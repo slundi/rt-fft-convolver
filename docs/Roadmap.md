@@ -3,13 +3,13 @@
 This roadmap outlines the development of a zero-latency, high-performance convolution engine for guitar effects.
 
 ## Phase 1: Core Mathematical Foundation (dsp/ & utils/)
-- [ ] **FFT Abstraction (`fft_handler.rs`)**:
+- [x] **FFT Abstraction (`fft_handler.rs`)**:
   - Integrate `rustfft`.
   - Create a wrapper to handle forward and inverse FFTs for real-to-complex signals.
-- [ ] **Direct Form Convolution (`direct.rs`)**:
+- [x] **Direct Form Convolution (`direct.rs`)**:
   - Implement a simple time-domain convolution for the first block (head) of the Impulse Response.
   - Goal: Achieve 0-sample latency for the initial attack.
-- [ ] **Anti-Denormal Protection (`denormals.rs`)**:
+- [x] **Anti-Denormal Protection (`denormals.rs`)**:
   - Implement FTZ (Flush To Zero) logic to prevent CPU spikes during silent passages.
 
 ## Phase 2: Partitioned Engine (engine/)
