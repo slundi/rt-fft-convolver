@@ -18,7 +18,7 @@ This roadmap outlines the development of a zero-latency, high-performance convol
   - Implement the "Overlap-Save" or "Overlap-Add" algorithm.
 - [x] **Frequency Domain Delay Line**:
   - Create a buffer to store past frequency blocks and multiply them with IR partitions.
-- [ ] **Stereo & True Stereo Support**:
+- [x] **Stereo & True Stereo Support**:
   - Parallel processing for Left/Right channels.
   - Support for 4-channel convolution (L->L, L->R, R->L, R->R).
 

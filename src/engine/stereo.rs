@@ -307,10 +307,10 @@ mod tests {
     #[test]
     fn stereo_different_gains_per_channel() {
         let ir_l: Vec<f32> = std::iter::once(2.0)
-            .chain(std::iter::repeat(0.0).take(3))
+            .chain(std::iter::repeat_n(0.0, 3))
             .collect();
         let ir_r: Vec<f32> = std::iter::once(3.0)
-            .chain(std::iter::repeat(0.0).take(3))
+            .chain(std::iter::repeat_n(0.0, 3))
             .collect();
         let mut conv = StereoConvolver::new(&ir_l, &ir_r, BLOCK);
         let ones = [1.0f32; BLOCK];
@@ -367,10 +367,10 @@ mod tests {
 
         // New IRs: gain-5 on L, gain-7 on R.
         let ir5: Vec<f32> = std::iter::once(5.0)
-            .chain(std::iter::repeat(0.0).take(3))
+            .chain(std::iter::repeat_n(0.0, 3))
             .collect();
         let ir7: Vec<f32> = std::iter::once(7.0)
-            .chain(std::iter::repeat(0.0).take(3))
+            .chain(std::iter::repeat_n(0.0, 3))
             .collect();
         conv.load_ir(&ir5, &ir7);
 
@@ -441,7 +441,7 @@ mod tests {
     fn true_stereo_all_four_paths_contribute() {
         let make_ir = |gain: f32| -> Vec<f32> {
             std::iter::once(gain)
-                .chain(std::iter::repeat(0.0).take(3))
+                .chain(std::iter::repeat_n(0.0, 3))
                 .collect()
         };
         let mut conv = TrueStereoConvolver::new(
@@ -512,7 +512,7 @@ mod tests {
 
         // Install gain-2 IR on all paths.
         let ir2: Vec<f32> = std::iter::once(2.0)
-            .chain(std::iter::repeat(0.0).take(3))
+            .chain(std::iter::repeat_n(0.0, 3))
             .collect();
         conv.load_ir(&ir2, &ir2, &ir2, &ir2);
 
