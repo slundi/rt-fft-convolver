@@ -54,4 +54,4 @@ fn main() {
 **rt-fft-convolver** is developed on Codeberg and mirrored to GitHub.
 
 * Primary Repo: [Codeberg main repo](https://codeberg.org/slundi/rt-fft-convolver)
-* Mirror: [GitHub repo](https://codeberg.com/slundi/rt-fft-convolver)
+* Mirror: [GitHub repo](https://github.com/slundi/rt-fft-convolver)
