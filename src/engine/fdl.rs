@@ -40,6 +40,66 @@
 //! [`accumulate`]: FreqDomainDelayLine::accumulate
 
 use rustfft::num_complex::Complex;
+use wide::f32x8;
+
+/// Multiply-accumulate `acc[i] += slot[i] * ir[i]` for complex f32 slices.
+///
+/// Uses `f32x8` to process **4 complex numbers per SIMD iteration**
+/// (8 floats = 4 × `[re, im]` pairs).
+///
+/// # Complex multiply in SIMD
+///
+/// For each pair `(s, h)` the product is `(s.re·h.re − s.im·h.im, s.re·h.im + s.im·h.re)`.
+/// Laid out as 8-wide f32 vectors:
+///
+/// ```text
+/// s_re_dup = [s0r, s0r, s1r, s1r, s2r, s2r, s3r, s3r]   ← re duplicated into pairs
+/// s_im_dup = [s0i, s0i, s1i, s1i, s2i, s2i, s3i, s3i]   ← im duplicated into pairs
+/// h_ri     = [h0r, h0i, h1r, h1i, h2r, h2i, h3r, h3i]   ← normal interleaved layout
+/// h_ni     = [-h0i, h0r, -h1i, h1r, -h2i, h2r, -h3i, h3r] ← negated-im / swapped pairs
+///
+/// s_re_dup * h_ri + s_im_dup * h_ni
+///   = [s0r·h0r + s0i·(−h0i),  s0r·h0i + s0i·h0r,  …]
+///   = [s0r·h0r − s0i·h0i,     s0r·h0i + s0i·h0r,  …]   ✓
+/// ```
+///
+/// Compiles to AVX2 FMA on x86-64, NEON on ARM, and SIMD128 on wasm32.
+/// The tail (`n % 4` complex) is handled by a scalar fallback.
+#[inline]
+fn complex_mac(acc: &mut [Complex<f32>], slot: &[Complex<f32>], ir: &[Complex<f32>]) {
+    let n = acc.len();
+    let chunks = n / 4;
+
+    for c in 0..chunks {
+        let i = c * 4;
+
+        // Load 4 complex from each slice.
+        let (s0, s1, s2, s3) = (slot[i], slot[i + 1], slot[i + 2], slot[i + 3]);
+        let (h0, h1, h2, h3) = (ir[i], ir[i + 1], ir[i + 2], ir[i + 3]);
+        let (a0, a1, a2, a3) = (acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+
+        let s_re = f32x8::from([s0.re, s0.re, s1.re, s1.re, s2.re, s2.re, s3.re, s3.re]);
+        let s_im = f32x8::from([s0.im, s0.im, s1.im, s1.im, s2.im, s2.im, s3.im, s3.im]);
+        let h_ri = f32x8::from([h0.re, h0.im, h1.re, h1.im, h2.re, h2.im, h3.re, h3.im]);
+        // Negate im and swap each pair: [-h.im, h.re, …]
+        let h_ni = f32x8::from([-h0.im, h0.re, -h1.im, h1.re, -h2.im, h2.re, -h3.im, h3.re]);
+        let a_ri = f32x8::from([a0.re, a0.im, a1.re, a1.im, a2.re, a2.im, a3.re, a3.im]);
+
+        let r = (a_ri + s_re * h_ri + s_im * h_ni).to_array();
+
+        acc[i] = Complex { re: r[0], im: r[1] };
+        acc[i + 1] = Complex { re: r[2], im: r[3] };
+        acc[i + 2] = Complex { re: r[4], im: r[5] };
+        acc[i + 3] = Complex { re: r[6], im: r[7] };
+    }
+
+    // Scalar tail for n % 4 remaining bins.
+    // In practice fft_size = 2 * block_size is always a power-of-two ≥ 4,
+    // so this branch is never taken — it exists only for correctness.
+    for i in (chunks * 4)..n {
+        acc[i] += slot[i] * ir[i];
+    }
+}
 
 /// Circular buffer of complex frequency-domain spectra for partitioned
 /// convolution.
@@ -153,16 +213,13 @@ impl FreqDomainDelayLine {
 
         let p = self.slots.len();
 
-        for k in 0..p {
+        for (k, ir) in ir_spectra.iter().enumerate() {
             // Slot for delay k: the most-recent push is at write_pos−1 (mod P).
             // Delay k maps to (write_pos + P − 1 − k) % P.
             let slot_idx = (self.write_pos + p - 1 - k) % p;
             let slot = &self.slots[slot_idx];
-            let ir = &ir_spectra[k];
 
-            for ((a, &s), &h) in acc.iter_mut().zip(slot.iter()).zip(ir.iter()) {
-                *a += s * h;
-            }
+            complex_mac(acc, slot, ir);
         }
     }
 

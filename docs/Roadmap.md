@@ -30,8 +30,8 @@ This roadmap outlines the development of a zero-latency, high-performance convol
   - Implement a "Dry/Wet" mix control.
 
 ## Phase 4: Optimization & Studio Mode
-- [ ] **SIMD Optimization**:
-  - Use `packed_simd` or auto-vectorization for complex multiplications.
+- [x] **SIMD Optimization**:
+  - Use ~~`packed_simd`~~ `simsimd` or auto-vectorization for complex multiplications.
 - [ ] **Offline High-Fidelity Mode**:
   - Create a non-partitioned, high-precision processing path for studio rendering.
 - [ ] **Cross-fading IR Switch**:
