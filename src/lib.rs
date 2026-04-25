@@ -12,6 +12,7 @@ pub use dsp::direct::DirectConvolver;
 
 /// Partitioned-convolution engines.
 pub use engine::fdl::FreqDomainDelayLine;
+pub use engine::mixer::Mixer;
 pub use engine::partition::UniformPartitionEngine;
 pub use engine::stereo::{StereoConvolver, TrueStereoConvolver};
 

@@ -25,7 +25,7 @@ This roadmap outlines the development of a zero-latency, high-performance convol
 ## Phase 3: Audio Professional Features (utils/ & lib.rs)
 - [x] **Resampling Engine (`resampler.rs`)**:
   - Automatically resample IR files (WAV) to match the host's sample rate (44.1k, 48k, 96k).
-- [ ] **Normalization & Gain Staging (`mixer.rs`)**:
+- [x] **Normalization & Gain Staging (`mixer.rs`)**:
   - Auto-calculate IR loudness to prevent clipping.
   - Implement a "Dry/Wet" mix control.
 
