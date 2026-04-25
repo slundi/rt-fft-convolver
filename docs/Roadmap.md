@@ -23,7 +23,7 @@ This roadmap outlines the development of a zero-latency, high-performance convol
   - Support for 4-channel convolution (L->L, L->R, R->L, R->R).
 
 ## Phase 3: Audio Professional Features (utils/ & lib.rs)
-- [ ] **Resampling Engine (`resampler.rs`)**:
+- [x] **Resampling Engine (`resampler.rs`)**:
   - Automatically resample IR files (WAV) to match the host's sample rate (44.1k, 48k, 96k).
 - [ ] **Normalization & Gain Staging (`mixer.rs`)**:
   - Auto-calculate IR loudness to prevent clipping.

@@ -31,6 +31,8 @@ targets = [
 
 
 [dependencies]
+hound = "3.5"
+rubato = "2.0"
 rustfft = "6.4"
 
 [workspace.metadata.cargo-machete]
