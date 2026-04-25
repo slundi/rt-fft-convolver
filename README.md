@@ -2,7 +2,7 @@
 
 **rt-fft-convolver** is a professional-grade, real-time digital signal processing (DSP) library for performing fast convolution. It is specifically engineered for guitar cabinet simulation (IR) and reverb effects where ultra-low latency is critical.
 
-## Features
+## ✨ Features
 
 - **Zero-Latency Hybrid Engine**: Combines Time-Domain Direct Form convolution for the initial impulse response (IR) head with Partitioned FFT convolution for the tail.
 - **Optimized FFT**: Powered by `rustfft` for high-performance frequency domain processing.
@@ -24,7 +24,7 @@ Add this to your `Cargo.toml`:
 rust-convolver = "0.1.0"
 ```
 
-## Quick start
+## 🚀 Quick start
 
 ```rust
 use rust_convolver::{Convolver, Config};
@@ -48,3 +48,10 @@ fn main() {
     });
 }
 ```
+
+## 🤝 Contributing
+
+**rt-fft-convolver** is developed on Codeberg and mirrored to GitHub.
+
+* Primary Repo: [Codeberg main repo](https://codeberg.org/slundi/rt-fft-convolver)
+* Mirror: [GitHub repo](https://codeberg.com/slundi/rt-fft-convolver)
