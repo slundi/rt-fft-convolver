@@ -16,7 +16,7 @@ This roadmap outlines the development of a zero-latency, high-performance convol
 - [x] **Uniform Partitioning (`partition.rs`)**:
   - Split long IRs into equal blocks of size `N`.
   - Implement the "Overlap-Save" or "Overlap-Add" algorithm.
-- [ ] **Frequency Domain Delay Line**:
+- [x] **Frequency Domain Delay Line**:
   - Create a buffer to store past frequency blocks and multiply them with IR partitions.
 - [ ] **Stereo & True Stereo Support**:
   - Parallel processing for Left/Right channels.

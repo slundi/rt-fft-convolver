@@ -49,6 +49,7 @@
 use rustfft::num_complex::Complex;
 
 use crate::dsp::FftHandler;
+use crate::engine::fdl::FreqDomainDelayLine;
 
 /// Uniform partitioned convolution engine for the IR tail.
 ///
@@ -62,9 +63,6 @@ use crate::dsp::FftHandler;
 /// [`block_size`]: UniformPartitionEngine::block_size
 /// [`process`]: UniformPartitionEngine::process
 pub struct UniformPartitionEngine {
-    /// FFT size = 2 × block_size.
-    fft_size: usize,
-
     /// Audio block size N (= partition size).
     block_size: usize,
 
@@ -73,13 +71,9 @@ pub struct UniformPartitionEngine {
     /// (zero-padded to 2N).
     ir_spectra: Vec<Vec<Complex<f32>>>,
 
-    /// Frequency-domain delay line (FDL): circular buffer of the P most
-    /// recent input spectra.  `fdl[fdl_pos]` is the **current** block;
-    /// `fdl[(fdl_pos + P - k) % P]` is the spectrum from k blocks ago.
-    fdl: Vec<Vec<Complex<f32>>>,
-
-    /// Write pointer into `fdl`, always in `[0, fdl.len())`.
-    fdl_pos: usize,
+    /// Frequency-domain delay line: circular buffer of the P most recent
+    /// input spectra.  Updated once per block via [`FreqDomainDelayLine::push`].
+    fdl: FreqDomainDelayLine,
 
     /// Overlap-save buffer of length 2N.
     /// `input_buf[0..N]`  = previous block (the "overlap").
@@ -146,17 +140,14 @@ impl UniformPartitionEngine {
             })
             .collect();
 
-        // FDL needs at least one slot to avoid a zero-length Vec (unused when
-        // num_partitions == 0 since process() returns early).
-        let fdl_slots = num_partitions.max(1);
-        let fdl = vec![vec![Complex::default(); fft_size]; fdl_slots];
+        // FDL needs at least one slot; it is never accessed when num_partitions
+        // == 0 because process() returns early in that case.
+        let fdl = FreqDomainDelayLine::new(num_partitions.max(1), fft_size);
 
         Self {
-            fft_size,
             block_size,
             ir_spectra,
             fdl,
-            fdl_pos: 0,
             input_buf: vec![0.0f32; fft_size],
             acc_buf: vec![Complex::default(); fft_size],
             out_buf: vec![0.0f32; fft_size],
@@ -184,12 +175,9 @@ impl UniformPartitionEngine {
     /// **Real-time safe** — no allocation.
     pub fn reset(&mut self) {
         self.input_buf.fill(0.0);
-        for slot in &mut self.fdl {
-            slot.fill(Complex::default());
-        }
+        self.fdl.reset();
         self.acc_buf.fill(Complex::default());
         self.out_buf.fill(0.0);
-        self.fdl_pos = 0;
     }
 
     /// Replace the IR tail and reset all internal state.
@@ -235,7 +223,6 @@ impl UniformPartitionEngine {
         }
 
         let n = self.block_size;
-        let fdl_len = self.fdl.len();
 
         // ── Step 1: slide the overlap-save window ─────────────────────────
         // First half ← old second half (previous block).
@@ -253,29 +240,17 @@ impl UniformPartitionEngine {
             fft.forward(&self.input_buf, &mut self.acc_buf);
         }
 
-        // ── Step 3: store current spectrum in the FDL ─────────────────────
-        self.fdl[self.fdl_pos].copy_from_slice(&self.acc_buf);
+        // ── Step 3: push current spectrum into the FDL ────────────────────
+        self.fdl.push(&self.acc_buf);
 
         // ── Step 4: frequency-domain multiply-accumulate ──────────────────
-        // acc = Σ_{k=0}^{P-1}  FDL[(fdl_pos + P − k) % P]  ⊙  IR[k]
-        //
-        // k=0 → most recent block (just stored at fdl_pos)
-        // k=1 → one block older, etc.
+        // acc = Σ_{k=0}^{P-1}  FDL[k]  ⊙  IR[k]
+        // (FDL slot 0 = most recently pushed; managed by FreqDomainDelayLine)
         self.acc_buf.fill(Complex::default());
-
-        let num_parts = self.ir_spectra.len();
-        for k in 0..num_parts {
-            let slot = (self.fdl_pos + fdl_len - k) % fdl_len;
-
-            // Split borrows: fdl and ir_spectra are immutable,
-            // acc_buf is mutably borrowed — all distinct fields.
-            let fdl_slice = &self.fdl[slot];
-            let ir_slice = &self.ir_spectra[k];
-            let acc = &mut self.acc_buf;
-
-            for ((a, &f), &h) in acc.iter_mut().zip(fdl_slice.iter()).zip(ir_slice.iter()) {
-                *a += f * h;
-            }
+        {
+            let fdl = &self.fdl;
+            let ir = &self.ir_spectra;
+            fdl.accumulate(ir, &mut self.acc_buf);
         }
 
         // ── Step 5: IFFT the accumulator ──────────────────────────────────
@@ -290,9 +265,6 @@ impl UniformPartitionEngine {
         for (y, &x) in output.iter_mut().zip(self.out_buf[n..].iter()) {
             *y += x;
         }
-
-        // ── Advance FDL write pointer ──────────────────────────────────────
-        self.fdl_pos = (self.fdl_pos + 1) % fdl_len;
     }
 }
 
