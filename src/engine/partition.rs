@@ -399,8 +399,8 @@ mod tests {
         // y[0] = 1, y[7] = 1, all others = 0.
         assert!((out[0] - 1.0).abs() < EPSILON, "y[0]={}", out[0]);
         assert!((out[7] - 1.0).abs() < EPSILON, "y[7]={}", out[7]);
-        for i in 1..7 {
-            assert!(out[i].abs() < EPSILON, "y[{i}]={}", out[i]);
+        for (i, val) in out.iter().enumerate().take(7).skip(1) {
+            assert!(val.abs() < EPSILON, "y[{i}]={val}");
         }
     }
 

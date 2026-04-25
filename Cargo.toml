@@ -4,7 +4,7 @@ authors = ["Sébastien LUNDI"]
 description = "A high-performance, zero-latency partitioned convolution engine. Designed specifically for real-time guitar cabinet simulation and reverb effects with SIMD optimizations and anti-denormal protection."
 readme = "README.md"
 license = "MIT"
-repository = "https://codeberg.org/slundi/MY_PROJECT"
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
 keywords = ["dsp", "fft", "convolution", "audio", "guitar-effects"]
 categories = ["multimedia::audio", "rendering::engine"]
 version = "0.1.0"
@@ -54,11 +54,6 @@ lto = "fat"       # Link Time Optimization (smaller, faster binary)
 codegen-units = 1 # Better optimizations at the cost of compile time
 panic = "abort"   # Removes stack unwinding (smaller binary size)
 strip = true      # Automatically strips symbols/debug info (like 'strip' command)
-
-# Profile for Benchmarking
-[profile.bench]
-extend = "release"
-debug = false
 
 # --- Features ---
 # [features]
