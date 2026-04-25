@@ -1,0 +1,63 @@
+[package]
+name = "MY_PROJECT"
+authors = ["Sébastien LUNDI"]
+description = "SHORT DESCRIPTION"
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://codeberg.org/slundi/MY_PROJECT"
+keywords = []
+categories = []
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# [lib]
+# name = "MY_PROJECT"
+# path = "src/lib.rs"
+
+# [[bin]]
+# name = "MY_PROJECT"
+# path = "src/main.rs"
+
+[package.metadata.docs.rs]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    # "x86_64-apple-darwin",
+    # "x86_64-pc-windows-msvc",
+    # "i686-unknown-linux-gnu",
+    # "i686-pc-windows-msvc"
+]
+
+
+[dependencies]
+
+
+[workspace.metadata.cargo-machete]
+ignored = []
+
+# --- Profiles ---
+
+# Standard Dev Profile (Optimized for speed of compilation)
+[profile.dev]
+opt-level = 0
+debug = true
+
+# Production Release Profile
+# This ensures the Nix-built binary is highly optimized
+[profile.release]
+opt-level = 3     # Max optimizations
+lto = "fat"       # Link Time Optimization (smaller, faster binary)
+codegen-units = 1 # Better optimizations at the cost of compile time
+panic = "abort"   # Removes stack unwinding (smaller binary size)
+strip = true      # Automatically strips symbols/debug info (like 'strip' command)
+
+# Profile for Benchmarking
+[profile.bench]
+extend = "release"
+debug = false
+
+# --- Features ---
+# [features]
+# default = []
+# async = ["dep:tokio"] # must be in dependencies
