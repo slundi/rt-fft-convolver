@@ -13,7 +13,7 @@ This roadmap outlines the development of a zero-latency, high-performance convol
   - Implement FTZ (Flush To Zero) logic to prevent CPU spikes during silent passages.
 
 ## Phase 2: Partitioned Engine (engine/)
-- [ ] **Uniform Partitioning (`partition.rs`)**:
+- [x] **Uniform Partitioning (`partition.rs`)**:
   - Split long IRs into equal blocks of size `N`.
   - Implement the "Overlap-Save" or "Overlap-Add" algorithm.
 - [ ] **Frequency Domain Delay Line**:
