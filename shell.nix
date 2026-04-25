@@ -1,16 +1,11 @@
 {pkgs ? import <nixpkgs> {}}:
 pkgs.mkShell {
   inputsFrom = with pkgs; [
-    # openssl
-    libressl
-
     llvmPackages.bintools
     rustc
   ];
 
   buildInputs = with pkgs; [
-    # openssl
-    libressl
     pkg-config
 
     llvmPackages.bintools
@@ -28,8 +23,6 @@ pkgs.mkShell {
   ];
 
   packages = with pkgs; [
-    # openssl
-    libressl
     pkg-config
     llvmPackages.bintools
     rustc

@@ -1,12 +1,12 @@
 [package]
-name = "MY_PROJECT"
+name = "rt-fft-convolver"
 authors = ["Sébastien LUNDI"]
-description = "SHORT DESCRIPTION"
+description = "A high-performance, zero-latency partitioned convolution engine. Designed specifically for real-time guitar cabinet simulation and reverb effects with SIMD optimizations and anti-denormal protection."
 readme = "README.md"
-license = "Apache-2.0"
+license = "MIT"
 repository = "https://codeberg.org/slundi/MY_PROJECT"
-keywords = []
-categories = []
+keywords = ["dsp", "fft", "convolution", "audio", "guitar-effects"]
+categories = ["multimedia::audio", "rendering::engine"]
 version = "0.1.0"
 edition = "2024"
 
@@ -31,7 +31,7 @@ targets = [
 
 
 [dependencies]
-
+rustfft = "6.4"
 
 [workspace.metadata.cargo-machete]
 ignored = []
