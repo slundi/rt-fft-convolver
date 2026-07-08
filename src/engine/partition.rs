@@ -354,6 +354,58 @@ mod tests {
         }
     }
 
+    /// IR length is not a multiple of block_size — the final partition must be
+    /// zero-padded correctly so that its "missing" taps contribute 0.
+    ///
+    /// IR = [1, 2, 3, 4, 5] with block_size=2 → 3 partitions:
+    ///   partition 0 = [1, 2]
+    ///   partition 1 = [3, 4]
+    ///   partition 2 = [5, 0]  ← last tap zero-padded
+    ///
+    /// Feed a single impulse in block 1 and read the response across blocks.
+    /// Expected impulse response: [1, 2, 3, 4, 5, 0, ...].
+    #[test]
+    fn non_multiple_ir_length_is_zero_padded() {
+        let block_size = 2;
+        let ir = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        // Feed impulse in block 1, silence in subsequent blocks to read the tail.
+        let blocks: Vec<&[f32]> = vec![&[1.0, 0.0], &[0.0, 0.0], &[0.0, 0.0]];
+        let out = run_blocks(&ir, block_size, &blocks);
+        let expected = [1.0f32, 2.0, 3.0, 4.0, 5.0, 0.0];
+        for (i, (e, y)) in expected.iter().zip(out.iter()).enumerate() {
+            assert!((e - y).abs() < EPSILON, "y[{i}]: expected {e}, got {y}");
+        }
+    }
+
+    /// IR length that leaves the last partition mostly empty (1 tap out of 4).
+    /// Verifies the padded region contributes zero regardless of block size.
+    #[test]
+    fn single_tap_in_last_partition() {
+        let block_size = 4;
+        // 5 taps → 2 partitions: [1,10,100,1000] and [10000,0,0,0].
+        let ir = [1.0f32, 10.0, 100.0, 1000.0, 10000.0];
+        let blocks: Vec<&[f32]> = vec![
+            &[1.0, 0.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0, 0.0],
+        ];
+        let out = run_blocks(&ir, block_size, &blocks);
+        let expected = [
+            1.0f32, 10.0, 100.0, 1000.0, // block 1
+            10000.0, 0.0, 0.0, 0.0, // block 2 (only tap 4 fires)
+            0.0, 0.0, 0.0, 0.0, // block 3 (silence)
+        ];
+        // Tolerance scales with the peak IR magnitude: f32 FFT roundtrip has
+        // ~1e-6 relative precision, so absolute error can approach
+        // peak * 1e-4 on zero-valued output samples due to cancellation.
+        let peak = ir.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let tol = peak * 1e-4;
+        for (i, (e, y)) in expected.iter().zip(out.iter()).enumerate() {
+            let err = (e - y).abs();
+            assert!(err < tol, "y[{i}]: expected {e}, got {y} (abs err {err})");
+        }
+    }
+
     /// Known two-tap convolution: input=[1,2,3,4], IR=[1,2], block_size=4.
     /// y[n] = 1*x[n] + 2*x[n-1].
     /// Expected: [1*1+2*0, 1*2+2*1, 1*3+2*2, 1*4+2*3] = [1, 4, 7, 10].
