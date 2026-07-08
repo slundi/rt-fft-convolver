@@ -231,14 +231,7 @@ impl UniformPartitionEngine {
         self.input_buf[n..].copy_from_slice(input);
 
         // ── Step 2: FFT the 2N window into acc_buf ────────────────────────
-        // Split field borrows so the borrow checker sees distinct locations:
-        //   &mut self.fft  (for the FFT engine)
-        //   &    self.input_buf
-        //   &mut self.acc_buf
-        {
-            let fft = &mut self.fft;
-            fft.forward(&self.input_buf, &mut self.acc_buf);
-        }
+        self.fft.forward(&self.input_buf, &mut self.acc_buf);
 
         // ── Step 3: push current spectrum into the FDL ────────────────────
         self.fdl.push(&self.acc_buf);
@@ -247,17 +240,10 @@ impl UniformPartitionEngine {
         // acc = Σ_{k=0}^{P-1}  FDL[k]  ⊙  IR[k]
         // (FDL slot 0 = most recently pushed; managed by FreqDomainDelayLine)
         self.acc_buf.fill(Complex::default());
-        {
-            let fdl = &self.fdl;
-            let ir = &self.ir_spectra;
-            fdl.accumulate(ir, &mut self.acc_buf);
-        }
+        self.fdl.accumulate(&self.ir_spectra, &mut self.acc_buf);
 
         // ── Step 5: IFFT the accumulator ──────────────────────────────────
-        {
-            let fft = &mut self.fft;
-            fft.inverse(&mut self.acc_buf, &mut self.out_buf);
-        }
+        self.fft.inverse(&mut self.acc_buf, &mut self.out_buf);
 
         // ── Step 6: accumulate the valid second half into output ──────────
         // The first N samples are the circular wrap-around artifact; the
