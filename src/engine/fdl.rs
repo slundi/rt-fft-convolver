@@ -65,32 +65,88 @@ use wide::f32x8;
 ///
 /// Compiles to AVX2 FMA on x86-64, NEON on ARM, and SIMD128 on wasm32.
 /// The tail (`n % 4` complex) is handled by a scalar fallback.
+///
+/// # Layout note
+///
+/// `num_complex::Complex<f32>` is `#[repr(C)]` with two consecutive `f32`
+/// fields, so a `[Complex<f32>; N]` has the same memory representation as
+/// a `[f32; 2N]` in `[re0, im0, re1, im1, …]` order.  We reinterpret the
+/// slices to give the compiler flat `f32` loads (256-bit `vmovups` on AVX)
+/// instead of eight separate field accesses per iteration.
 #[inline]
 fn complex_mac(acc: &mut [Complex<f32>], slot: &[Complex<f32>], ir: &[Complex<f32>]) {
     let n = acc.len();
     let chunks = n / 4;
 
+    // SAFETY: `Complex<f32>` is `#[repr(C)]` with fields `re: f32, im: f32`,
+    // so `&[Complex<f32>]` of length N and `&[f32]` of length 2N share the
+    // same allocation, alignment (f32 alignment divides Complex<f32>
+    // alignment), and lifetime.  We hold no other aliasing reference to
+    // these slices for the duration of the returned view.
+    let acc_f: &mut [f32] =
+        unsafe { std::slice::from_raw_parts_mut(acc.as_mut_ptr() as *mut f32, n * 2) };
+    let slot_f: &[f32] = unsafe { std::slice::from_raw_parts(slot.as_ptr() as *const f32, n * 2) };
+    let ir_f: &[f32] = unsafe { std::slice::from_raw_parts(ir.as_ptr() as *const f32, n * 2) };
+
     for c in 0..chunks {
-        let i = c * 4;
+        let i = c * 8; // 8 floats = 4 complex numbers per iteration
 
-        // Load 4 complex from each slice.
-        let (s0, s1, s2, s3) = (slot[i], slot[i + 1], slot[i + 2], slot[i + 3]);
-        let (h0, h1, h2, h3) = (ir[i], ir[i + 1], ir[i + 2], ir[i + 3]);
-        let (a0, a1, a2, a3) = (acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
-
-        let s_re = f32x8::from([s0.re, s0.re, s1.re, s1.re, s2.re, s2.re, s3.re, s3.re]);
-        let s_im = f32x8::from([s0.im, s0.im, s1.im, s1.im, s2.im, s2.im, s3.im, s3.im]);
-        let h_ri = f32x8::from([h0.re, h0.im, h1.re, h1.im, h2.re, h2.im, h3.re, h3.im]);
+        // Load 4 complex as flat f32 pairs: [re0, im0, re1, im1, re2, im2, re3, im3].
+        let s_re = f32x8::from([
+            slot_f[i],
+            slot_f[i],
+            slot_f[i + 2],
+            slot_f[i + 2],
+            slot_f[i + 4],
+            slot_f[i + 4],
+            slot_f[i + 6],
+            slot_f[i + 6],
+        ]);
+        let s_im = f32x8::from([
+            slot_f[i + 1],
+            slot_f[i + 1],
+            slot_f[i + 3],
+            slot_f[i + 3],
+            slot_f[i + 5],
+            slot_f[i + 5],
+            slot_f[i + 7],
+            slot_f[i + 7],
+        ]);
+        let h_ri = f32x8::from([
+            ir_f[i],
+            ir_f[i + 1],
+            ir_f[i + 2],
+            ir_f[i + 3],
+            ir_f[i + 4],
+            ir_f[i + 5],
+            ir_f[i + 6],
+            ir_f[i + 7],
+        ]);
         // Negate im and swap each pair: [-h.im, h.re, …]
-        let h_ni = f32x8::from([-h0.im, h0.re, -h1.im, h1.re, -h2.im, h2.re, -h3.im, h3.re]);
-        let a_ri = f32x8::from([a0.re, a0.im, a1.re, a1.im, a2.re, a2.im, a3.re, a3.im]);
+        let h_ni = f32x8::from([
+            -ir_f[i + 1],
+            ir_f[i],
+            -ir_f[i + 3],
+            ir_f[i + 2],
+            -ir_f[i + 5],
+            ir_f[i + 4],
+            -ir_f[i + 7],
+            ir_f[i + 6],
+        ]);
+        let a_ri = f32x8::from([
+            acc_f[i],
+            acc_f[i + 1],
+            acc_f[i + 2],
+            acc_f[i + 3],
+            acc_f[i + 4],
+            acc_f[i + 5],
+            acc_f[i + 6],
+            acc_f[i + 7],
+        ]);
 
         let r = (a_ri + s_re * h_ri + s_im * h_ni).to_array();
 
-        acc[i] = Complex { re: r[0], im: r[1] };
-        acc[i + 1] = Complex { re: r[2], im: r[3] };
-        acc[i + 2] = Complex { re: r[4], im: r[5] };
-        acc[i + 3] = Complex { re: r[6], im: r[7] };
+        acc_f[i..i + 8].copy_from_slice(&r);
     }
 
     // Scalar tail for n % 4 remaining bins.
