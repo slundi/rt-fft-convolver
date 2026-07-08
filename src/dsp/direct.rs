@@ -18,18 +18,31 @@
 /// positions: `write_pos` and `write_pos + head_len`.  After each write the
 /// slice `history[write_pos .. write_pos + head_len]` is always a contiguous,
 /// wrap-free window of the most recent `head_len` samples ordered
-/// **newest → oldest**.  The inner dot-product loop then reduces to a plain
-/// slice multiply-accumulate, which LLVM auto-vectorises with SIMD.
+/// **newest → oldest**.
+///
+/// The trick only works if the write cursor moves **backward** through the
+/// buffer.  Concretely, sample `x[n]` is written at position `p_n`, then
+/// `write_pos` wrap-decrements to `p_{n+1} = (p_n − 1) mod head_len`.  Walking
+/// forward `head_len` slots from the newest write therefore visits
+/// `p_n, p_{n−1}, p_{n−2}, …` — exactly newest → oldest.  A naïve
+/// forward-advancing cursor would leave the window in a rotated order and
+/// silently produce incorrect output for `head_len ≥ 3`.
 ///
 /// ```text
-///  head_len = 4,  write_pos = 1 after writing x[5]
+///  head_len = 4.  write_pos = 2 after writing x[5]
+///  With initial write_pos = 0 and wrap-decrement-before-write, each sample
+///  lands at:   x[0]→3, x[1]→2, x[2]→1, x[3]→0, x[4]→3, x[5]→2
+///  (Each write is also mirrored to position + head_len; mirrors omitted.)
 ///
-///  index : 0     1     2     3   | 4     5     6     7
-///  value : x[4]  x[5]  x[2]  x[3]  x[4]  x[5]  x[2]  x[3]
-///                ↑ write_pos
-///  window: history[1..5] = [x[5], x[4], x[3], x[2]]  ← contiguous ✓
-///  IR    :                   h[0]   h[1]  h[2]  h[3]
+///  index : 0     1     2     3     4     5     6     7
+///  value : x[3]  x[2]  x[5]  x[4]  x[3]  x[2]  x[5]  x[4]
+///                      ↑ write_pos = 2 (points to newest sample)
+///  window: history[2..6] = [x[5], x[4], x[3], x[2]]   ← newest → oldest ✓
+///  IR    :                    h[0]   h[1]  h[2]  h[3]
 /// ```
+///
+/// The inner dot-product loop then reduces to a plain slice multiply-
+/// accumulate, which LLVM auto-vectorises with SIMD.
 pub struct DirectConvolver {
     /// IR head coefficients h[0..head_len].
     /// h[0] is multiplied by the *current* (newest) input sample, achieving
@@ -38,11 +51,14 @@ pub struct DirectConvolver {
     ir_head: Vec<f32>,
 
     /// Doubled circular buffer, length = 2 * head_len.
-    /// Invariant: `history[write_pos .. write_pos + head_len]` always holds
-    /// the last `head_len` input samples in newest-first order.
+    /// Invariant: after each `process()` iteration
+    /// `history[write_pos .. write_pos + head_len]` holds the last `head_len`
+    /// input samples in newest-first order.  The cursor moves *backward*
+    /// through the buffer on every write to maintain this ordering.
     history: Vec<f32>,
 
-    /// Next write index, always in `[0, head_len)`.
+    /// Position of the most recently written sample, always in `[0, head_len)`.
+    /// Wrap-decrements to `head_len - 1` when it would reach `-1`.
     write_pos: usize,
 }
 
@@ -59,6 +75,7 @@ impl DirectConvolver {
             ir_head: ir_head.to_vec(),
             // Double-length buffer, zero-initialised (silent history).
             history: vec![0.0f32; 2 * head_len.max(1)],
+            // Start at 0; the first wrap-decrement moves it to head_len-1.
             write_pos: 0,
         }
     }
@@ -130,23 +147,26 @@ impl DirectConvolver {
         }
 
         for (x, y) in input.iter().zip(output.iter_mut()) {
+            // --- Advance cursor BACKWARD, wrapping 0 → head_len-1 ---
+            // The cursor must move backward so that walking forward from the
+            // newest write visits samples in newest → oldest order.
+            self.write_pos = if self.write_pos == 0 {
+                head_len - 1
+            } else {
+                self.write_pos - 1
+            };
+
             // --- Write new sample to both halves of the doubled buffer ---
-            // This keeps both halves mirrored so the convolution window is
-            // always contiguous (see struct-level doc).
+            // Mirroring makes the window contiguous even when it straddles
+            // the head_len boundary.
             self.history[self.write_pos] = *x;
             self.history[self.write_pos + head_len] = *x;
 
             // --- Dot product: h ⊙ window (newest → oldest) ---
-            // SAFETY: write_pos < head_len, so write_pos + head_len < 2*head_len,
+            // write_pos < head_len, so write_pos + head_len ≤ 2*head_len,
             // and the slice is always within bounds.
             let window = &self.history[self.write_pos..self.write_pos + head_len];
             *y = dot(window, &self.ir_head);
-
-            // --- Advance write cursor (wraps at head_len, not 2*head_len) ---
-            self.write_pos += 1;
-            if self.write_pos == head_len {
-                self.write_pos = 0;
-            }
         }
     }
 }
@@ -290,6 +310,96 @@ mod tests {
         conv.process(&input, &mut output);
         for &y in &output {
             assert_eq!(y, 0.0);
+        }
+    }
+
+    /// Regression: three-tap IR with distinct coefficients.  Exercises the
+    /// window ordering that the doubled-buffer trick must preserve.  A
+    /// forward-advancing cursor scrambles the middle sample and produces
+    /// [1, 102, 213, 324] instead of [1, 12, 123, 234].
+    #[test]
+    fn three_tap_convolution() {
+        // y[n] = x[n] + 10*x[n-1] + 100*x[n-2]
+        let ir = [1.0f32, 10.0, 100.0];
+        let input = [1.0f32, 2.0, 3.0, 4.0];
+        let expected = [1.0f32, 12.0, 123.0, 234.0];
+        let output = convolve_block(&ir, &input);
+        for (i, (e, y)) in expected.iter().zip(output.iter()).enumerate() {
+            assert!((e - y).abs() < EPSILON, "y[{i}]: expected {e}, got {y}");
+        }
+    }
+
+    /// Four-tap IR spanning a full buffer cycle then wrapping through it.
+    /// Verifies correctness across multiple wraps of the doubled-buffer cursor.
+    #[test]
+    fn four_tap_convolution_across_wraps() {
+        // y[n] = x[n] + 2*x[n-1] + 3*x[n-2] + 4*x[n-3]
+        let ir = [1.0f32, 2.0, 3.0, 4.0];
+        let input = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        // Manually computed reference:
+        //  y[0] =  1
+        //  y[1] =  2 + 2*1              =  4
+        //  y[2] =  3 + 2*2 + 3*1        = 10
+        //  y[3] =  4 + 2*3 + 3*2 + 4*1  = 20
+        //  y[4] =  5 + 2*4 + 3*3 + 4*2  = 30
+        //  y[5] =  6 + 2*5 + 3*4 + 4*3  = 40
+        //  y[6] =  7 + 2*6 + 3*5 + 4*4  = 50
+        //  y[7] =  8 + 2*7 + 3*6 + 4*5  = 60
+        let expected = [1.0f32, 4.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let output = convolve_block(&ir, &input);
+        for (i, (e, y)) in expected.iter().zip(output.iter()).enumerate() {
+            assert!((e - y).abs() < EPSILON, "y[{i}]: expected {e}, got {y}");
+        }
+    }
+
+    /// Eight-tap IR fed one sample at a time.  Confirms that per-sample calls
+    /// (block_size == 1) produce the same output as a single big block —
+    /// state must be identical to feeding the whole input in one shot.
+    #[test]
+    fn eight_tap_single_sample_matches_block() {
+        let ir: Vec<f32> = (1..=8).map(|i| i as f32).collect(); // [1..8]
+        let input: Vec<f32> = (1..=16).map(|i| i as f32).collect();
+
+        // Reference: convolve as one block.
+        let mut whole = DirectConvolver::new(&ir);
+        let mut out_whole = vec![0.0f32; input.len()];
+        whole.process(&input, &mut out_whole);
+
+        // Compare against single-sample processing.
+        let mut streamed = DirectConvolver::new(&ir);
+        let mut out_streamed = vec![0.0f32; input.len()];
+        for (i, &x) in input.iter().enumerate() {
+            streamed.process(&[x], &mut out_streamed[i..i + 1]);
+        }
+
+        for (i, (a, b)) in out_whole.iter().zip(out_streamed.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < EPSILON,
+                "streamed y[{i}]={b} diverged from whole-block y[{i}]={a}"
+            );
+        }
+    }
+
+    /// Cross-check against a naïve O(N·L) reference convolution for a
+    /// non-trivial IR.  Guards against algorithmic drift regardless of taps.
+    #[test]
+    fn matches_naive_reference() {
+        let ir: Vec<f32> = [0.2, -0.5, 0.7, 0.1, -0.3, 0.9].to_vec();
+        let input: Vec<f32> = (0..32).map(|i| ((i as f32) * 0.37).sin()).collect();
+
+        // Reference: naive time-domain convolution with zero prefix.
+        let mut reference = vec![0.0f32; input.len()];
+        for (n, r) in reference.iter_mut().enumerate() {
+            for (k, &h) in ir.iter().enumerate() {
+                if n >= k {
+                    *r += h * input[n - k];
+                }
+            }
+        }
+
+        let output = convolve_block(&ir, &input);
+        for (i, (r, y)) in reference.iter().zip(output.iter()).enumerate() {
+            assert!((r - y).abs() < EPSILON, "y[{i}]: expected {r}, got {y}");
         }
     }
 
