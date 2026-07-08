@@ -25,23 +25,31 @@ You are a Senior Audio DSP Engineer specializing in Rust. Your goal is to assist
 rt-fft-convolver/
 ├── Cargo.toml
 ├── README.md
-├── ROADMAP.md
-├── AGENT.md
+├── CLAUDE.md
+├── CONTRIBUTING.md
+├── docs/
+│   ├── CLI.md
+│   ├── Nix.md
+│   └── Roadmap.md        # project roadmap (was ROADMAP.md)
 ├── src/
 │   ├── lib.rs            # public entry point for lib
+│   ├── error.rs          # LoadError enum
 │   ├── engine/           # processing core
 │   │   ├── mod.rs
-│   │   ├── partition.rs  # Management of the IR division
-│   │   └── mixer.rs      # sum delay lines and handle gain
+│   │   ├── fdl.rs        # frequency-domain delay line + complex MAC
+│   │   ├── partition.rs  # uniform partitioned overlap-save engine
+│   │   ├── mixer.rs      # IR-normalised dry/wet mixer
+│   │   └── stereo.rs     # Stereo and true-stereo convolvers
 │   ├── dsp/              # math and FFT
 │   │   ├── mod.rs
 │   │   ├── fft_handler.rs# rustfft abstraction
 │   │   └── direct.rs     # direct convolution (zero latency)
-│   ├── utils/            # utilities
-│   │   ├── mod.rs
-│   │   ├── denormals.rs  # FTZ management (Flush To Zero)
-│   │   └── resampler.rs  # To adapt IR to samplerate
-│   └── tests/            # integration tests
+│   └── utils/            # utilities
+│       ├── mod.rs
+│       ├── denormals.rs  # FTZ management (Flush To Zero)
+│       └── resampler.rs  # WAV loading + sample-rate conversion
+└── tests/                # integration tests
+    └── integration_test.rs
 ```
 
 ## Coding process
@@ -49,4 +57,4 @@ rt-fft-convolver/
 After adding/editing/deleting code, always finish with those steps
 1. write tests for new code
 2. run `cargo fmt && cargo clippy` and fix clippy errors from your new code
-3. suggest conventionnal commit
+3. suggest conventional commit
