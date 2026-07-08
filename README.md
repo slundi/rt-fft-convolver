@@ -21,33 +21,74 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rust-convolver = "0.1.0"
+rt-fft-convolver = "0.1"
 ```
 
 ## 🚀 Quick start
 
-```rust
-use rust_convolver::{Convolver, Config};
+The crate exposes composable primitives — assemble the ones you need for
+your signal path.  A minimal mono chain using the partitioned FFT engine
+(one block of algorithmic latency) plus IR normalisation:
 
-fn main() {
-    // Load your Impulse Response (IR)
-    let ir_data = load_wav("cab_ir.wav"); 
-    
-    // Initialize the engine for 44.1kHz with a 64-sample buffer
-    let mut engine = Convolver::new(Config {
-        sample_rate: 44100.0,
-        partition_size: 64,
-        latency_mode: LatencyMode::Zero,
-    });
+```rust,no_run
+use rt_fft_convolver::{
+    DenormalGuard, Mixer, UniformPartitionEngine, load_ir,
+};
 
-    engine.load_ir(&ir_data);
+const BLOCK: usize = 64;
 
-    // In your audio callback
-    audio_host.set_callback(move |buffer| {
-        engine.process(buffer);
-    });
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ── Load and resample the IR to the host sample rate ──────────────────
+    let ir = load_ir("cab_ir.wav", 48_000)?;
+    let samples = &ir.channels[0]; // mono
+
+    // ── FFT-partitioned convolution across the whole IR ───────────────────
+    let mut engine = UniformPartitionEngine::new(samples, BLOCK);
+
+    // ── Mixer normalises IR loudness and blends dry / wet ─────────────────
+    let mixer = Mixer::new(samples, 1.0); // fully wet
+
+    // Scratch buffers used by the render callback (allocate up front).
+    let mut wet = [0.0f32; BLOCK];
+
+    // ── Real-time render callback ─────────────────────────────────────────
+    let mut process = move |input: &[f32; BLOCK], output: &mut [f32; BLOCK]| {
+        let _guard = DenormalGuard::new(); // FTZ for the whole callback
+
+        wet.fill(0.0);
+        engine.process(input, &mut wet);   // convolve x ⊛ ir into wet
+
+        mixer.process(input, &wet, output); // dry × cos + wet × sin·gain
+    };
+
+    // Plug `process` into your audio host of choice.
+    let (input, mut output) = ([0.0f32; BLOCK], [0.0f32; BLOCK]);
+    process(&input, &mut output);
+    Ok(())
 }
 ```
+
+### Zero-latency mode
+
+For applications that need sub-block latency (live guitar rigs), the
+[`DirectConvolver`] primitive handles the first `head_len` IR taps in the
+time domain with **zero algorithmic latency**.  Assembling it into a true
+hybrid engine requires delaying the tail input by `head_len` samples so the
+two paths don't double-count — a dedicated `HybridConvolver` type will land
+in a future release.  Until then, use [`DirectConvolver`] alone for short
+IRs (≤ a few hundred taps) or [`UniformPartitionEngine`] for long IRs.
+
+### Stereo and true-stereo
+
+[`StereoConvolver`] runs an independent engine per channel;
+[`TrueStereoConvolver`] runs the full 4-path routing matrix (L→L, L→R, R→L,
+R→R) needed for stereo-microphone IR captures.  Both types expose the same
+`process(in_l, in_r, out_l, out_r)` signature.
+
+[`DirectConvolver`]: https://docs.rs/rt-fft-convolver/latest/rt_fft_convolver/struct.DirectConvolver.html
+[`UniformPartitionEngine`]: https://docs.rs/rt-fft-convolver/latest/rt_fft_convolver/struct.UniformPartitionEngine.html
+[`StereoConvolver`]: https://docs.rs/rt-fft-convolver/latest/rt_fft_convolver/struct.StereoConvolver.html
+[`TrueStereoConvolver`]: https://docs.rs/rt-fft-convolver/latest/rt_fft_convolver/struct.TrueStereoConvolver.html
 
 ## 🤝 Contributing
 
