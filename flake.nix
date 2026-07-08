@@ -27,16 +27,7 @@
         mkhl.direnv
         vadimcn.vscode-lldb
         redhat.vscode-yaml
-        ryanluker.vscode-coverage-gutters
-        # Note: If swellaby is not in your nixpkgs channel,
-        # you may need to use a community overlay or skip it here.
-        swellaby.vscode-rust-test-adapter
       ];
-      # Create a custom VSCodium with these extensions
-      custom-codium = pkgs.vscode-with-extensions.override {
-        vscode = pkgs.vscodium;
-        vscodeExtensions = extensions;
-      };
 
       # Define the rust toolchain from your toml
       rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
@@ -55,13 +46,40 @@
           prek # pre-commit
           gitleaks # The compiled secret scanner or trufflehog or ripgrep
           just # Command runner
-          custom-codium
         ];
 
         # This runs when the shell starts
         shellHook = ''
           echo "🦀 Rust Dev Shell Loaded"
-          echo "💡 Tip: Run 'codium .' to start coding with all extensions pre-installed."
+
+          # Enrich the system-installed VSCodium with our extensions,
+          # only adding those not already present in the user's profile.
+          if command -v codium >/dev/null 2>&1; then
+            ext_dir="$HOME/.vscode-oss/extensions"
+            mkdir -p "$ext_dir"
+            installed=$(codium --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            added=0
+            for ext_pkg in ${pkgs.lib.concatMapStringsSep " " (e: "${e}") extensions}; do
+              for src in "$ext_pkg"/share/vscode/extensions/*/; do
+                [ -d "$src" ] || continue
+                name=$(basename "$src")
+                lower=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+                if ! printf '%s\n' "$installed" | grep -qxF "$lower"; then
+                  cp -rL --no-preserve=mode,ownership "$src" "$ext_dir/$name"
+                  echo "  + added VSCodium extension: $name"
+                  added=$((added + 1))
+                fi
+              done
+            done
+            if [ "$added" -eq 0 ]; then
+              echo "Tip: Run 'codium .' — all flake-provided extensions already installed."
+            else
+              echo "Tip: Restart VSCodium to pick up $added new extension(s)."
+            fi
+          else
+            echo "Note: 'codium' not found on PATH — skipping extension seeding."
+          fi
+
           # Automatically install hooks if .git exists
           if [ -d .git ] && command -v prek >/dev/null; then
             prek install
