@@ -131,13 +131,24 @@ impl Mixer {
     /// output[n] = dry[n] × dry_gain + wet[n] × wet_gain
     /// ```
     ///
-    /// All three slices must have the same length.
+    /// All three slices must have the same length.  In release builds a
+    /// length mismatch is handled deterministically — samples up to
+    /// `min(dry.len(), wet.len(), output.len())` are processed and any
+    /// trailing `output` samples are left untouched.  In debug builds a
+    /// mismatch panics via the assertions below.
     ///
     /// **Real-time safe** — no allocation, no locking, no panics in release
     /// builds.
     pub fn process(&self, dry: &[f32], wet: &[f32], output: &mut [f32]) {
         debug_assert_eq!(dry.len(), wet.len(), "dry and wet length mismatch");
         debug_assert_eq!(dry.len(), output.len(), "dry and output length mismatch");
+
+        // Take the minimum length explicitly so slicing is deterministic and
+        // the compiler can hoist bounds checks out of the inner loop.
+        let n = dry.len().min(wet.len()).min(output.len());
+        let dry = &dry[..n];
+        let wet = &wet[..n];
+        let output = &mut output[..n];
 
         for ((&d, &w), y) in dry.iter().zip(wet.iter()).zip(output.iter_mut()) {
             *y = d * self.dry_gain + w * self.wet_gain;
@@ -299,6 +310,31 @@ mod tests {
         m.process(&dry, &wet, &mut out);
         for &y in &out {
             assert_approx("out", y, 3.0);
+        }
+    }
+
+    /// In release builds (or when debug asserts are compiled out), mismatched
+    /// lengths must process `min(len)` samples and leave the tail untouched.
+    /// We exercise the release-behavior branch directly by comparing shorter
+    /// input slices against a longer output buffer.
+    #[test]
+    fn process_shorter_input_leaves_tail_untouched() {
+        let m = Mixer::new(&[1.0f32], 0.0); // fully dry, ir_gain=1
+        let dry = [1.0f32, 2.0]; // shorter
+        let wet = [0.0f32, 0.0];
+        let mut out = [99.0f32; 5]; // longer sentinel
+
+        // NOTE: this call would trip a debug_assert_eq in debug builds.  It is
+        // intentionally invoked here for the release-semantics contract — we
+        // skip the panic in debug and only verify determinism in release.
+        if !cfg!(debug_assertions) {
+            m.process(&dry, &wet, &mut out);
+            assert_approx("out[0]", out[0], 1.0);
+            assert_approx("out[1]", out[1], 2.0);
+            // Samples past min(len) must be untouched.
+            for (i, &y) in out.iter().enumerate().skip(2) {
+                assert_approx(&format!("out[{i}]"), y, 99.0);
+            }
         }
     }
 }
