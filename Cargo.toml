@@ -6,7 +6,7 @@ readme = "README.md"
 license = "MIT"
 repository = "https://codeberg.org/slundi/rt-fft-convolver"
 keywords = ["dsp", "fft", "convolution", "audio", "guitar-effects"]
-categories = ["multimedia::audio", "rendering::engine"]
+categories = ["multimedia::audio", "mathematics"]
 version = "0.1.1"
 edition = "2024"
 
