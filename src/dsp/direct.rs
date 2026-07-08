@@ -88,22 +88,22 @@ impl DirectConvolver {
 
     /// Replace the IR head coefficients with a new slice.
     ///
-    /// If the new length differs from the current one the internal buffers are
-    /// reallocated and the sample history is cleared.
+    /// If the new length differs from the current one the internal history
+    /// buffer is reallocated; otherwise the existing allocation is reused and
+    /// zeroed.  The sample history is always cleared to avoid artefacts from
+    /// the previous IR.
     ///
     /// **May allocate** — call from a non-real-time thread.
     pub fn load_ir(&mut self, ir_head: &[f32]) {
-        let new_len = ir_head.len();
-        if new_len != self.ir_head.len() {
-            self.history = vec![0.0f32; 2 * new_len.max(1)];
-            self.write_pos = 0;
+        let needed_history = 2 * ir_head.len().max(1);
+        if needed_history != self.history.len() {
+            self.history = vec![0.0f32; needed_history];
         } else {
-            // Same length: keep history but clear it so there are no artefacts
-            // from the previous IR.
             self.history.fill(0.0);
-            self.write_pos = 0;
         }
-        self.ir_head = ir_head.to_vec();
+        self.write_pos = 0;
+        self.ir_head.clear();
+        self.ir_head.extend_from_slice(ir_head);
     }
 
     /// Clear the sample history without reallocating.
