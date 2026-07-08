@@ -7,18 +7,10 @@ license = "MIT"
 repository = "https://codeberg.org/slundi/rt-fft-convolver"
 keywords = ["dsp", "fft", "convolution", "audio", "guitar-effects"]
 categories = ["multimedia::audio", "mathematics"]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-# [lib]
-# name = "MY_PROJECT"
-# path = "src/lib.rs"
-
-# [[bin]]
-# name = "MY_PROJECT"
-# path = "src/main.rs"
 
 [package.metadata.docs.rs]
 targets = [
@@ -32,9 +24,9 @@ targets = [
 
 [dependencies]
 hound = "3.5"
-rubato = "2.0"
+rubato = "3.0"
 rustfft = "6.4"
-wide = "1.3"
+wide = "1.5"
 
 [workspace.metadata.cargo-machete]
 ignored = []
