@@ -525,6 +525,58 @@ mod tests {
         assert_approx("out_r", &out_r, &[4.0f32; BLOCK]);
     }
 
+    /// The four paths may hold IRs of different lengths (and thus different
+    /// partition counts).  A long ll path together with an empty lr must still
+    /// produce clean output — no cross-talk from either path bleeding into
+    /// the other, even when their internal delay-line depths differ.
+    #[test]
+    fn true_stereo_asymmetric_partition_counts() {
+        // ll: 8-tap IR → 2 partitions of size 4
+        // lr: empty      → 0 partitions
+        // rl: 4-tap IR   → 1 partition of size 4
+        // rr: 16-tap IR  → 4 partitions of size 4
+        let ir_ll = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+        let ir_rl = [0.0_f32, 2.0, 0.0, 0.0]; // one-sample delay × 2
+        let ir_rr: Vec<f32> = std::iter::once(3.0)
+            .chain(std::iter::repeat_n(0.0, 15))
+            .collect();
+        let mut conv = TrueStereoConvolver::new(&ir_ll, &[], &ir_rl, &ir_rr, BLOCK);
+
+        // Block 1: impulse on both channels.
+        let in_l = [1.0_f32, 0.0, 0.0, 0.0];
+        let in_r = [1.0_f32, 0.0, 0.0, 0.0];
+        let (mut out_l, mut out_r) = ([0.0_f32; BLOCK], [0.0_f32; BLOCK]);
+        conv.process(&in_l, &in_r, &mut out_l, &mut out_r);
+
+        // out_L block 1 = ll[0]*in_L[0] + rl*in_R (delay one, gain 2)
+        //   y_l[0] = 1*1 + 0 (rl has no in_R history before sample 0) = 1
+        //   y_l[1] = 0 + 2*1 = 2 (rl[1]=2 * in_R[0]=1)
+        assert!((out_l[0] - 1.0).abs() < EPSILON, "out_l[0]={}", out_l[0]);
+        assert!((out_l[1] - 2.0).abs() < EPSILON, "out_l[1]={}", out_l[1]);
+
+        // out_R block 1 = rr[0] * in_R[0] = 3
+        assert!((out_r[0] - 3.0).abs() < EPSILON, "out_r[0]={}", out_r[0]);
+        // Samples 1..4 should be zero since rr only has a tap at 0.
+        for (i, val) in out_r.iter().enumerate().skip(1) {
+            assert!(val.abs() < EPSILON, "out_r[{i}]={val}");
+        }
+
+        // Block 2: silence — verify tail of ll (0.5 at sample 7) fires in
+        // out_L[3] of this block (7 = block1[0..3] + block2[0..3], so tap at
+        // index 7 lands in block 2 sample 3).
+        let (mut out_l2, mut out_r2) = ([0.0_f32; BLOCK], [0.0_f32; BLOCK]);
+        conv.process(&[0.0; BLOCK], &[0.0; BLOCK], &mut out_l2, &mut out_r2);
+        assert!(
+            (out_l2[3] - 0.5).abs() < EPSILON,
+            "ll tail expected 0.5 at block 2 sample 3, got {}",
+            out_l2[3]
+        );
+        // No cross-talk from lr (which is empty).
+        for (i, val) in out_r2.iter().enumerate() {
+            assert!(val.abs() < EPSILON, "out_r2[{i}]={val} (expected 0)");
+        }
+    }
+
     /// Multi-block tail energy propagates correctly through the rl cross-path.
     ///
     /// IR: rl = [0, 0, 0, 1] (4-sample delay inside one partition), others empty.
