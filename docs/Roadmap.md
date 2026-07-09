@@ -38,10 +38,10 @@ This roadmap outlines the development of a zero-latency, high-performance convol
   - Allow switching between cabinets (Cab A to Cab B) without audio clicks.
 
 ## Phase 5: Follow-up performance / robustness
-- [ ] **Hybrid zero-latency engine**:
+- [x] **Hybrid zero-latency engine**:
   - `HybridConvolver` type that wraps `DirectConvolver` + a delayed
     `UniformPartitionEngine` so `head + tail` composition doesn't
-    double-count taps.  Until this lands users must pick one primitive.
+    double-count taps.
 - [ ] **`realfft` for the render FFT**:
   - Replace `rustfft`'s complex-in-complex-out plan with a real-to-complex
     plan.  Cuts inner-loop memory and roughly halves the FFT / IFFT cost.

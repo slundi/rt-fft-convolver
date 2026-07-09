@@ -22,6 +22,9 @@ pub use engine::offline::OfflineConvolver;
 /// Click-free IR switching via equal-power cross-fading between two engines.
 pub use engine::crossfade::CrossfadingConvolver;
 
+/// Zero-latency hybrid convolver: direct head + delayed partitioned tail.
+pub use engine::hybrid::HybridConvolver;
+
 pub use error::LoadError;
 
 /// IR loading and sample-rate conversion utilities.
