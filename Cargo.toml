@@ -24,6 +24,7 @@ targets = [
 
 [dependencies]
 hound = "3.5"
+realfft = "3.5"
 rubato = "3.0"
 rustfft = "6.4"
 wide = "1.5"

@@ -42,7 +42,7 @@ This roadmap outlines the development of a zero-latency, high-performance convol
   - `HybridConvolver` type that wraps `DirectConvolver` + a delayed
     `UniformPartitionEngine` so `head + tail` composition doesn't
     double-count taps.
-- [ ] **`realfft` for the render FFT**:
+- [x] **`realfft` for the render FFT**:
   - Replace `rustfft`'s complex-in-complex-out plan with a real-to-complex
     plan.  Cuts inner-loop memory and roughly halves the FFT / IFFT cost.
     Requires updating `FftHandler`, `UniformPartitionEngine`, and the

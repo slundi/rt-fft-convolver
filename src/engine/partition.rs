@@ -13,8 +13,10 @@
 //! The IR tail (everything after the zero-latency head handled by
 //! [`DirectConvolver`]) is split into equal **partitions** of `block_size`
 //! samples.  Each partition is zero-padded to `2 × block_size` and
-//! pre-transformed via FFT, giving a frequency-domain representation stored
-//! in [`ir_spectra`].
+//! pre-transformed via a real-to-complex FFT, giving a frequency-domain
+//! representation of `block_size + 1` unique complex bins stored in
+//! [`ir_spectra`] (the remaining bins of a full 2N-point spectrum are
+//! conjugate-symmetric and are omitted, halving spectrum memory).
 //!
 //! On every audio callback (one block of `block_size` samples):
 //!
@@ -66,29 +68,32 @@ pub struct UniformPartitionEngine {
     /// Audio block size N (= partition size).
     block_size: usize,
 
-    /// Pre-computed 2N-point FFT of each IR tail partition.
-    /// `ir_spectra[k]` is the spectrum of IR samples `k*N .. (k+1)*N`
-    /// (zero-padded to 2N).
+    /// Pre-computed 2N-point real-input FFT of each IR tail partition,
+    /// stored as its `N + 1` unique complex bins (the rest are
+    /// conjugate-symmetric and omitted).  `ir_spectra[k]` is the
+    /// spectrum of IR samples `k*N .. (k+1)*N` (zero-padded to 2N in
+    /// the time domain before the transform).
     ir_spectra: Vec<Vec<Complex<f32>>>,
 
     /// Frequency-domain delay line: circular buffer of the P most recent
     /// input spectra.  Updated once per block via [`FreqDomainDelayLine::push`].
     fdl: FreqDomainDelayLine,
 
-    /// Overlap-save buffer of length 2N.
+    /// Overlap-save buffer of length 2N (time-domain).
     /// `input_buf[0..N]`  = previous block (the "overlap").
     /// `input_buf[N..2N]` = current  block (the "new" data).
     input_buf: Vec<f32>,
 
-    /// Frequency-domain accumulator for the multiply-accumulate step.
-    /// Also used as a temporary buffer for the forward FFT result.
+    /// Frequency-domain accumulator (`N + 1` complex bins) for the
+    /// multiply-accumulate step.  Also used as a temporary buffer for
+    /// the forward FFT result.
     acc_buf: Vec<Complex<f32>>,
 
     /// Time-domain IFFT output buffer of length 2N.
     /// The valid output lives in `out_buf[N..2N]`.
     out_buf: Vec<f32>,
 
-    /// Pre-planned FFT / IFFT engine for 2N-point transforms.
+    /// Pre-planned real-to-complex / complex-to-real 2N-point transforms.
     fft: FftHandler,
 }
 
@@ -113,6 +118,8 @@ impl UniformPartitionEngine {
         assert!(block_size > 0, "block_size must be > 0");
 
         let fft_size = 2 * block_size;
+        // Real-input FFT stores only the N + 1 unique bins.
+        let spectrum_size = block_size + 1;
 
         let num_partitions = if ir_tail.is_empty() {
             0
@@ -134,7 +141,7 @@ impl UniformPartitionEngine {
                 let mut padded = vec![0.0f32; fft_size];
                 padded[..end - start].copy_from_slice(&ir_tail[start..end]);
 
-                let mut spectrum = vec![Complex::default(); fft_size];
+                let mut spectrum = vec![Complex::default(); spectrum_size];
                 fft.forward(&padded, &mut spectrum);
                 spectrum
             })
@@ -142,14 +149,14 @@ impl UniformPartitionEngine {
 
         // FDL needs at least one slot; it is never accessed when num_partitions
         // == 0 because process() returns early in that case.
-        let fdl = FreqDomainDelayLine::new(num_partitions.max(1), fft_size);
+        let fdl = FreqDomainDelayLine::new(num_partitions.max(1), spectrum_size);
 
         Self {
             block_size,
             ir_spectra,
             fdl,
             input_buf: vec![0.0f32; fft_size],
-            acc_buf: vec![Complex::default(); fft_size],
+            acc_buf: vec![Complex::default(); spectrum_size],
             out_buf: vec![0.0f32; fft_size],
             fft,
         }

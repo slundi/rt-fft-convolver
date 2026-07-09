@@ -13,15 +13,17 @@
 //! Y[t] = Σ_{k=0}^{P-1}  X[t-k]  ⊙  H[k]
 //! ```
 //!
-//! where `X[t-k]` is the 2N-point FFT of the input from `k` blocks ago and
-//! `H[k]` is the pre-computed FFT of the k-th IR partition.  The FDL stores
-//! the P most recent `X` values and [`accumulate`] evaluates the sum above in
-//! O(P · N) complex multiplications.
+//! where `X[t-k]` is the real-input 2N-point FFT of the input from `k`
+//! blocks ago (stored as its `N + 1` unique complex bins — the rest are
+//! conjugate-symmetric mirrors) and `H[k]` is the pre-computed FFT of the
+//! k-th IR partition.  The FDL stores the P most recent `X` values and
+//! [`accumulate`] evaluates the sum above in O(P · N) complex
+//! multiplications.
 //!
 //! # Memory layout
 //!
 //! Internally the buffer is a flat circular array of `P` slots, each holding
-//! `fft_size` complex bins.  The write pointer advances by one slot per
+//! `spectrum_size` complex bins.  The write pointer advances by one slot per
 //! [`push`]; no memory is ever moved.
 //!
 //! ```text
@@ -150,7 +152,7 @@ fn complex_mac(acc: &mut [Complex<f32>], slot: &[Complex<f32>], ir: &[Complex<f3
     }
 
     // Scalar tail for n % 4 remaining bins.
-    // In practice fft_size = 2 * block_size is always a power-of-two ≥ 4,
+    // In practice spectrum_size = 2 * block_size is always a power-of-two ≥ 4,
     // so this branch is never taken — it exists only for correctness.
     for i in (chunks * 4)..n {
         acc[i] += slot[i] * ir[i];
@@ -172,33 +174,36 @@ fn complex_mac(acc: &mut [Complex<f32>], slot: &[Complex<f32>], ir: &[Complex<f3
 /// [`push`]: FreqDomainDelayLine::push
 /// [`accumulate`]: FreqDomainDelayLine::accumulate
 pub struct FreqDomainDelayLine {
-    /// Circular slot buffer, shape `[num_partitions][fft_size]`.
+    /// Circular slot buffer, shape `[num_partitions][spectrum_size]`.
     slots: Vec<Vec<Complex<f32>>>,
 
     /// Index of the **next** slot to write.
     /// The most-recently pushed spectrum is at `(write_pos + P − 1) % P`.
     write_pos: usize,
 
-    /// Number of complex bins per spectrum (= 2 × block_size).
-    fft_size: usize,
+    /// Number of complex bins per spectrum.  With the real-input FFT
+    /// used by [`crate::dsp::FftHandler`] this is `block_size + 1`
+    /// (`fft_size / 2 + 1`), i.e. the unique bins of a `2N`-point
+    /// real-to-complex transform.
+    spectrum_size: usize,
 }
 
 impl FreqDomainDelayLine {
-    /// Allocate an FDL with `num_partitions` slots, each holding `fft_size`
+    /// Allocate an FDL with `num_partitions` slots, each holding `spectrum_size`
     /// complex bins, initialised to zero.
     ///
     /// **Allocates** — call from a non-real-time thread.
     ///
     /// # Panics
     ///
-    /// Panics if `num_partitions == 0` or `fft_size == 0`.
-    pub fn new(num_partitions: usize, fft_size: usize) -> Self {
+    /// Panics if `num_partitions == 0` or `spectrum_size == 0`.
+    pub fn new(num_partitions: usize, spectrum_size: usize) -> Self {
         assert!(num_partitions > 0, "num_partitions must be > 0");
-        assert!(fft_size > 0, "fft_size must be > 0");
+        assert!(spectrum_size > 0, "spectrum_size must be > 0");
         Self {
-            slots: vec![vec![Complex::default(); fft_size]; num_partitions],
+            slots: vec![vec![Complex::default(); spectrum_size]; num_partitions],
             write_pos: 0,
-            fft_size,
+            spectrum_size,
         }
     }
 
@@ -208,10 +213,11 @@ impl FreqDomainDelayLine {
         self.slots.len()
     }
 
-    /// Length of each stored spectrum in complex bins (= 2 × block_size).
+    /// Number of complex bins in each stored spectrum
+    /// (`block_size + 1` for the real-input FFT used by the render path).
     #[inline]
-    pub fn fft_size(&self) -> usize {
-        self.fft_size
+    pub fn spectrum_size(&self) -> usize {
+        self.spectrum_size
     }
 
     /// Insert `spectrum` as the newest entry and advance the write pointer.
@@ -219,7 +225,7 @@ impl FreqDomainDelayLine {
     /// After this call `spectrum` is at delay index 0 for the next
     /// [`accumulate`] call.
     ///
-    /// `spectrum.len()` must equal [`Self::fft_size()`].
+    /// `spectrum.len()` must equal [`Self::spectrum_size()`].
     ///
     /// **Real-time safe** — no allocation.
     ///
@@ -227,8 +233,8 @@ impl FreqDomainDelayLine {
     pub fn push(&mut self, spectrum: &[Complex<f32>]) {
         debug_assert_eq!(
             spectrum.len(),
-            self.fft_size,
-            "push: spectrum length must equal fft_size"
+            self.spectrum_size,
+            "push: spectrum length must equal spectrum_size"
         );
         self.slots[self.write_pos].copy_from_slice(spectrum);
         self.write_pos = (self.write_pos + 1) % self.slots.len();
@@ -249,7 +255,7 @@ impl FreqDomainDelayLine {
     /// `acc` is **not** zeroed before use — zero it beforehand if a fresh
     /// result is needed.
     ///
-    /// All slices must have length [`Self::fft_size()`], and
+    /// All slices must have length [`Self::spectrum_size()`], and
     /// `ir_spectra.len()` must equal [`Self::num_partitions()`].
     ///
     /// **Real-time safe** — no allocation.
@@ -263,8 +269,8 @@ impl FreqDomainDelayLine {
         );
         debug_assert_eq!(
             acc.len(),
-            self.fft_size,
-            "accumulate: acc.len() must equal fft_size"
+            self.spectrum_size,
+            "accumulate: acc.len() must equal spectrum_size"
         );
 
         let p = self.slots.len();
@@ -301,14 +307,14 @@ mod tests {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// Build a constant spectrum: every bin equals `value`.
-    fn const_spec(fft_size: usize, value: Complex<f32>) -> Vec<Complex<f32>> {
-        vec![value; fft_size]
+    fn const_spec(spectrum_size: usize, value: Complex<f32>) -> Vec<Complex<f32>> {
+        vec![value; spectrum_size]
     }
 
     /// Build identity IR spectra: each partition is a flat spectrum of ones.
     /// Accumulating against these returns the sum of all stored slots.
-    fn identity_ir(num_partitions: usize, fft_size: usize) -> Vec<Vec<Complex<f32>>> {
-        vec![const_spec(fft_size, Complex::new(1.0, 0.0)); num_partitions]
+    fn identity_ir(num_partitions: usize, spectrum_size: usize) -> Vec<Vec<Complex<f32>>> {
+        vec![const_spec(spectrum_size, Complex::new(1.0, 0.0)); num_partitions]
     }
 
     // ── Construction ──────────────────────────────────────────────────────────
@@ -330,7 +336,7 @@ mod tests {
     fn accessors_report_construction_params() {
         let fdl = FreqDomainDelayLine::new(5, 16);
         assert_eq!(fdl.num_partitions(), 5);
-        assert_eq!(fdl.fft_size(), 16);
+        assert_eq!(fdl.spectrum_size(), 16);
     }
 
     // ── push / accumulate correctness ─────────────────────────────────────────
@@ -338,8 +344,8 @@ mod tests {
     /// After one push with identity IR, acc must equal the pushed spectrum.
     #[test]
     fn single_push_identity_ir() {
-        let fft_size = 4;
-        let mut fdl = FreqDomainDelayLine::new(1, fft_size);
+        let spectrum_size = 4;
+        let mut fdl = FreqDomainDelayLine::new(1, spectrum_size);
         let pushed = vec![
             Complex::new(1.0, 2.0),
             Complex::new(3.0, 4.0),
@@ -348,8 +354,8 @@ mod tests {
         ];
         fdl.push(&pushed);
 
-        let ir = identity_ir(1, fft_size);
-        let mut acc = vec![Complex::default(); fft_size];
+        let ir = identity_ir(1, spectrum_size);
+        let mut acc = vec![Complex::default(); spectrum_size];
         fdl.accumulate(&ir, &mut acc);
 
         for (a, &p) in acc.iter().zip(pushed.iter()) {
@@ -366,8 +372,8 @@ mod tests {
     /// Expected: acc[0] = B[0], acc[1] = A[1].
     #[test]
     fn delay_ordering_most_recent_is_slot_zero() {
-        let fft_size = 4;
-        let mut fdl = FreqDomainDelayLine::new(2, fft_size);
+        let spectrum_size = 4;
+        let mut fdl = FreqDomainDelayLine::new(2, spectrum_size);
 
         let a = vec![
             Complex::new(10.0, 0.0),
@@ -402,7 +408,7 @@ mod tests {
             ],
         ];
 
-        let mut acc = vec![Complex::default(); fft_size];
+        let mut acc = vec![Complex::default(); spectrum_size];
         fdl.accumulate(&ir, &mut acc);
 
         assert!((acc[0].re - 30.0).abs() < EPSILON, "acc[0]={}", acc[0]);
@@ -417,20 +423,20 @@ mod tests {
     /// With identity IR: acc = B + C (A was evicted).
     #[test]
     fn circular_wrap_evicts_oldest_slot() {
-        let fft_size = 2;
-        let mut fdl = FreqDomainDelayLine::new(2, fft_size);
+        let spectrum_size = 2;
+        let mut fdl = FreqDomainDelayLine::new(2, spectrum_size);
 
-        let a = const_spec(fft_size, Complex::new(100.0, 0.0));
-        let b = const_spec(fft_size, Complex::new(2.0, 0.0));
-        let c = const_spec(fft_size, Complex::new(3.0, 0.0));
+        let a = const_spec(spectrum_size, Complex::new(100.0, 0.0));
+        let b = const_spec(spectrum_size, Complex::new(2.0, 0.0));
+        let c = const_spec(spectrum_size, Complex::new(3.0, 0.0));
 
         fdl.push(&a); // will be evicted on 4th push
         fdl.push(&b); // older (delay 1)
         fdl.push(&c); // most recent (delay 0)
         // A is now overwritten: only B and C remain.
 
-        let ir = identity_ir(2, fft_size);
-        let mut acc = vec![Complex::default(); fft_size];
+        let ir = identity_ir(2, spectrum_size);
+        let mut acc = vec![Complex::default(); spectrum_size];
         fdl.accumulate(&ir, &mut acc);
 
         // Expected: B + C = 2 + 3 = 5 in each bin.
@@ -442,8 +448,8 @@ mod tests {
     /// Complex IR entries: accumulate computes correct complex products.
     #[test]
     fn complex_multiply_accumulate() {
-        let fft_size = 1;
-        let mut fdl = FreqDomainDelayLine::new(1, fft_size);
+        let spectrum_size = 1;
+        let mut fdl = FreqDomainDelayLine::new(1, spectrum_size);
 
         // Push one spectrum: [3 + 4j].
         let spectrum = vec![Complex::new(3.0, 4.0)];
@@ -453,7 +459,7 @@ mod tests {
         let ir = vec![vec![Complex::new(2.0, 1.0)]];
 
         // Expected: (3+4j)*(2+1j) = 6+3j+8j+4j² = (6-4) + (3+8)j = 2 + 11j.
-        let mut acc = vec![Complex::default(); fft_size];
+        let mut acc = vec![Complex::default(); spectrum_size];
         fdl.accumulate(&ir, &mut acc);
 
         assert!((acc[0].re - 2.0).abs() < EPSILON, "re={}", acc[0].re);
@@ -463,13 +469,13 @@ mod tests {
     /// accumulate *adds* to acc — pre-existing values are preserved.
     #[test]
     fn accumulate_adds_to_existing_acc() {
-        let fft_size = 2;
-        let mut fdl = FreqDomainDelayLine::new(1, fft_size);
-        fdl.push(&const_spec(fft_size, Complex::new(1.0, 0.0)));
+        let spectrum_size = 2;
+        let mut fdl = FreqDomainDelayLine::new(1, spectrum_size);
+        fdl.push(&const_spec(spectrum_size, Complex::new(1.0, 0.0)));
 
-        let ir = identity_ir(1, fft_size);
+        let ir = identity_ir(1, spectrum_size);
         // Pre-seed acc with 5.
-        let mut acc = vec![Complex::new(5.0, 0.0); fft_size];
+        let mut acc = vec![Complex::new(5.0, 0.0); spectrum_size];
         fdl.accumulate(&ir, &mut acc);
 
         // Each bin: 5 + 1 * 1 = 6.
@@ -484,16 +490,16 @@ mod tests {
     /// FDL behaves identically to a freshly-constructed one.
     #[test]
     fn reset_zeros_all_slots() {
-        let fft_size = 4;
-        let mut fdl = FreqDomainDelayLine::new(2, fft_size);
+        let spectrum_size = 4;
+        let mut fdl = FreqDomainDelayLine::new(2, spectrum_size);
 
         // Push non-zero data.
-        fdl.push(&const_spec(fft_size, Complex::new(9.0, 9.0)));
-        fdl.push(&const_spec(fft_size, Complex::new(9.0, 9.0)));
+        fdl.push(&const_spec(spectrum_size, Complex::new(9.0, 9.0)));
+        fdl.push(&const_spec(spectrum_size, Complex::new(9.0, 9.0)));
         fdl.reset();
 
-        let ir = identity_ir(2, fft_size);
-        let mut acc = vec![Complex::default(); fft_size];
+        let ir = identity_ir(2, spectrum_size);
+        let mut acc = vec![Complex::default(); spectrum_size];
         fdl.accumulate(&ir, &mut acc);
 
         for c in &acc {
@@ -505,18 +511,18 @@ mod tests {
     /// one for a given sequence of pushes.
     #[test]
     fn reset_produces_same_output_as_fresh_fdl() {
-        let fft_size = 4;
+        let spectrum_size = 4;
         let p = 2;
 
-        let mut fdl = FreqDomainDelayLine::new(p, fft_size);
-        let mut fresh = FreqDomainDelayLine::new(p, fft_size);
+        let mut fdl = FreqDomainDelayLine::new(p, spectrum_size);
+        let mut fresh = FreqDomainDelayLine::new(p, spectrum_size);
 
-        let spec_a = const_spec(fft_size, Complex::new(3.0, 1.0));
-        let spec_b = const_spec(fft_size, Complex::new(7.0, 2.0));
+        let spec_a = const_spec(spectrum_size, Complex::new(3.0, 1.0));
+        let spec_b = const_spec(spectrum_size, Complex::new(7.0, 2.0));
 
         // Prime the FDL, then reset.
-        fdl.push(&const_spec(fft_size, Complex::new(99.0, 99.0)));
-        fdl.push(&const_spec(fft_size, Complex::new(99.0, 99.0)));
+        fdl.push(&const_spec(spectrum_size, Complex::new(99.0, 99.0)));
+        fdl.push(&const_spec(spectrum_size, Complex::new(99.0, 99.0)));
         fdl.reset();
 
         // Feed the same sequence to both.
@@ -525,9 +531,9 @@ mod tests {
         fdl.push(&spec_b);
         fresh.push(&spec_b);
 
-        let ir = identity_ir(p, fft_size);
-        let mut acc_fdl = vec![Complex::default(); fft_size];
-        let mut acc_fresh = vec![Complex::default(); fft_size];
+        let ir = identity_ir(p, spectrum_size);
+        let mut acc_fdl = vec![Complex::default(); spectrum_size];
+        let mut acc_fresh = vec![Complex::default(); spectrum_size];
 
         fdl.accumulate(&ir, &mut acc_fdl);
         fresh.accumulate(&ir, &mut acc_fresh);
