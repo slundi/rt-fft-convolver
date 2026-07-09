@@ -16,6 +16,9 @@ pub use engine::mixer::Mixer;
 pub use engine::partition::UniformPartitionEngine;
 pub use engine::stereo::{StereoConvolver, TrueStereoConvolver};
 
+/// Offline high-fidelity (non-partitioned, `f64`) convolver for studio use.
+pub use engine::offline::OfflineConvolver;
+
 pub use error::LoadError;
 
 /// IR loading and sample-rate conversion utilities.

@@ -5,7 +5,7 @@
 //! [`load_ir`], and drive it through the full render chain
 //! (`UniformPartitionEngine` + `Mixer`).
 
-use rt_fft_convolver::{Mixer, UniformPartitionEngine, load_ir, resample};
+use rt_fft_convolver::{Mixer, OfflineConvolver, UniformPartitionEngine, load_ir, resample};
 
 // ─── Local helpers ────────────────────────────────────────────────────────────
 
@@ -212,6 +212,53 @@ fn end_to_end_mixer_normalises_output_energy() {
         (out_energy - 1.0).abs() < 5e-3,
         "output energy {out_energy} deviated from expected 1.0"
     );
+}
+
+/// Offline high-fidelity convolver matches the real-time partitioned engine
+/// on the sample range they both cover — the offline engine produces the
+/// **full** linear convolution (M + L − 1 samples), while the partitioned
+/// engine emits M samples of the causal head.  Both must agree on the
+/// overlapping prefix within an audible-noise-floor tolerance (partitioned
+/// runs in `f32`, offline in `f64`).
+#[test]
+fn offline_convolver_matches_partitioned_engine_prefix() {
+    // Non-trivial IR that spans several partitions at block_size = 8.
+    let ir: Vec<f32> = (0..40)
+        .map(|i| ((i as f32) * 0.19).sin() * 0.4 - ((i as f32) * 0.07).cos() * 0.2)
+        .collect();
+
+    let block_size = 8;
+    let n_blocks = 12;
+    let input: Vec<f32> = (0..block_size * n_blocks)
+        .map(|i| ((i as f32) * 0.09).sin())
+        .collect();
+
+    // ── Partitioned (f32, real-time path) ─────────────────────────────────
+    let mut engine = UniformPartitionEngine::new(&ir, block_size);
+    let mut rt_out = Vec::with_capacity(input.len());
+    for chunk in input.chunks(block_size) {
+        let mut buf = vec![0.0f32; block_size];
+        engine.process(chunk, &mut buf);
+        rt_out.extend_from_slice(&buf);
+    }
+
+    // ── Offline (f64, non-partitioned path) ────────────────────────────────
+    let offline = OfflineConvolver::new(&ir);
+    let off_out = offline.convolve(&input);
+    // Full linear convolution length.
+    assert_eq!(off_out.len(), input.len() + ir.len() - 1);
+
+    // Compare the M-sample prefix — both engines produce the same causal
+    // convolution over that range.
+    for (i, (&rt, &off)) in rt_out.iter().zip(off_out.iter()).enumerate() {
+        let err = (rt - off).abs();
+        // f32 partitioned FFT roundtrip precision is ~1e-4; f64 offline
+        // is far tighter, so the diff is dominated by the partitioned path.
+        assert!(
+            err < 1e-3,
+            "sample {i}: partitioned {rt} vs offline {off} (abs err {err})"
+        );
+    }
 }
 
 /// The exported `resample` function is reachable through the crate root and

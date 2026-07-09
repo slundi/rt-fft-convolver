@@ -32,7 +32,7 @@ This roadmap outlines the development of a zero-latency, high-performance convol
 ## Phase 4: Optimization & Studio Mode
 - [x] **SIMD Optimization**:
   - Use ~~`packed_simd`~~ `simsimd` or auto-vectorization for complex multiplications.
-- [ ] **Offline High-Fidelity Mode**:
+- [x] **Offline High-Fidelity Mode**:
   - Create a non-partitioned, high-precision processing path for studio rendering.
 - [ ] **Cross-fading IR Switch**:
   - Allow switching between cabinets (Cab A to Cab B) without audio clicks.
