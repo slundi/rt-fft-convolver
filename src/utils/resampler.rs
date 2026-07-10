@@ -26,10 +26,10 @@
 
 use std::path::Path;
 
-// rubato 2.0 re-exports `audioadapter_buffers` so we can reach it through
+// rubato re-exports `audioadapter_buffers` so we can reach it through
 // the rubato namespace without adding an extra Cargo dependency.
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
-use rubato::{Fft, FixedSync, Resampler};
+use rubato::{Fft, FixedSync, Resampler, WindowFunction};
 
 use crate::LoadError;
 
@@ -108,12 +108,15 @@ fn make_resampler(from_rate: u32, to_rate: u32) -> Result<Fft<f32>, LoadError> {
     // 1 024-frame chunks: good balance between quality and per-call overhead.
     // sub_chunks = 2 widens the internal FFT window for better stopband attenuation.
     const CHUNK: usize = 1024;
-    Fft::<f32>::new(
+    // rubato 4.0 dropped `sub_chunks` from `Fft::new`; use `new_custom` to keep
+    // explicit control over the sub-chunk count and anti-aliasing window.
+    Fft::<f32>::new_custom(
         from_rate as usize,
         to_rate as usize,
         CHUNK,
         2, // sub-chunks (higher → better stopband, more memory)
         1, // mono — callers deinterleave before calling us
+        WindowFunction::BlackmanHarris2,
         FixedSync::Input,
     )
     .map_err(LoadError::Resample)

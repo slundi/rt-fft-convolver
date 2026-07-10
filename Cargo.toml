@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://codeberg.org/slundi/rt-fft-convolver"
 keywords = ["dsp", "fft", "convolution", "audio", "guitar-effects"]
 categories = ["multimedia::audio", "mathematics"]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -25,7 +25,7 @@ targets = [
 [dependencies]
 hound = "3.5"
 realfft = "3.5"
-rubato = "3.0"
+rubato = "4.0"
 rustfft = "6.4"
 wide = "1.5"
 
