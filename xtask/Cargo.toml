@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+description = "Bundler/utility runner for the rt-ir plugins (invoke via `cargo xtask`)."
+license = "MIT"
+publish = false
+
+[dependencies]
+# NIH-plug's bundler: builds the plugin cdylibs and lays out `.clap` / `.vst3`
+# bundles under `target/bundled/` (git-only, like nih-plug itself).
+nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }

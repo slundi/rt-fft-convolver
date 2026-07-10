@@ -1,0 +1,66 @@
+# Release: on a version tag, build + bundle on each OS, package, and attach the
+# archives + checksums to the release.  GitHub-Actions syntax (also runs on
+# Codeberg's Forgejo Actions).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            plat: linux-x86_64
+          - os: macos-latest
+            plat: macos-aarch64
+          - os: windows-latest
+            plat: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libxcb1-dev
+
+      - name: Bundle plugins (CLAP + VST3, with editor)
+        run: |
+          cargo xtask bundle rt-ir-cab --release --features gui
+          cargo xtask bundle rt-ir-reverb --release --features gui
+
+      # Bash is available on all three runners (Git Bash on Windows).
+      - name: Package
+        shell: bash
+        run: packaging/package.sh "${GITHUB_REF_NAME#v}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rt-ir-plugins-${{ matrix.plat }}
+          path: dist/*
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release with all artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

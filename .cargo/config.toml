@@ -1,0 +1,5 @@
+# `cargo xtask …` runs the NIH-plug bundler (see xtask/). Release mode keeps the
+# serde build shared with release plugin builds, as NIH-plug recommends.
+[alias]
+xtask = "run --package xtask --release --"
+xtask-debug = "run --package xtask --"

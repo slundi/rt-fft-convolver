@@ -204,22 +204,42 @@ Designed at `docs/UI-lv2.md`
 
 ## Phase 5: Packaging & release
 
-- [ ] **CI**: cross-compile for Linux (x86_64, aarch64), macOS
-  (universal), Windows (x86_64) via GitHub Actions / Codeberg CI.
-- [ ] **Bundling**:
-  - `.lv2` bundle with manifest.
-  - `.clap` single-file.
-  - `.vst3` bundle.
-- [ ] **Installers**:
-  - Debian `.deb` (LV2 + CLAP + VST3 in standard paths).
-  - macOS `.pkg` signed and notarised.
-  - Windows `.exe` (Inno Setup).
-- [ ] **Documentation**:
-  - Per-plugin manual under `docs/`.
-  - Screenshots + a short video for each plugin.
-- [ ] **Release channels**:
-  - Codeberg release tags with checksums.
-  - Optional: submit to KVR / linux-audio user announcements.
+> **Status:** bundling, CI, `just` recipes, Debian packaging, and per-plugin
+> manuals are in place; the bundler is verified end-to-end (CLAP + VST3
+> produced, staged into a `dist/` archive + `SHA256SUMS`).  macOS/Windows
+> installers are ready as scripts/templates but need their own OS + signing
+> identities to run; screenshots/video are a manual step; **LV2** is not emitted
+> (NIH-plug exports CLAP + VST3 only — see note below).
+
+- [x] **CI** (`.github/workflows/`, also read by Codeberg's Forgejo Actions):
+  - `ci.yaml` — fmt + clippy + tests (headless), plus a `gui` build/clippy
+    matrix on Ubuntu / macOS / Windows (Linux installs the X11/GL dev libs).
+  - `release.yaml` — per-OS bundle + package on tag, artifacts attached to the
+    release.  aarch64 Linux via `just bundle-cross` (needs a `cross` image with
+    the X11/GL libs).
+- [x] **CI runnable with `just`**: `just ci` (core gate), `just ci-gui`
+  (editor build), `just ci-local` (through the Nix devshell).
+- [x] **Bundling** (`cargo xtask bundle …` / `just bundle-all`):
+  - `.clap` single-file and `.vst3` bundle — verified.
+  - `.lv2` — **not produced**; NIH-plug has no LV2 exporter.  Needs a CLAP→LV2
+    bridge; the installers reserve `/usr/lib/lv2` for when one lands.
+- [x] **Installers** (`packaging/`):
+  - Debian `.deb` — [`build-deb.sh`](../packaging/build-deb.sh), CLAP+VST3 into
+    `/usr/lib/{clap,vst3}` (runs in Linux CI).
+  - macOS `.pkg` — [`macos/build-pkg.sh`](../packaging/macos/build-pkg.sh),
+    signing + notarisation commands documented inline.
+  - Windows `.exe` — Inno Setup
+    [`windows/rt-ir-plugins.iss`](../packaging/windows/rt-ir-plugins.iss).
+- [x] **Documentation**:
+  - Per-plugin manuals: [`manual-cab.md`](manual-cab.md),
+    [`manual-reverb.md`](manual-reverb.md).
+  - Screenshots + video: manual step once the editor runs in a host.
+- [x] **Release channels**:
+  - Codeberg release tags with checksums: `just tag` + `just release` (Forgejo
+    API upload) and the `release.yaml` workflow; `SHA256SUMS` via
+    [`checksums.sh`](../packaging/checksums.sh).
+  - KVR / linux-audio announcements: manual, optional.
+- [ ] LV2 export in addition to CLAP?
 
 ## Out of scope (future work)
 

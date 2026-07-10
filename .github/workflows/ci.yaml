@@ -1,0 +1,51 @@
+# CI: format, lint, test (headless) + a GUI build matrix across the three OSes.
+# GitHub-Actions syntax; Codeberg's Forgejo Actions reads this path too.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast, system-library-free gate: fmt + clippy + tests on the cores.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  # Build (and clippy) the egui editors on every target OS.
+  gui:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # egui-baseview links X11 + OpenGL on Linux.
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libxcb1-dev
+      - run: cargo clippy -p rt-ir-cab --features gui -- -D warnings
+      - run: cargo clippy -p rt-ir-reverb --features gui -- -D warnings
+      - run: cargo build -p rt-ir-cab --features gui
+      - run: cargo build -p rt-ir-reverb --features gui
