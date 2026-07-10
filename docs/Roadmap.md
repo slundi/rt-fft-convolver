@@ -56,11 +56,14 @@ This roadmap outlines the development of a zero-latency, high-performance convol
     (8 complex/iter) with a single per-block deinterleave at `push`.  Added
     `benches/convolution.rs` (criterion) covering `partition_process` and the
     isolated `fdl_accumulate` hot path.
-- [ ] **Serial denormal-guard tests**:
+- [x] **Serial denormal-guard tests**:
   - `x86_ftz_daz_bits_are_set_and_restored` mutates thread-global MXCSR and
     can race with `nested_guards_restore_state` under `cargo test` default
     parallelism.  Gate FTZ-mutating tests behind a `serial_test` lock (or
     a hand-rolled `std::sync::Mutex`) so they run one at a time.
+  - Done: hand-rolled `static FPU_TEST_LOCK: Mutex<()>` (poison-tolerant
+    `fpu_lock()` helper) now serialises every FPU-mutating test; added
+    `x86_guard_restores_arbitrary_prior_mxcsr` verifying exact-bit restoration.
 - [ ] **Resampler output-buffer reuse**:
   - `resample()` calls `vec![0.0; process_all_needed_output_len]` then
     `truncate()`s the tail.  On multi-channel loads this is one allocation

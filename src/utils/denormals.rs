@@ -215,6 +215,30 @@ impl Drop for DenormalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    // ── FPU-state test serialisation ──────────────────────────────────────────
+    //
+    // `cargo test` runs test functions concurrently.  MXCSR (x86) / FPCR
+    // (AArch64) are per-thread, but libtest reuses a pool of worker threads
+    // across tests, so a test that constructs a `DenormalGuard` — or writes the
+    // control register directly — can race with another FPU-mutating test:
+    // `x86_ftz_daz_bits_are_set_and_restored` reads the *current* register as
+    // its baseline and later asserts the exact restored bits, which is only
+    // meaningful if no other test mutates the same thread's register in the
+    // interim.  Every FPU-mutating test therefore holds this lock for its whole
+    // body so they run one at a time.
+
+    /// Global lock serialising all tests that touch the FPU control register.
+    static FPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the FPU serialisation lock, recovering from poisoning so a single
+    /// panicking FPU test does not cascade into failures for all the others.
+    fn fpu_lock() -> MutexGuard<'static, ()> {
+        FPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     // ── flush_to_zero ─────────────────────────────────────────────────────────
 
@@ -281,6 +305,7 @@ mod tests {
     /// Guard must not panic on construction or drop.
     #[test]
     fn guard_constructs_and_drops() {
+        let _fpu = fpu_lock();
         let _guard = DenormalGuard::new();
         // If we reach this point the guard constructed successfully.
     }
@@ -288,6 +313,7 @@ mod tests {
     /// Nested guards must not corrupt the FPU state.
     #[test]
     fn nested_guards_restore_state() {
+        let _fpu = fpu_lock();
         {
             let _outer = DenormalGuard::new();
             {
@@ -302,6 +328,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn x86_ftz_daz_bits_are_set_and_restored() {
+        let _fpu = fpu_lock();
         // Save a known baseline without FTZ/DAZ.
         let baseline = unsafe { read_mxcsr() } & !(MXCSR_FTZ | MXCSR_DAZ);
         unsafe { write_mxcsr(baseline) };
@@ -327,6 +354,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn x86_subnormal_output_is_flushed_by_hardware() {
+        let _fpu = fpu_lock();
         // A very small normal float whose square is subnormal.
         // sqrt(MIN_POSITIVE) ≈ 1.08e-19, squaring gives MIN_POSITIVE ≈ 1.18e-38.
         // But MIN_POSITIVE itself is normal.  We need something whose square is
@@ -355,5 +383,38 @@ mod tests {
             with_guard, 0.0,
             "FTZ hardware flush did not zero the subnormal product"
         );
+    }
+
+    /// On x86_64, the guard must restore the **exact** prior MXCSR value — not
+    /// merely clear FTZ/DAZ.  Set a distinctive prior state (FTZ on, DAZ off),
+    /// run a guard (which forces both on), and confirm drop returns MXCSR
+    /// bit-for-bit to the prior value.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_guard_restores_arbitrary_prior_mxcsr() {
+        let _fpu = fpu_lock();
+        // Remember the process-original so we leave the thread as we found it.
+        let original = unsafe { read_mxcsr() };
+
+        // Distinctive prior state: FTZ set, DAZ cleared.
+        let prior = (original | MXCSR_FTZ) & !MXCSR_DAZ;
+        unsafe { write_mxcsr(prior) };
+
+        {
+            let _guard = DenormalGuard::new();
+            let live = unsafe { read_mxcsr() };
+            assert!(live & MXCSR_FTZ != 0, "FTZ must be on while guard is live");
+            assert!(live & MXCSR_DAZ != 0, "DAZ must be on while guard is live");
+        }
+
+        let restored = unsafe { read_mxcsr() };
+        assert_eq!(
+            restored, prior,
+            "guard must restore the exact prior MXCSR, including the cleared DAZ bit"
+        );
+
+        // Restore the original register so subsequent work on this worker
+        // thread is unaffected.
+        unsafe { write_mxcsr(original) };
     }
 }
