@@ -48,6 +48,13 @@ codegen-units = 1 # Better optimizations at the cost of compile time
 panic = "abort"   # Removes stack unwinding (smaller binary size)
 strip = true      # Automatically strips symbols/debug info (like 'strip' command)
 
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "convolution"
+harness = false
+
 # --- Features ---
 # [features]
 # default = []

@@ -51,7 +51,7 @@
 use rustfft::num_complex::Complex;
 
 use crate::dsp::FftHandler;
-use crate::engine::fdl::FreqDomainDelayLine;
+use crate::engine::fdl::{FreqDomainDelayLine, SplitSpectrum};
 
 /// Uniform partitioned convolution engine for the IR tail.
 ///
@@ -70,10 +70,11 @@ pub struct UniformPartitionEngine {
 
     /// Pre-computed 2N-point real-input FFT of each IR tail partition,
     /// stored as its `N + 1` unique complex bins (the rest are
-    /// conjugate-symmetric and omitted).  `ir_spectra[k]` is the
-    /// spectrum of IR samples `k*N .. (k+1)*N` (zero-padded to 2N in
+    /// conjugate-symmetric and omitted) in split re/im layout so the
+    /// complex-MAC kernel loads plain contiguous vectors.  `ir_spectra[k]`
+    /// is the spectrum of IR samples `k*N .. (k+1)*N` (zero-padded to 2N in
     /// the time domain before the transform).
-    ir_spectra: Vec<Vec<Complex<f32>>>,
+    ir_spectra: Vec<SplitSpectrum>,
 
     /// Frequency-domain delay line: circular buffer of the P most recent
     /// input spectra.  Updated once per block via [`FreqDomainDelayLine::push`].
@@ -84,10 +85,15 @@ pub struct UniformPartitionEngine {
     /// `input_buf[N..2N]` = current  block (the "new" data).
     input_buf: Vec<f32>,
 
-    /// Frequency-domain accumulator (`N + 1` complex bins) for the
-    /// multiply-accumulate step.  Also used as a temporary buffer for
-    /// the forward FFT result.
+    /// Interleaved `[Complex<f32>]` buffer (`N + 1` bins) bridging the FFT
+    /// and the split-layout MAC: it receives the forward-FFT result (pushed
+    /// into the FDL) and, after [`SplitSpectrum::write_interleaved`], feeds
+    /// the inverse FFT.
     acc_buf: Vec<Complex<f32>>,
+
+    /// Split re/im accumulator for the frequency-domain multiply-accumulate
+    /// step.  Zeroed each block, then filled by [`FreqDomainDelayLine::accumulate`].
+    acc_split: SplitSpectrum,
 
     /// Time-domain IFFT output buffer of length 2N.
     /// The valid output lives in `out_buf[N..2N]`.
@@ -133,7 +139,7 @@ impl UniformPartitionEngine {
         // Each partition is zero-padded from block_size to fft_size before
         // the FFT so that the circular convolution matches linear convolution
         // in the valid (second-half) output region.
-        let ir_spectra: Vec<Vec<Complex<f32>>> = (0..num_partitions)
+        let ir_spectra: Vec<SplitSpectrum> = (0..num_partitions)
             .map(|k| {
                 let start = k * block_size;
                 let end = (start + block_size).min(ir_tail.len());
@@ -143,7 +149,8 @@ impl UniformPartitionEngine {
 
                 let mut spectrum = vec![Complex::default(); spectrum_size];
                 fft.forward(&padded, &mut spectrum);
-                spectrum
+                // Store in split re/im layout for the complex-MAC kernel.
+                SplitSpectrum::from_complex(&spectrum)
             })
             .collect();
 
@@ -157,6 +164,7 @@ impl UniformPartitionEngine {
             fdl,
             input_buf: vec![0.0f32; fft_size],
             acc_buf: vec![Complex::default(); spectrum_size],
+            acc_split: SplitSpectrum::zeros(spectrum_size),
             out_buf: vec![0.0f32; fft_size],
             fft,
         }
@@ -184,6 +192,7 @@ impl UniformPartitionEngine {
         self.input_buf.fill(0.0);
         self.fdl.reset();
         self.acc_buf.fill(Complex::default());
+        self.acc_split.fill_zero();
         self.out_buf.fill(0.0);
     }
 
@@ -246,8 +255,11 @@ impl UniformPartitionEngine {
         // ── Step 4: frequency-domain multiply-accumulate ──────────────────
         // acc = Σ_{k=0}^{P-1}  FDL[k]  ⊙  IR[k]
         // (FDL slot 0 = most recently pushed; managed by FreqDomainDelayLine)
-        self.acc_buf.fill(Complex::default());
-        self.fdl.accumulate(&self.ir_spectra, &mut self.acc_buf);
+        // The MAC runs in split re/im layout, then we re-interleave once into
+        // acc_buf for the complex-to-real inverse transform.
+        self.acc_split.fill_zero();
+        self.fdl.accumulate(&self.ir_spectra, &mut self.acc_split);
+        self.acc_split.write_interleaved(&mut self.acc_buf);
 
         // ── Step 5: IFFT the accumulator ──────────────────────────────────
         self.fft.inverse(&mut self.acc_buf, &mut self.out_buf);

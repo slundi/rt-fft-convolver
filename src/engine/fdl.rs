@@ -20,6 +20,21 @@
 //! [`accumulate`] evaluates the sum above in O(P · N) complex
 //! multiplications.
 //!
+//! # Split-complex (structure-of-arrays) storage
+//!
+//! Every spectrum in this module — the FDL slots, the IR partitions, and the
+//! accumulator — is stored as a [`SplitSpectrum`]: the real parts in one
+//! contiguous `Vec<f32>` and the imaginary parts in another, rather than the
+//! interleaved `[re0, im0, re1, im1, …]` layout of `[Complex<f32>]`.
+//!
+//! This lets the SIMD complex-multiply kernel issue plain aligned vector loads
+//! (`re[i..i+8]`, `im[i..i+8]`) and process **8 complex numbers per iteration**
+//! with no in-register shuffles.  The interleaved layout forced either a
+//! per-element gather to build the duplicated-real / duplicated-imag vectors,
+//! or an in-lane shuffle every iteration; splitting the storage moves that cost
+//! out of the O(P) inner loop and into a single deinterleave at [`push`] time
+//! (once per block, not once per partition).
+//!
 //! # Memory layout
 //!
 //! Internally the buffer is a flat circular array of `P` slots, each holding
@@ -44,127 +59,188 @@
 use rustfft::num_complex::Complex;
 use wide::f32x8;
 
-/// Multiply-accumulate `acc[i] += slot[i] * ir[i]` for complex f32 slices.
-///
-/// Uses `f32x8` to process **4 complex numbers per SIMD iteration**
-/// (8 floats = 4 × `[re, im]` pairs).
-///
-/// # Complex multiply in SIMD
-///
-/// For each pair `(s, h)` the product is `(s.re·h.re − s.im·h.im, s.re·h.im + s.im·h.re)`.
-/// Laid out as 8-wide f32 vectors:
-///
-/// ```text
-/// s_re_dup = [s0r, s0r, s1r, s1r, s2r, s2r, s3r, s3r]   ← re duplicated into pairs
-/// s_im_dup = [s0i, s0i, s1i, s1i, s2i, s2i, s3i, s3i]   ← im duplicated into pairs
-/// h_ri     = [h0r, h0i, h1r, h1i, h2r, h2i, h3r, h3i]   ← normal interleaved layout
-/// h_ni     = [-h0i, h0r, -h1i, h1r, -h2i, h2r, -h3i, h3r] ← negated-im / swapped pairs
-///
-/// s_re_dup * h_ri + s_im_dup * h_ni
-///   = [s0r·h0r + s0i·(−h0i),  s0r·h0i + s0i·h0r,  …]
-///   = [s0r·h0r − s0i·h0i,     s0r·h0i + s0i·h0r,  …]   ✓
-/// ```
-///
-/// Compiles to AVX2 FMA on x86-64, NEON on ARM, and SIMD128 on wasm32.
-/// The tail (`n % 4` complex) is handled by a scalar fallback.
-///
-/// # Layout note
-///
-/// `num_complex::Complex<f32>` is `#[repr(C)]` with two consecutive `f32`
-/// fields, so a `[Complex<f32>; N]` has the same memory representation as
-/// a `[f32; 2N]` in `[re0, im0, re1, im1, …]` order.  We reinterpret the
-/// slices to give the compiler flat `f32` loads (256-bit `vmovups` on AVX)
-/// instead of eight separate field accesses per iteration.
-#[inline]
-fn complex_mac(acc: &mut [Complex<f32>], slot: &[Complex<f32>], ir: &[Complex<f32>]) {
-    let n = acc.len();
-    let chunks = n / 4;
+/// SIMD width: `f32x8` processes 8 real (or 8 imaginary) values per iteration.
+/// With split storage that is a full 8 complex numbers per iteration, versus
+/// the 4 complex numbers per iteration achievable with interleaved storage.
+const LANES: usize = 8;
 
-    // SAFETY: `Complex<f32>` is `#[repr(C)]` with fields `re: f32, im: f32`,
-    // so `&[Complex<f32>]` of length N and `&[f32]` of length 2N share the
-    // same allocation, alignment (f32 alignment divides Complex<f32>
-    // alignment), and lifetime.  We hold no other aliasing reference to
-    // these slices for the duration of the returned view.
-    let acc_f: &mut [f32] =
-        unsafe { std::slice::from_raw_parts_mut(acc.as_mut_ptr() as *mut f32, n * 2) };
-    let slot_f: &[f32] = unsafe { std::slice::from_raw_parts(slot.as_ptr() as *const f32, n * 2) };
-    let ir_f: &[f32] = unsafe { std::slice::from_raw_parts(ir.as_ptr() as *const f32, n * 2) };
+/// A complex spectrum in **split** (structure-of-arrays) layout: real parts in
+/// one contiguous buffer, imaginary parts in another.
+///
+/// `re[i]` and `im[i]` together form the `i`-th complex bin.  The two vectors
+/// always have equal length ([`Self::len`]).
+///
+/// Storing re/im separately is what makes the complex-MAC kernel a sequence of
+/// plain vector loads instead of interleaved shuffles — see the module docs.
+#[derive(Clone, Debug, Default)]
+pub struct SplitSpectrum {
+    /// Real parts, one per bin.
+    pub re: Vec<f32>,
+    /// Imaginary parts, one per bin (same length as [`Self::re`]).
+    pub im: Vec<f32>,
+}
 
-    for c in 0..chunks {
-        let i = c * 8; // 8 floats = 4 complex numbers per iteration
-
-        // Load 4 complex as flat f32 pairs: [re0, im0, re1, im1, re2, im2, re3, im3].
-        let s_re = f32x8::from([
-            slot_f[i],
-            slot_f[i],
-            slot_f[i + 2],
-            slot_f[i + 2],
-            slot_f[i + 4],
-            slot_f[i + 4],
-            slot_f[i + 6],
-            slot_f[i + 6],
-        ]);
-        let s_im = f32x8::from([
-            slot_f[i + 1],
-            slot_f[i + 1],
-            slot_f[i + 3],
-            slot_f[i + 3],
-            slot_f[i + 5],
-            slot_f[i + 5],
-            slot_f[i + 7],
-            slot_f[i + 7],
-        ]);
-        let h_ri = f32x8::from([
-            ir_f[i],
-            ir_f[i + 1],
-            ir_f[i + 2],
-            ir_f[i + 3],
-            ir_f[i + 4],
-            ir_f[i + 5],
-            ir_f[i + 6],
-            ir_f[i + 7],
-        ]);
-        // Negate im and swap each pair: [-h.im, h.re, …]
-        let h_ni = f32x8::from([
-            -ir_f[i + 1],
-            ir_f[i],
-            -ir_f[i + 3],
-            ir_f[i + 2],
-            -ir_f[i + 5],
-            ir_f[i + 4],
-            -ir_f[i + 7],
-            ir_f[i + 6],
-        ]);
-        let a_ri = f32x8::from([
-            acc_f[i],
-            acc_f[i + 1],
-            acc_f[i + 2],
-            acc_f[i + 3],
-            acc_f[i + 4],
-            acc_f[i + 5],
-            acc_f[i + 6],
-            acc_f[i + 7],
-        ]);
-
-        let r = (a_ri + s_re * h_ri + s_im * h_ni).to_array();
-
-        acc_f[i..i + 8].copy_from_slice(&r);
+impl SplitSpectrum {
+    /// Allocate a zero-filled split spectrum of `len` complex bins.
+    ///
+    /// **Allocates** — call from a non-real-time thread.
+    pub fn zeros(len: usize) -> Self {
+        Self {
+            re: vec![0.0f32; len],
+            im: vec![0.0f32; len],
+        }
     }
 
-    // Scalar tail for n % 4 remaining bins.
-    // In practice spectrum_size = 2 * block_size is always a power-of-two ≥ 4,
-    // so this branch is never taken — it exists only for correctness.
-    for i in (chunks * 4)..n {
-        acc[i] += slot[i] * ir[i];
+    /// Deinterleave a `&[Complex<f32>]` into a freshly-allocated split spectrum.
+    ///
+    /// **Allocates** — call from a non-real-time thread.
+    pub fn from_complex(src: &[Complex<f32>]) -> Self {
+        let mut s = Self::zeros(src.len());
+        s.copy_from_complex(src);
+        s
+    }
+
+    /// Number of complex bins.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.re.len()
+    }
+
+    /// `true` if this spectrum holds no bins.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.re.is_empty()
+    }
+
+    /// Overwrite this spectrum by deinterleaving `src` into the re/im buffers.
+    ///
+    /// `src.len()` must equal [`Self::len`].
+    ///
+    /// **Real-time safe** — no allocation.
+    #[inline]
+    pub fn copy_from_complex(&mut self, src: &[Complex<f32>]) {
+        debug_assert_eq!(
+            src.len(),
+            self.re.len(),
+            "copy_from_complex: length mismatch"
+        );
+        for (i, c) in src.iter().enumerate() {
+            self.re[i] = c.re;
+            self.im[i] = c.im;
+        }
+    }
+
+    /// Interleave this split spectrum back into `dst` as `[Complex<f32>]`.
+    ///
+    /// `dst.len()` must equal [`Self::len`].
+    ///
+    /// **Real-time safe** — no allocation.
+    #[inline]
+    pub fn write_interleaved(&self, dst: &mut [Complex<f32>]) {
+        debug_assert_eq!(
+            dst.len(),
+            self.re.len(),
+            "write_interleaved: length mismatch"
+        );
+        for (i, c) in dst.iter_mut().enumerate() {
+            c.re = self.re[i];
+            c.im = self.im[i];
+        }
+    }
+
+    /// Zero both the real and imaginary buffers in place.
+    ///
+    /// **Real-time safe** — no allocation.
+    #[inline]
+    pub fn fill_zero(&mut self) {
+        self.re.fill(0.0);
+        self.im.fill(0.0);
+    }
+}
+
+/// Load exactly `LANES` contiguous `f32` values into an `f32x8`.
+///
+/// `s` must have length `LANES`; the slice-to-array conversion is a single
+/// aligned load once the optimiser removes the (statically-true) length check.
+#[inline(always)]
+fn load8(s: &[f32]) -> f32x8 {
+    f32x8::from(<[f32; LANES]>::try_from(s).expect("load8: slice must be LANES long"))
+}
+
+/// Multiply-accumulate `acc += slot * ir` for complex spectra held in split
+/// re/im layout.
+///
+/// # Complex multiply
+///
+/// For each bin the product is
+///
+/// ```text
+/// (s.re + i·s.im)(h.re + i·h.im)
+///   = (s.re·h.re − s.im·h.im) + i·(s.re·h.im + s.im·h.re)
+/// ```
+///
+/// # Why split storage is faster here
+///
+/// With re and im in separate buffers, `slot_re[i..i+8]`, `slot_im[i..i+8]`,
+/// etc. are all contiguous, so each becomes one 256-bit `vmovups`.  The two
+/// output lanes then follow directly from four multiplies and two add/subs —
+/// no `s.re`/`s.im` duplication and no `[-im, re]` shuffle as the interleaved
+/// kernel required.  Eight complex numbers are handled per iteration instead
+/// of four.
+///
+/// Compiles to AVX2 FMA on x86-64, NEON on ARM, and SIMD128 on wasm32.
+///
+/// # Tail
+///
+/// `spectrum_size = block_size + 1` is odd for the power-of-two block sizes
+/// used by the render path, so the `n % 8` scalar tail always runs for at
+/// least the Nyquist bin.
+#[inline]
+fn complex_mac_split(
+    acc_re: &mut [f32],
+    acc_im: &mut [f32],
+    slot_re: &[f32],
+    slot_im: &[f32],
+    ir_re: &[f32],
+    ir_im: &[f32],
+) {
+    let n = acc_re.len();
+    let chunks = n / LANES;
+
+    for c in 0..chunks {
+        let i = c * LANES;
+
+        let sr = load8(&slot_re[i..i + LANES]);
+        let si = load8(&slot_im[i..i + LANES]);
+        let hr = load8(&ir_re[i..i + LANES]);
+        let hi = load8(&ir_im[i..i + LANES]);
+        let ar = load8(&acc_re[i..i + LANES]);
+        let ai = load8(&acc_im[i..i + LANES]);
+
+        // (sr + i·si)(hr + i·hi) = (sr·hr − si·hi) + i·(sr·hi + si·hr)
+        let out_re = ar + sr * hr - si * hi;
+        let out_im = ai + sr * hi + si * hr;
+
+        acc_re[i..i + LANES].copy_from_slice(&out_re.to_array());
+        acc_im[i..i + LANES].copy_from_slice(&out_im.to_array());
+    }
+
+    // Scalar tail for the `n % 8` bins the SIMD loop did not cover.
+    for i in (chunks * LANES)..n {
+        let out_re = acc_re[i] + slot_re[i] * ir_re[i] - slot_im[i] * ir_im[i];
+        let out_im = acc_im[i] + slot_re[i] * ir_im[i] + slot_im[i] * ir_re[i];
+        acc_re[i] = out_re;
+        acc_im[i] = out_im;
     }
 }
 
 /// Circular buffer of complex frequency-domain spectra for partitioned
 /// convolution.
 ///
-/// Stores the `P` most recent input spectra (one pushed per audio block).
-/// Use [`push`] to insert the current block's spectrum, then [`accumulate`]
-/// to compute `Σ_k slot[k] ⊙ H[k]` across all P IR partitions.
+/// Stores the `P` most recent input spectra (one pushed per audio block) in
+/// [`SplitSpectrum`] layout.  Use [`push`] to insert the current block's
+/// spectrum, then [`accumulate`] to compute `Σ_k slot[k] ⊙ H[k]` across all P
+/// IR partitions.
 ///
 /// # Real-time safety
 ///
@@ -174,8 +250,9 @@ fn complex_mac(acc: &mut [Complex<f32>], slot: &[Complex<f32>], ir: &[Complex<f3
 /// [`push`]: FreqDomainDelayLine::push
 /// [`accumulate`]: FreqDomainDelayLine::accumulate
 pub struct FreqDomainDelayLine {
-    /// Circular slot buffer, shape `[num_partitions][spectrum_size]`.
-    slots: Vec<Vec<Complex<f32>>>,
+    /// Circular slot buffer, one [`SplitSpectrum`] of `spectrum_size` bins per
+    /// slot.
+    slots: Vec<SplitSpectrum>,
 
     /// Index of the **next** slot to write.
     /// The most-recently pushed spectrum is at `(write_pos + P − 1) % P`.
@@ -201,7 +278,7 @@ impl FreqDomainDelayLine {
         assert!(num_partitions > 0, "num_partitions must be > 0");
         assert!(spectrum_size > 0, "spectrum_size must be > 0");
         Self {
-            slots: vec![vec![Complex::default(); spectrum_size]; num_partitions],
+            slots: vec![SplitSpectrum::zeros(spectrum_size); num_partitions],
             write_pos: 0,
             spectrum_size,
         }
@@ -222,6 +299,11 @@ impl FreqDomainDelayLine {
 
     /// Insert `spectrum` as the newest entry and advance the write pointer.
     ///
+    /// The interleaved `[Complex<f32>]` produced by the forward FFT is
+    /// deinterleaved into the target slot's split re/im buffers here — the one
+    /// deinterleave per block that keeps [`accumulate`]'s inner loop free of
+    /// shuffles.
+    ///
     /// After this call `spectrum` is at delay index 0 for the next
     /// [`accumulate`] call.
     ///
@@ -236,7 +318,7 @@ impl FreqDomainDelayLine {
             self.spectrum_size,
             "push: spectrum length must equal spectrum_size"
         );
-        self.slots[self.write_pos].copy_from_slice(spectrum);
+        self.slots[self.write_pos].copy_from_complex(spectrum);
         self.write_pos = (self.write_pos + 1) % self.slots.len();
     }
 
@@ -252,16 +334,16 @@ impl FreqDomainDelayLine {
     /// where `slot[0]` is the spectrum from the **most recent** [`push`] and
     /// `slot[k]` is the spectrum from `k` blocks ago.
     ///
-    /// `acc` is **not** zeroed before use — zero it beforehand if a fresh
-    /// result is needed.
+    /// `acc` is **not** zeroed before use — call [`SplitSpectrum::fill_zero`]
+    /// beforehand if a fresh result is needed.
     ///
-    /// All slices must have length [`Self::spectrum_size()`], and
+    /// All spectra must have length [`Self::spectrum_size()`], and
     /// `ir_spectra.len()` must equal [`Self::num_partitions()`].
     ///
     /// **Real-time safe** — no allocation.
     ///
     /// [`push`]: Self::push
-    pub fn accumulate(&self, ir_spectra: &[Vec<Complex<f32>>], acc: &mut [Complex<f32>]) {
+    pub fn accumulate(&self, ir_spectra: &[SplitSpectrum], acc: &mut SplitSpectrum) {
         debug_assert_eq!(
             ir_spectra.len(),
             self.slots.len(),
@@ -274,6 +356,7 @@ impl FreqDomainDelayLine {
         );
 
         let p = self.slots.len();
+        let (acc_re, acc_im) = (&mut acc.re, &mut acc.im);
 
         for (k, ir) in ir_spectra.iter().enumerate() {
             // Slot for delay k: the most-recent push is at write_pos−1 (mod P).
@@ -281,7 +364,7 @@ impl FreqDomainDelayLine {
             let slot_idx = (self.write_pos + p - 1 - k) % p;
             let slot = &self.slots[slot_idx];
 
-            complex_mac(acc, slot, ir);
+            complex_mac_split(acc_re, acc_im, &slot.re, &slot.im, &ir.re, &ir.im);
         }
     }
 
@@ -290,7 +373,7 @@ impl FreqDomainDelayLine {
     /// **Real-time safe** — no allocation.
     pub fn reset(&mut self) {
         for slot in &mut self.slots {
-            slot.fill(Complex::default());
+            slot.fill_zero();
         }
         self.write_pos = 0;
     }
@@ -306,15 +389,40 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Build a constant spectrum: every bin equals `value`.
-    fn const_spec(spectrum_size: usize, value: Complex<f32>) -> Vec<Complex<f32>> {
-        vec![value; spectrum_size]
+    /// Build a split spectrum where every bin equals `value`.
+    fn const_spec(spectrum_size: usize, value: Complex<f32>) -> SplitSpectrum {
+        SplitSpectrum::from_complex(&vec![value; spectrum_size])
     }
 
     /// Build identity IR spectra: each partition is a flat spectrum of ones.
     /// Accumulating against these returns the sum of all stored slots.
-    fn identity_ir(num_partitions: usize, spectrum_size: usize) -> Vec<Vec<Complex<f32>>> {
+    fn identity_ir(num_partitions: usize, spectrum_size: usize) -> Vec<SplitSpectrum> {
         vec![const_spec(spectrum_size, Complex::new(1.0, 0.0)); num_partitions]
+    }
+
+    /// Push a `&[Complex]` spectrum from a slice of literals.
+    fn push_complex(fdl: &mut FreqDomainDelayLine, values: &[Complex<f32>]) {
+        fdl.push(values);
+    }
+
+    // ── SplitSpectrum round-trips ───────────────────────────────────────────────
+
+    /// Deinterleave then re-interleave reproduces the original complex slice.
+    #[test]
+    fn split_spectrum_round_trips_complex() {
+        let src = vec![
+            Complex::new(1.0, 2.0),
+            Complex::new(-3.0, 4.0),
+            Complex::new(5.5, -6.5),
+        ];
+        let split = SplitSpectrum::from_complex(&src);
+        assert_eq!(split.len(), 3);
+        assert_eq!(split.re, vec![1.0, -3.0, 5.5]);
+        assert_eq!(split.im, vec![2.0, 4.0, -6.5]);
+
+        let mut back = vec![Complex::default(); 3];
+        split.write_interleaved(&mut back);
+        assert_eq!(back, src);
     }
 
     // ── Construction ──────────────────────────────────────────────────────────
@@ -324,10 +432,10 @@ mod tests {
     fn new_fdl_is_all_zeros() {
         let fdl = FreqDomainDelayLine::new(3, 8);
         let ir = identity_ir(3, 8);
-        let mut acc = vec![Complex::default(); 8];
+        let mut acc = SplitSpectrum::zeros(8);
         fdl.accumulate(&ir, &mut acc);
-        for c in &acc {
-            assert!(c.norm() < EPSILON, "expected zero, got {c}");
+        for (re, im) in acc.re.iter().zip(acc.im.iter()) {
+            assert!(re.abs() < EPSILON && im.abs() < EPSILON, "expected zero");
         }
     }
 
@@ -346,20 +454,21 @@ mod tests {
     fn single_push_identity_ir() {
         let spectrum_size = 4;
         let mut fdl = FreqDomainDelayLine::new(1, spectrum_size);
-        let pushed = vec![
+        let pushed = [
             Complex::new(1.0, 2.0),
             Complex::new(3.0, 4.0),
             Complex::new(5.0, 6.0),
             Complex::new(7.0, 8.0),
         ];
-        fdl.push(&pushed);
+        push_complex(&mut fdl, &pushed);
 
         let ir = identity_ir(1, spectrum_size);
-        let mut acc = vec![Complex::default(); spectrum_size];
+        let mut acc = SplitSpectrum::zeros(spectrum_size);
         fdl.accumulate(&ir, &mut acc);
 
-        for (a, &p) in acc.iter().zip(pushed.iter()) {
-            assert!((a - p).norm() < EPSILON, "expected {p}, got {a}");
+        for (i, &p) in pushed.iter().enumerate() {
+            assert!((acc.re[i] - p.re).abs() < EPSILON, "re[{i}]");
+            assert!((acc.im[i] - p.im).abs() < EPSILON, "im[{i}]");
         }
     }
 
@@ -375,46 +484,54 @@ mod tests {
         let spectrum_size = 4;
         let mut fdl = FreqDomainDelayLine::new(2, spectrum_size);
 
-        let a = vec![
+        let a = [
             Complex::new(10.0, 0.0),
             Complex::new(20.0, 0.0),
             Complex::new(0.0, 0.0),
             Complex::new(0.0, 0.0),
         ];
-        let b = vec![
+        let b = [
             Complex::new(30.0, 0.0),
             Complex::new(40.0, 0.0),
             Complex::new(0.0, 0.0),
             Complex::new(0.0, 0.0),
         ];
 
-        fdl.push(&a); // A is older
-        fdl.push(&b); // B is most recent
+        push_complex(&mut fdl, &a); // A is older
+        push_complex(&mut fdl, &b); // B is most recent
 
         // IR[0] reads only bin 0 of slot[0] (= B).
         // IR[1] reads only bin 1 of slot[1] (= A).
         let ir = vec![
-            vec![
+            SplitSpectrum::from_complex(&[
                 Complex::new(1.0, 0.0),
                 Complex::new(0.0, 0.0),
                 Complex::new(0.0, 0.0),
                 Complex::new(0.0, 0.0),
-            ],
-            vec![
+            ]),
+            SplitSpectrum::from_complex(&[
                 Complex::new(0.0, 0.0),
                 Complex::new(1.0, 0.0),
                 Complex::new(0.0, 0.0),
                 Complex::new(0.0, 0.0),
-            ],
+            ]),
         ];
 
-        let mut acc = vec![Complex::default(); spectrum_size];
+        let mut acc = SplitSpectrum::zeros(spectrum_size);
         fdl.accumulate(&ir, &mut acc);
 
-        assert!((acc[0].re - 30.0).abs() < EPSILON, "acc[0]={}", acc[0]);
-        assert!((acc[1].re - 20.0).abs() < EPSILON, "acc[1]={}", acc[1]);
-        assert!(acc[0].im.abs() < EPSILON);
-        assert!(acc[1].im.abs() < EPSILON);
+        assert!(
+            (acc.re[0] - 30.0).abs() < EPSILON,
+            "acc.re[0]={}",
+            acc.re[0]
+        );
+        assert!(
+            (acc.re[1] - 20.0).abs() < EPSILON,
+            "acc.re[1]={}",
+            acc.re[1]
+        );
+        assert!(acc.im[0].abs() < EPSILON);
+        assert!(acc.im[1].abs() < EPSILON);
     }
 
     /// Circular wrap: after P+1 pushes the oldest slot is overwritten.
@@ -426,22 +543,22 @@ mod tests {
         let spectrum_size = 2;
         let mut fdl = FreqDomainDelayLine::new(2, spectrum_size);
 
-        let a = const_spec(spectrum_size, Complex::new(100.0, 0.0));
-        let b = const_spec(spectrum_size, Complex::new(2.0, 0.0));
-        let c = const_spec(spectrum_size, Complex::new(3.0, 0.0));
+        let a = vec![Complex::new(100.0, 0.0); spectrum_size];
+        let b = vec![Complex::new(2.0, 0.0); spectrum_size];
+        let c = vec![Complex::new(3.0, 0.0); spectrum_size];
 
-        fdl.push(&a); // will be evicted on 4th push
-        fdl.push(&b); // older (delay 1)
-        fdl.push(&c); // most recent (delay 0)
+        push_complex(&mut fdl, &a); // will be evicted on 4th push
+        push_complex(&mut fdl, &b); // older (delay 1)
+        push_complex(&mut fdl, &c); // most recent (delay 0)
         // A is now overwritten: only B and C remain.
 
         let ir = identity_ir(2, spectrum_size);
-        let mut acc = vec![Complex::default(); spectrum_size];
+        let mut acc = SplitSpectrum::zeros(spectrum_size);
         fdl.accumulate(&ir, &mut acc);
 
         // Expected: B + C = 2 + 3 = 5 in each bin.
-        for c in &acc {
-            assert!((c.re - 5.0).abs() < EPSILON, "expected 5.0, got {}", c.re);
+        for &re in &acc.re {
+            assert!((re - 5.0).abs() < EPSILON, "expected 5.0, got {re}");
         }
     }
 
@@ -452,18 +569,17 @@ mod tests {
         let mut fdl = FreqDomainDelayLine::new(1, spectrum_size);
 
         // Push one spectrum: [3 + 4j].
-        let spectrum = vec![Complex::new(3.0, 4.0)];
-        fdl.push(&spectrum);
+        push_complex(&mut fdl, &[Complex::new(3.0, 4.0)]);
 
         // IR partition: [2 + 1j].
-        let ir = vec![vec![Complex::new(2.0, 1.0)]];
+        let ir = vec![SplitSpectrum::from_complex(&[Complex::new(2.0, 1.0)])];
 
         // Expected: (3+4j)*(2+1j) = 6+3j+8j+4j² = (6-4) + (3+8)j = 2 + 11j.
-        let mut acc = vec![Complex::default(); spectrum_size];
+        let mut acc = SplitSpectrum::zeros(spectrum_size);
         fdl.accumulate(&ir, &mut acc);
 
-        assert!((acc[0].re - 2.0).abs() < EPSILON, "re={}", acc[0].re);
-        assert!((acc[0].im - 11.0).abs() < EPSILON, "im={}", acc[0].im);
+        assert!((acc.re[0] - 2.0).abs() < EPSILON, "re={}", acc.re[0]);
+        assert!((acc.im[0] - 11.0).abs() < EPSILON, "im={}", acc.im[0]);
     }
 
     /// accumulate *adds* to acc — pre-existing values are preserved.
@@ -471,16 +587,44 @@ mod tests {
     fn accumulate_adds_to_existing_acc() {
         let spectrum_size = 2;
         let mut fdl = FreqDomainDelayLine::new(1, spectrum_size);
-        fdl.push(&const_spec(spectrum_size, Complex::new(1.0, 0.0)));
+        push_complex(&mut fdl, &vec![Complex::new(1.0, 0.0); spectrum_size]);
 
         let ir = identity_ir(1, spectrum_size);
         // Pre-seed acc with 5.
-        let mut acc = vec![Complex::new(5.0, 0.0); spectrum_size];
+        let mut acc = const_spec(spectrum_size, Complex::new(5.0, 0.0));
         fdl.accumulate(&ir, &mut acc);
 
         // Each bin: 5 + 1 * 1 = 6.
-        for c in &acc {
-            assert!((c.re - 6.0).abs() < EPSILON, "expected 6.0, got {}", c.re);
+        for &re in &acc.re {
+            assert!((re - 6.0).abs() < EPSILON, "expected 6.0, got {re}");
+        }
+    }
+
+    /// The SIMD kernel must agree with a scalar reference across a length that
+    /// exercises both the 8-wide body and the `n % 8` tail (13 = 8 + 5).
+    #[test]
+    fn simd_kernel_matches_scalar_reference_with_tail() {
+        let spectrum_size = 13;
+        let mut fdl = FreqDomainDelayLine::new(1, spectrum_size);
+
+        // Deterministic pseudo-values for slot and IR.
+        let slot: Vec<Complex<f32>> = (0..spectrum_size)
+            .map(|i| Complex::new(i as f32 * 0.5 - 2.0, 1.0 - i as f32 * 0.25))
+            .collect();
+        let ir_c: Vec<Complex<f32>> = (0..spectrum_size)
+            .map(|i| Complex::new(0.3 * i as f32, -0.7 + i as f32 * 0.1))
+            .collect();
+
+        push_complex(&mut fdl, &slot);
+        let ir = vec![SplitSpectrum::from_complex(&ir_c)];
+
+        let mut acc = SplitSpectrum::zeros(spectrum_size);
+        fdl.accumulate(&ir, &mut acc);
+
+        for i in 0..spectrum_size {
+            let expected = slot[i] * ir_c[i];
+            assert!((acc.re[i] - expected.re).abs() < EPSILON, "re[{i}]");
+            assert!((acc.im[i] - expected.im).abs() < EPSILON, "im[{i}]");
         }
     }
 
@@ -494,16 +638,19 @@ mod tests {
         let mut fdl = FreqDomainDelayLine::new(2, spectrum_size);
 
         // Push non-zero data.
-        fdl.push(&const_spec(spectrum_size, Complex::new(9.0, 9.0)));
-        fdl.push(&const_spec(spectrum_size, Complex::new(9.0, 9.0)));
+        push_complex(&mut fdl, &vec![Complex::new(9.0, 9.0); spectrum_size]);
+        push_complex(&mut fdl, &vec![Complex::new(9.0, 9.0); spectrum_size]);
         fdl.reset();
 
         let ir = identity_ir(2, spectrum_size);
-        let mut acc = vec![Complex::default(); spectrum_size];
+        let mut acc = SplitSpectrum::zeros(spectrum_size);
         fdl.accumulate(&ir, &mut acc);
 
-        for c in &acc {
-            assert!(c.norm() < EPSILON, "expected zero after reset, got {c}");
+        for (re, im) in acc.re.iter().zip(acc.im.iter()) {
+            assert!(
+                re.abs() < EPSILON && im.abs() < EPSILON,
+                "expected zero after reset"
+            );
         }
     }
 
@@ -517,31 +664,32 @@ mod tests {
         let mut fdl = FreqDomainDelayLine::new(p, spectrum_size);
         let mut fresh = FreqDomainDelayLine::new(p, spectrum_size);
 
-        let spec_a = const_spec(spectrum_size, Complex::new(3.0, 1.0));
-        let spec_b = const_spec(spectrum_size, Complex::new(7.0, 2.0));
+        let spec_a = vec![Complex::new(3.0, 1.0); spectrum_size];
+        let spec_b = vec![Complex::new(7.0, 2.0); spectrum_size];
 
         // Prime the FDL, then reset.
-        fdl.push(&const_spec(spectrum_size, Complex::new(99.0, 99.0)));
-        fdl.push(&const_spec(spectrum_size, Complex::new(99.0, 99.0)));
+        push_complex(&mut fdl, &vec![Complex::new(99.0, 99.0); spectrum_size]);
+        push_complex(&mut fdl, &vec![Complex::new(99.0, 99.0); spectrum_size]);
         fdl.reset();
 
         // Feed the same sequence to both.
-        fdl.push(&spec_a);
-        fresh.push(&spec_a);
-        fdl.push(&spec_b);
-        fresh.push(&spec_b);
+        push_complex(&mut fdl, &spec_a);
+        push_complex(&mut fresh, &spec_a);
+        push_complex(&mut fdl, &spec_b);
+        push_complex(&mut fresh, &spec_b);
 
         let ir = identity_ir(p, spectrum_size);
-        let mut acc_fdl = vec![Complex::default(); spectrum_size];
-        let mut acc_fresh = vec![Complex::default(); spectrum_size];
+        let mut acc_fdl = SplitSpectrum::zeros(spectrum_size);
+        let mut acc_fresh = SplitSpectrum::zeros(spectrum_size);
 
         fdl.accumulate(&ir, &mut acc_fdl);
         fresh.accumulate(&ir, &mut acc_fresh);
 
-        for (f, r) in acc_fdl.iter().zip(acc_fresh.iter()) {
+        for i in 0..spectrum_size {
             assert!(
-                (f - r).norm() < EPSILON,
-                "reset FDL diverged from fresh: {f} != {r}"
+                (acc_fdl.re[i] - acc_fresh.re[i]).abs() < EPSILON
+                    && (acc_fdl.im[i] - acc_fresh.im[i]).abs() < EPSILON,
+                "reset FDL diverged from fresh at bin {i}"
             );
         }
     }

@@ -47,10 +47,15 @@ This roadmap outlines the development of a zero-latency, high-performance convol
     plan.  Cuts inner-loop memory and roughly halves the FFT / IFFT cost.
     Requires updating `FftHandler`, `UniformPartitionEngine`, and the
     `FreqDomainDelayLine` spectrum length (`N + 1` instead of `2N`).
-- [ ] **Split-real/imag IR storage for the complex-MAC**:
+- [x] **Split-real/imag IR storage for the complex-MAC**:
   - Pre-compute IR partitions as separate re/im vectors so the SIMD kernel
     can use plain vector loads instead of interleaved shuffle patterns.
     Needs a criterion-based benchmark harness first to validate the gain.
+  - Done: `SplitSpectrum` (SoA re/im) now backs the FDL slots, IR partitions,
+    and accumulator; the `complex_mac_split` kernel does plain `f32x8` loads
+    (8 complex/iter) with a single per-block deinterleave at `push`.  Added
+    `benches/convolution.rs` (criterion) covering `partition_process` and the
+    isolated `fdl_accumulate` hot path.
 - [ ] **Serial denormal-guard tests**:
   - `x86_ftz_daz_bits_are_set_and_restored` mutates thread-global MXCSR and
     can race with `nested_guards_restore_state` under `cargo test` default
