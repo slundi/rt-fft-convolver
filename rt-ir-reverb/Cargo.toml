@@ -1,0 +1,13 @@
+[package]
+name = "rt-ir-reverb"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Convolution reverb plugin (LV2/CLAP/VST3) with true-stereo support, built on rt-fft-convolver. Placeholder — implemented in Phase 2 of docs/Roadmap-lv2.md."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+publish = false
+
+[dependencies]
+# Shared Phase-0 foundation. The nih-plug integration and the plugin's own
+# controls land in Phase 2.
+rt-ir-plugin-core = { path = "../rt-ir-plugin-core" }

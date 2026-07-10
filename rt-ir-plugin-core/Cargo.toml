@@ -1,0 +1,20 @@
+[package]
+name = "rt-ir-plugin-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared foundation for the rt-ir-cab and rt-ir-reverb plugins: IR slot bank, lock-free RT handoff, MIDI slot routing, and a parametric equal-power crossfader. Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "convolution", "audio", "plugin", "real-time"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# The convolution engines this crate orchestrates.
+rt-fft-convolver = { path = ".." }
+# Lock-free, wait-free single-producer/single-consumer handoff of the active
+# convolver from the control thread to the audio thread (roadmap Phase 0).
+triple_buffer = "8"
+
+[dev-dependencies]
+# Used only to synthesise a temporary WAV file for the PreparedIr load test.
+hound = "3.5"

@@ -33,11 +33,11 @@ Rust codebase produces every format.
 These roadmap items must land in the core library before the plugins
 can ship a stable release:
 
-- [ ] **HybridConvolver** (Phase 5 of the core roadmap):
+- [x] **HybridConvolver** (Phase 5 of the core roadmap):
   - Needed by `rt-ir-cab` for true 0-sample latency.
   - Wraps `DirectConvolver` + delayed `UniformPartitionEngine` so
     head + tail don't double-count taps.
-- [ ] **Cross-fading IR switch** (Phase 4 of the core roadmap):
+- [x] **Cross-fading IR switch** (Phase 4 of the core roadmap):
   - Both plugins depend on it.  Design the API as
     `(from_slot, to_slot, duration_samples)` from day one — not a
     fixed A↔B toggle — so N-slot switching works with the same
@@ -47,28 +47,36 @@ can ship a stable release:
 
 Internal crate reused by both plugins.  Not published to crates.io.
 
-- [ ] **Workspace layout**:
-  - `crates/rt-ir-plugin-core` — shared logic.
-  - `crates/rt-ir-cab` — cab plugin.
-  - `crates/rt-ir-reverb` — reverb plugin.
-- [ ] **`IrSlotBank<const N: usize = 8>`**:
-  - Owns 8 `Option<PreparedIr>` slots.
-  - `load(index, path)` runs off-RT via `nih-plug`'s background task;
-    resamples to host rate and pre-partitions.
-  - `activate(index)` requests an RT-safe swap on the next block.
-- [ ] **Lock-free RT handoff**:
-  - `triple_buffer` or `arc-swap` between worker and audio thread.
-  - Never blocks the audio callback.
-- [ ] **MIDI routing**:
-  - Parse Program Change → slot index (0–7).
-  - Parse CC (user-assignable CC number) → slot index (value / 16).
-  - Parameter changes from the host UI also route through the same
-    `activate()` path.
-- [ ] **Parametric slot crossfader**:
-  - Equal-power crossfade envelope, driven by a
-    `crossfade_ms` parameter (5 – 200 ms).
-  - Runs two convolvers in parallel during the transition, then
-    releases the old one.
+> **Status (done):** the crate is deliberately **framework-agnostic** — it has
+> no `nih-plug` dependency.  It provides the reusable, RT-safe primitives and
+> unit-tests them in isolation; the `nih-plug` wiring (background-task loading,
+> `Plugin` impls) is a thin layer added in the plugin crates (Phase 1/2).
+
+- [x] **Workspace layout**:
+  - `rt-ir-plugin-core` — shared logic.
+  - `rt-ir-cab` — cab plugin (placeholder until Phase 1).
+  - `rt-ir-reverb` — reverb plugin (placeholder until Phase 2).
+- [x] **`IrSlotBank<T, const N: usize = 8>`**:
+  - Owns `N` `Option<T>` slots (`T` = a built convolver or `PreparedIr`).
+  - `PreparedIr::load(path, rate)` resamples off-RT; the plugin's `nih-plug`
+    background task calls it and `IrSlotBank::load(index, …)`.
+  - `request_activation(index)` records intent; `take_pending()` performs the
+    RT-safe swap on the next block.  Empty slots stay activatable (dry).
+- [x] **Lock-free RT handoff**:
+  - `triple_buffer`-backed `IrPublisher` / `IrConsumer` between worker and
+    audio thread.  Wait-free, allocation-free read; the retired convolver is
+    dropped on the producer, never on the audio thread.
+- [x] **MIDI routing**:
+  - `program_to_slot` (Program Change → slot index, out-of-range ignored).
+  - `cc_to_slot` (assignable CC → slot index, `value / 16`, clamped).
+  - `MidiRouter` unifies both; host-UI parameter changes route through the
+    same `IrSlotBank::request_activation()` path.
+- [x] **Parametric slot crossfader**:
+  - `SlotCrossfader<T: MonoConvolver>` with a **per-fade** duration
+    (`ms_to_samples` maps the `crossfade_ms` param, 5 – 200 ms).
+  - Equal-power blend via a rotation recurrence (no per-sample `sin`/`cos`,
+    no table).  Runs two convolvers in parallel during the transition and
+    hands the retired one back for off-RT disposal.
 
 ## Phase 1: `rt-ir-cab` plugin
 

@@ -12,6 +12,18 @@ edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# --- Workspace ---
+# The root crate stays the published convolution library.  The LV2/CLAP/VST3
+# plugins and their shared foundation live here and depend on this
+# crate as a path dependency (see docs/Roadmap-lv2.md, Phase 0).
+[workspace]
+resolver = "2"
+members = [
+    "rt-ir-plugin-core",
+    "rt-ir-cab",
+    "rt-ir-reverb",
+]
+
 [package.metadata.docs.rs]
 targets = [
     "x86_64-unknown-linux-gnu",
