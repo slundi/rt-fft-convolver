@@ -121,30 +121,36 @@ Guitar / bass cabinet simulator.
 
 Convolution reverb with true-stereo support.
 
-- [ ] **I/O**:
-  - Stereo in → stereo out.
-  - Uses `TrueStereoConvolver` when the IR has 4 channels,
-    `StereoConvolver` for 2-channel IRs.
-- [ ] **Slot controls** (× 8):
-  - `IR File N` (patch:message).
-  - `Slot Enabled N` (bool).
-- [ ] **Global controls**:
+> **Status:** DSP + parameter model + `nih-plug` wrapper are done and tested
+> (`cargo build -p rt-ir-reverb --features nih` → CLAP + VST3).  Same structure
+> as the cab; GUI-bound items are Phase 3, host validation + the bundled room-IR
+> pack are Phase 4/5.
+
+- [x] **I/O**:
+  - Stereo in → stereo out; a `StereoBlockAdapter` bridges variable host
+    buffers to the fixed convolver block (reports `block_size` latency).
+  - `TrueStereoConvolver` for 4-channel IRs (L→L, L→R, R→L, R→R),
+    `StereoConvolver` for 1/2/3-channel IRs — chosen per IR in the controller.
+- [x] **Slot controls** (× 8):
+  - `IR File N` — persisted per-slot path, restored + built off-thread; the
+    drag-and-drop UI is Phase 3.
+  - `Slot Enabled N` (bool) — disabled plays dry without unloading.
+- [x] **Global controls**:
   - `Current Slot` (int 0–7, automatable).
-  - `Crossfade Time` (5–500 ms — longer than cab, tails need it).
-  - `Pre-Delay` (0–500 ms).
-  - `Dry` (−∞ … +6 dB, separate fader).
-  - `Wet` (−∞ … +6 dB, separate fader).
-  - `Stereo Width` (0–200 %, wet only).
-  - `Low Cut` (20–500 Hz, wet only).
-  - `High Cut` (2–20 kHz, wet only).
-  - `IR Reverse` (bool).
-  - `IR Length` (1–100 %, truncates the tail for CPU control).
+  - `Crossfade Time` (5–500 ms) — via the stereo equal-power crossfader.
+  - `Pre-Delay` (0–500 ms) — per-channel circular delay line.
+  - `Dry` (−∞ … +6 dB) / `Wet` (−∞ … +6 dB) — independent faders (`fader_gain`).
+  - `Stereo Width` (0–200 %, wet only) — mid/side scale.
+  - `Low Cut` (20–500 Hz) / `High Cut` (2–20 kHz), wet only — Butterworth.
+  - `IR Reverse` (bool) — build-time.
+  - `IR Length` (1–100 %) — build-time tail truncation (fewer partitions).
   - `Bypass`.
-- [ ] **MIDI learn**: same as cab.
-- [ ] **CPU meter**: same as cab.
-- [ ] **Presets**:
-  - Small room / large room / hall / plate / spring — assuming a
-    small bundled IR pack (CC-licensed) is shipped with the plugin.
+- [x] **MIDI routing** (learn UI in Phase 3): PC / assignable-CC → slot.
+- [x] **CPU meter** (host readout in Phase 3):
+  - `ReverbProcessor::cpu_estimate()` = tail partitions × block size.
+- [x] **Presets** (param shaping; IR pack in Phase 5):
+  - Small Room / Large Room / Hall / Plate / Spring set pre-delay, width, EQ,
+    and tail length; the matching room IR loads into a slot separately.
 
 ## Phase 3: UI
 

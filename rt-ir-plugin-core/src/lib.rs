@@ -11,6 +11,7 @@
 //! | [`handoff`]   | Lock-free control→audio handoff of the active convolver.     |
 //! | [`midi`]      | Program-Change / CC → slot-index routing.                    |
 //! | [`crossfade`] | [`SlotCrossfader`] — parametric equal-power IR crossfade.     |
+//! | [`dsp`]       | Shared DSP: [`Biquad`] EQ + [`db_to_gain`].                  |
 //!
 //! # Threading model
 //!
@@ -23,12 +24,14 @@
 //!   allocates, locks, or blocks.
 
 pub mod crossfade;
+pub mod dsp;
 pub mod handoff;
 pub mod ir;
 pub mod midi;
 pub mod slot;
 
 pub use crossfade::{MonoConvolver, SlotCrossfader, ms_to_samples};
+pub use dsp::{BUTTERWORTH_Q, Biquad, db_to_gain};
 pub use handoff::{IrConsumer, IrPublisher, ir_handoff};
 pub use ir::PreparedIr;
 pub use midi::{MidiRouter, SlotEvent, cc_to_slot, program_to_slot};

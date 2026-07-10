@@ -35,11 +35,10 @@ use std::path::Path;
 
 use rt_fft_convolver::{HybridConvolver, LoadError, Mixer};
 use rt_ir_plugin_core::{
-    IrConsumer, IrPublisher, IrSlotBank, MidiRouter, PreparedIr, SlotError, SlotEvent, ir_handoff,
-    ms_to_samples,
+    BUTTERWORTH_Q, Biquad, IrConsumer, IrPublisher, IrSlotBank, MidiRouter, PreparedIr, SlotError,
+    SlotEvent, db_to_gain, ir_handoff, ms_to_samples,
 };
 
-use crate::dsp::{BUTTERWORTH_Q, Biquad, db_to_gain};
 use crate::params::{CabParams, NUM_SLOTS};
 
 /// A slot's IRs built into ready-to-run convolvers, one per output channel.
