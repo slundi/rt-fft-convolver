@@ -90,12 +90,25 @@ pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32
         return Ok(samples.to_vec());
     }
 
+    let mut resampler = make_resampler(from_rate, to_rate)?;
+    let mut out = Vec::new();
+    resample_into(&mut resampler, samples, &mut out)?;
+    Ok(out)
+}
+
+// ─── Crate-internal helpers ───────────────────────────────────────────────────
+
+/// Construct a mono FFT resampler for the `from_rate → to_rate` pair.
+///
+/// The returned resampler is stateful but reusable: call
+/// [`Resampler::reset`](rubato::Resampler::reset) between independent signals
+/// (e.g. successive IR channels) to clear its internal delay line, avoiding the
+/// cost of rebuilding the FFT plans and scratch buffers per channel.
+fn make_resampler(from_rate: u32, to_rate: u32) -> Result<Fft<f32>, LoadError> {
     // 1 024-frame chunks: good balance between quality and per-call overhead.
     // sub_chunks = 2 widens the internal FFT window for better stopband attenuation.
     const CHUNK: usize = 1024;
-    let n_frames = samples.len(); // mono: 1 sample = 1 frame
-
-    let mut resampler = Fft::<f32>::new(
+    Fft::<f32>::new(
         from_rate as usize,
         to_rate as usize,
         CHUNK,
@@ -103,17 +116,37 @@ pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32
         1, // mono — callers deinterleave before calling us
         FixedSync::Input,
     )
-    .map_err(LoadError::Resample)?;
+    .map_err(LoadError::Resample)
+}
 
-    // Allocate the output buffer large enough for `process_all_into_buffer`,
-    // which includes the resampler's internal delay and a chunk of headroom.
+/// Resample `samples` through `resampler`, writing the result into `out`.
+///
+/// `out` is fully overwritten — any prior contents are discarded — but its
+/// **existing allocation is reused**: `resize` only re-mallocs when the buffer
+/// must grow past its current capacity.  Feeding the same `out` back on
+/// successive calls therefore amortises the output allocation across channels
+/// (`vec![0.0; …]` would malloc a fresh buffer every time).
+///
+/// The caller is responsible for [`Resampler::reset`](rubato::Resampler::reset)
+/// between independent signals.
+fn resample_into(
+    resampler: &mut Fft<f32>,
+    samples: &[f32],
+    out: &mut Vec<f32>,
+) -> Result<(), LoadError> {
+    let n_frames = samples.len(); // mono: 1 sample = 1 frame
+
+    // Size the output for `process_all_into_buffer`, which needs room for the
+    // resampler's internal delay plus a chunk of headroom.  clear()+resize on a
+    // reused buffer keeps the prior allocation whenever capacity already fits.
     let out_buf_len = resampler.process_all_needed_output_len(n_frames);
-    let mut outdata = vec![0.0_f32; out_buf_len];
+    out.clear();
+    out.resize(out_buf_len, 0.0);
 
     // Wrap the raw slices in adapters that the rubato Resampler trait accepts.
     let input = InterleavedSlice::new(samples, 1, n_frames)
         .map_err(|e| LoadError::UnsupportedFormat(e.to_string()))?;
-    let mut output = InterleavedSlice::new_mut(&mut outdata, 1, out_buf_len)
+    let mut output = InterleavedSlice::new_mut(out.as_mut_slice(), 1, out_buf_len)
         .map_err(|e| LoadError::UnsupportedFormat(e.to_string()))?;
 
     // `process_all_into_buffer` handles chunking, partial last chunk,
@@ -123,11 +156,9 @@ pub fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32
         .process_all_into_buffer(&input, &mut output, n_frames, None)
         .map_err(LoadError::ResampleProcess)?;
 
-    outdata.truncate(out_frames);
-    Ok(outdata)
+    out.truncate(out_frames);
+    Ok(())
 }
-
-// ─── Crate-internal helpers ───────────────────────────────────────────────────
 
 /// Core implementation shared between [`load_ir`] (file path) and the
 /// in-memory path used in unit tests.
@@ -158,8 +189,23 @@ pub(crate) fn load_ir_from_reader<R: std::io::Read>(
 
     // ── Resample each channel independently if the file rate differs ──────────
     if file_sample_rate != target_sample_rate {
+        // Build the resampler once and reuse it for every channel (reset()
+        // between channels clears its internal delay line).  This avoids
+        // reconstructing the FFT plans and scratch buffers per channel — the
+        // dominant allocation cost for multi-channel (true-stereo) IRs.
+        let mut resampler = make_resampler(file_sample_rate, target_sample_rate)?;
+
+        // `input_scratch` lets us resample each channel *back into its own Vec*
+        // instead of allocating a fresh output buffer per channel: we swap the
+        // channel's samples out into the scratch, then write the resampled
+        // result into the channel's (reused) allocation.  The scratch buffer
+        // itself is likewise reused across channels.
+        let mut input_scratch: Vec<f32> = Vec::new();
         for ch in channels.iter_mut() {
-            *ch = resample(ch, file_sample_rate, target_sample_rate)?;
+            // ch ← empty (old scratch), input_scratch ← this channel's samples
+            std::mem::swap(ch, &mut input_scratch);
+            resampler.reset(); // clear state left by the previous channel
+            resample_into(&mut resampler, &input_scratch, ch)?;
         }
     }
 
@@ -257,6 +303,35 @@ mod tests {
         for (&ls, &rs) in l.iter().zip(r.iter()) {
             w.write_sample((ls * i16::MAX as f32) as i16).unwrap();
             w.write_sample((rs * i16::MAX as f32) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+        buf.set_position(0);
+        buf
+    }
+
+    /// Build an N-channel 16-bit WAV in memory from per-channel sample slices
+    /// (all channels must share the same length).
+    fn make_wav_multi_i16(sample_rate: u32, channels: &[&[f32]]) -> Cursor<Vec<u8>> {
+        let num_ch = channels.len();
+        assert!(num_ch > 0);
+        let n = channels[0].len();
+        assert!(
+            channels.iter().all(|c| c.len() == n),
+            "channels differ in length"
+        );
+
+        let spec = hound::WavSpec {
+            channels: num_ch as u16,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = hound::WavWriter::new(&mut buf, spec).unwrap();
+        for i in 0..n {
+            for ch in channels {
+                w.write_sample((ch[i] * i16::MAX as f32) as i16).unwrap();
+            }
         }
         w.finalize().unwrap();
         buf.set_position(0);
@@ -464,5 +539,104 @@ mod tests {
         let reader = hound::WavReader::new(wav).unwrap();
         let ir = load_ir_from_reader(reader, 48_000).unwrap();
         assert_eq!(ir.channels[0], samples);
+    }
+
+    // ── output-buffer / resampler reuse ────────────────────────────────────────
+
+    /// Reusing an `out` buffer must (a) produce exactly the one-shot result and
+    /// (b) not reallocate on the second, same-sized call — the amortisation the
+    /// per-channel loop relies on.
+    #[test]
+    fn resample_into_reuses_dirty_buffer() {
+        let input: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.01).sin()).collect();
+        let expected = resample(&input, 44_100, 48_000).unwrap();
+
+        let mut resampler = make_resampler(44_100, 48_000).unwrap();
+        let mut out = Vec::new();
+
+        // First call establishes the allocation (grown to the internal
+        // delay+headroom size, then truncated to the valid frame count).
+        resample_into(&mut resampler, &input, &mut out).unwrap();
+        assert_eq!(out, expected, "first call must match one-shot output");
+        let cap_after_first = out.capacity();
+
+        // Dirty the surviving samples, then re-run the identical input: the
+        // clear()+resize()+truncate() path must overwrite the junk, and the
+        // existing capacity is enough so no reallocation occurs.
+        out.iter_mut().for_each(|s| *s = 9.99);
+        resampler.reset();
+        resample_into(&mut resampler, &input, &mut out).unwrap();
+
+        assert_eq!(out, expected, "reused buffer must match one-shot output");
+        assert_eq!(
+            out.capacity(),
+            cap_after_first,
+            "second same-sized call must reuse the allocation"
+        );
+    }
+
+    /// A single resampler reset between signals must yield the same output as a
+    /// fresh resampler per signal — the invariant `load_ir_from_reader` relies
+    /// on when reusing one resampler across channels.
+    #[test]
+    fn reused_resampler_matches_fresh_per_signal() {
+        let sig_a: Vec<f32> = (0..1500).map(|i| (i as f32 * 0.02).sin()).collect();
+        let sig_b: Vec<f32> = (0..1500).map(|i| (i as f32 * 0.05).cos()).collect();
+
+        let fresh_a = resample(&sig_a, 48_000, 44_100).unwrap();
+        let fresh_b = resample(&sig_b, 48_000, 44_100).unwrap();
+
+        let mut resampler = make_resampler(48_000, 44_100).unwrap();
+        let mut out = Vec::new();
+
+        resampler.reset();
+        resample_into(&mut resampler, &sig_a, &mut out).unwrap();
+        assert_eq!(out, fresh_a, "signal A after reuse must match fresh");
+        let reused_a = out.clone();
+
+        resampler.reset();
+        resample_into(&mut resampler, &sig_b, &mut out).unwrap();
+        assert_eq!(out, fresh_b, "signal B after reuse must match fresh");
+
+        // Sanity: distinct inputs give distinct outputs (no stale carry-over).
+        assert_ne!(reused_a, out);
+    }
+
+    /// True-stereo 4-channel IR: every channel is resampled correctly through
+    /// the reused resampler (exercises `reset()` across more than two channels).
+    #[test]
+    fn load_ir_resamples_four_channels() {
+        let wav_sr = 44_100_u32;
+        let target_sr = 48_000_u32;
+        // Long enough for the FFT resampler to reach steady state (matches the
+        // proven `resample_dc_signal_preserved` test scale).
+        let n = 4096_usize;
+
+        let ch0: Vec<f32> = vec![0.25_f32; n];
+        let ch1: Vec<f32> = vec![-0.25_f32; n];
+        let ch2: Vec<f32> = vec![0.75_f32; n];
+        let ch3: Vec<f32> = vec![-0.75_f32; n];
+        let wav = make_wav_multi_i16(wav_sr, &[&ch0, &ch1, &ch2, &ch3]);
+        let reader = hound::WavReader::new(wav).unwrap();
+        let ir = load_ir_from_reader(reader, target_sr).unwrap();
+
+        let expected_len = (n as f64 * target_sr as f64 / wav_sr as f64).ceil() as usize;
+        assert_eq!(ir.num_channels, 4);
+        assert_eq!(ir.channels.len(), 4);
+        for (c, ch) in ir.channels.iter().enumerate() {
+            assert_eq!(ch.len(), expected_len, "channel {c} length mismatch");
+        }
+
+        // Each DC channel should resample back to its constant level (skip the
+        // FIR transient at head/tail).
+        let levels = [0.25_f32, -0.25, 0.75, -0.75];
+        let tol = 1.0 / i16::MAX as f32 + 0.02;
+        for (ch, &level) in ir.channels.iter().zip(levels.iter()) {
+            let mid = &ch[64..ch.len().saturating_sub(64)];
+            assert!(!mid.is_empty());
+            for &s in mid {
+                assert!((s - level).abs() < tol, "expected ≈ {level}, got {s}");
+            }
+        }
     }
 }

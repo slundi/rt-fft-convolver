@@ -64,9 +64,15 @@ This roadmap outlines the development of a zero-latency, high-performance convol
   - Done: hand-rolled `static FPU_TEST_LOCK: Mutex<()>` (poison-tolerant
     `fpu_lock()` helper) now serialises every FPU-mutating test; added
     `x86_guard_restores_arbitrary_prior_mxcsr` verifying exact-bit restoration.
-- [ ] **Resampler output-buffer reuse**:
+- [x] **Resampler output-buffer reuse**:
   - `resample()` calls `vec![0.0; process_all_needed_output_len]` then
     `truncate()`s the tail.  On multi-channel loads this is one allocation
     per channel; switch to `Vec::with_capacity` + `resize()` + `truncate()`
     to skip the double-init cost.  IR loading is non-RT so this is minor,
     but matters for large multi-channel IRs.
+  - Done: split `resample()` into `make_resampler()` + `resample_into()`.
+    `load_ir_from_reader` now builds **one** resampler and `reset()`s it
+    between channels (avoiding per-channel FFT-plan reconstruction — the real
+    cost for true-stereo IRs) and resamples each channel back into its own
+    reused allocation via a swap-through scratch buffer.  `resample_into`
+    reuses `out`'s capacity through `clear()`+`resize()`+`truncate()`.
