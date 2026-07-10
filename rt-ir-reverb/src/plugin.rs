@@ -13,8 +13,19 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use nih_plug::prelude::*;
+#[cfg(feature = "gui")]
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 use parking_lot::Mutex as PlMutex;
 use rt_ir_plugin_core::SlotEvent;
+
+#[cfg(feature = "gui")]
+use rt_ir_plugin_core::{MidiStatus, PadState, WaveformSummary, pad_state};
+#[cfg(feature = "gui")]
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Waveform preview resolution (buckets across the frame width).
+#[cfg(feature = "gui")]
+const WAVEFORM_BUCKETS: usize = 256;
 
 use crate::block::StereoBlockAdapter;
 use crate::engine::ReverbController;
@@ -87,6 +98,10 @@ struct ReverbPluginParams {
 
     #[persist = "ir_paths"]
     ir_paths: PlMutex<Vec<Option<String>>>,
+
+    #[cfg(feature = "gui")]
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 impl Default for ReverbPluginParams {
@@ -183,6 +198,8 @@ impl Default for ReverbPluginParams {
                 .with_value_to_string(formatters::v2s_bool_bypass()),
             slots: core::array::from_fn(|_| SlotParams::default()),
             ir_paths: PlMutex::new(vec![None; NUM_SLOTS]),
+            #[cfg(feature = "gui")]
+            editor_state: EguiState::from_size(720, 380),
         }
     }
 }
@@ -216,6 +233,13 @@ pub struct ReverbPlugin {
     last_enabled: [bool; NUM_SLOTS],
     last_reverse: bool,
     last_length: f32,
+
+    /// Per-slot waveform previews for the editor, filled off-thread on load.
+    #[cfg(feature = "gui")]
+    waveforms: Arc<Mutex<Vec<Option<WaveformSummary>>>>,
+    /// Bumped on each recognised MIDI event so the editor LED can blink.
+    #[cfg(feature = "gui")]
+    midi_counter: Arc<AtomicU32>,
 }
 
 impl Default for ReverbPlugin {
@@ -228,8 +252,39 @@ impl Default for ReverbPlugin {
             last_enabled: [true; NUM_SLOTS],
             last_reverse: false,
             last_length: 1.0,
+            #[cfg(feature = "gui")]
+            waveforms: Arc::new(Mutex::new(vec![None; NUM_SLOTS])),
+            #[cfg(feature = "gui")]
+            midi_counter: Arc::new(AtomicU32::new(0)),
         }
     }
+}
+
+/// Mutable per-frame editor state owned by the egui editor closure.
+#[cfg(feature = "gui")]
+#[derive(Default)]
+struct ReverbEditorState {
+    midi: rt_ir_plugin_core::MidiActivity,
+    last_midi: u32,
+}
+
+/// Fill colour for a slot pad in each visual state.
+#[cfg(feature = "gui")]
+fn pad_fill(state: PadState, accent: egui::Color32) -> egui::Color32 {
+    match state {
+        PadState::Active => accent,
+        PadState::Filled => egui::Color32::from_rgb(0x23, 0x28, 0x30),
+        PadState::Disabled => egui::Color32::from_rgb(0x20, 0x22, 0x26),
+        PadState::Empty => egui::Color32::from_rgb(0x1a, 0x1e, 0x24),
+    }
+}
+
+/// Linear blend between two colours (`t` in `0..=1`).
+#[cfg(feature = "gui")]
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 impl Plugin for ReverbPlugin {
@@ -256,8 +311,138 @@ impl Plugin for ReverbPlugin {
         self.params.clone()
     }
 
+    #[cfg(feature = "gui")]
+    fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        use egui::{Color32, Sense, Stroke, pos2, vec2};
+
+        // Teal accent (docs/UI-lv2.md § reverb visual identity).
+        const ACCENT: Color32 = Color32::from_rgb(0x3a, 0xa3, 0xb5);
+        const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1e, 0x24);
+
+        let params = self.params.clone();
+        let waveforms = self.waveforms.clone();
+        let midi_counter = self.midi_counter.clone();
+        let executor = async_executor;
+
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            ReverbEditorState::default(),
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                // Drive the MIDI LED from the shared event counter.
+                let count = midi_counter.load(Ordering::Relaxed);
+                if count != state.last_midi {
+                    state.last_midi = count;
+                    state.midi.trigger(true);
+                }
+                state.midi.decay(0.08);
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Header: name · MIDI LED · bypass ──────────────────
+                    ui.horizontal(|ui| {
+                        ui.heading("RT IR Reverb");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.bypass, setter));
+                            let (led, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                            let base = match state.midi.status() {
+                                MidiStatus::Recognised => Color32::from_rgb(0x4e, 0xc3, 0x6a),
+                                MidiStatus::Unrecognised => Color32::from_rgb(0xd9, 0x4a, 0x4a),
+                                MidiStatus::Idle => Color32::from_gray(0x30),
+                            };
+                            let col =
+                                lerp_color(Color32::from_gray(0x30), base, state.midi.level());
+                            ui.painter().circle_filled(led.center(), 6.0, col);
+                            ui.label("MIDI");
+                        });
+                    });
+                    ui.separator();
+
+                    // ── Slot rack: 8 pads ─────────────────────────────────
+                    let current = params.current_slot.value();
+                    let mut pad_rects = [egui::Rect::NOTHING; NUM_SLOTS];
+                    ui.horizontal(|ui| {
+                        for (i, rect) in pad_rects.iter_mut().enumerate() {
+                            let loaded = params.ir_paths.lock()[i].is_some();
+                            let enabled = params.slots[i].enabled.value();
+                            let st = pad_state(loaded, enabled, i as i32 == current);
+                            let resp = ui.add_sized(
+                                vec2(56.0, 44.0),
+                                egui::Button::new(format!("{}", i + 1)).fill(pad_fill(st, ACCENT)),
+                            );
+                            *rect = resp.rect;
+                            if resp.clicked() {
+                                setter.begin_set_parameter(&params.current_slot);
+                                setter.set_parameter(&params.current_slot, i as i32);
+                                setter.end_set_parameter(&params.current_slot);
+                            }
+                        }
+                    });
+
+                    // ── Drag-and-drop a file onto a pad → load that slot ──
+                    let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+                    if !dropped.is_empty()
+                        && let Some(pos) = ctx.input(|i| i.pointer.hover_pos())
+                        && let Some(slot) = pad_rects.iter().position(|r| r.contains(pos))
+                    {
+                        for f in dropped {
+                            if let Some(path) = f.path {
+                                params.ir_paths.lock()[slot] =
+                                    Some(path.to_string_lossy().into_owned());
+                                executor.execute_background(ReverbTask::Load { slot, path });
+                                setter.begin_set_parameter(&params.current_slot);
+                                setter.set_parameter(&params.current_slot, slot as i32);
+                                setter.end_set_parameter(&params.current_slot);
+                            }
+                        }
+                    }
+
+                    // ── Waveform preview of the active slot ───────────────
+                    let (frame, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 96.0), Sense::hover());
+                    ui.painter().rect_filled(frame, 2.0, PANEL);
+                    if let Some(Some(w)) = waveforms.lock().unwrap().get(current as usize) {
+                        let n = w.peaks.len().max(1);
+                        let cy = frame.center().y;
+                        let half = frame.height() * 0.5;
+                        for (k, &(lo, hi)) in w.peaks.iter().enumerate() {
+                            let x = frame.left() + frame.width() * (k as f32 / n as f32);
+                            ui.painter().line_segment(
+                                [pos2(x, cy - hi * half), pos2(x, cy - lo * half)],
+                                Stroke::new(1.0, ACCENT),
+                            );
+                        }
+                    }
+                    ui.separator();
+
+                    // ── Global controls ───────────────────────────────────
+                    egui::Grid::new("reverb-controls").show(ui, |ui| {
+                        for (label, add) in [
+                            ("Pre-Delay", &params.predelay_ms),
+                            ("Low Cut", &params.low_cut),
+                            ("High Cut", &params.high_cut),
+                            ("Width", &params.width),
+                            ("Crossfade", &params.crossfade_ms),
+                            ("Dry", &params.dry_db),
+                            ("Wet", &params.wet_db),
+                            ("IR Length", &params.ir_length),
+                        ] {
+                            ui.label(label);
+                            ui.add(widgets::ParamSlider::for_param(add, setter));
+                            ui.end_row();
+                        }
+                        ui.label("IR Reverse");
+                        ui.add(widgets::ParamSlider::for_param(&params.ir_reverse, setter));
+                        ui.end_row();
+                    });
+                });
+            },
+        )
+    }
+
     fn task_executor(&mut self) -> TaskExecutor<Self> {
         let controller = self.controller.clone();
+        #[cfg(feature = "gui")]
+        let waveforms = self.waveforms.clone();
         Box::new(move |task| {
             let mut guard = controller.lock().unwrap();
             let Some(ctrl) = guard.as_mut() else {
@@ -269,6 +454,10 @@ impl Plugin for ReverbPlugin {
                         nih_error!("failed to load IR into slot {slot}: {e}");
                     }
                     ctrl.activate(slot);
+                    #[cfg(feature = "gui")]
+                    {
+                        waveforms.lock().unwrap()[slot] = ctrl.waveform(slot, WAVEFORM_BUCKETS);
+                    }
                 }
                 ReverbTask::Activate(slot) => ctrl.activate(slot),
                 ReverbTask::Midi(event) => {
@@ -308,6 +497,15 @@ impl Plugin for ReverbPlugin {
         controller.set_length(self.params.ir_length.value());
         controller.activate(self.params.current_slot.value() as usize);
 
+        // Pre-compute waveform previews for the restored slots.
+        #[cfg(feature = "gui")]
+        {
+            let mut wf = self.waveforms.lock().unwrap();
+            for (i, slot) in wf.iter_mut().enumerate() {
+                *slot = controller.waveform(i, WAVEFORM_BUCKETS);
+            }
+        }
+
         let adapter = StereoBlockAdapter::new(processor);
         context.set_latency_samples(adapter.latency_samples() as u32);
 
@@ -332,6 +530,8 @@ impl Plugin for ReverbPlugin {
             match event {
                 NoteEvent::MidiProgramChange { program, .. } => {
                     context.execute_background(ReverbTask::Midi(SlotEvent::ProgramChange(program)));
+                    #[cfg(feature = "gui")]
+                    self.midi_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 NoteEvent::MidiCC { cc, value, .. } => {
                     let raw = (value * 127.0).round().clamp(0.0, 127.0) as u8;
@@ -339,6 +539,8 @@ impl Plugin for ReverbPlugin {
                         controller: cc,
                         value: raw,
                     }));
+                    #[cfg(feature = "gui")]
+                    self.midi_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => {}
             }

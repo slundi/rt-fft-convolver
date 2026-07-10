@@ -132,6 +132,24 @@ impl CabController {
         self.sample_rate
     }
 
+    /// Whether slot `index` holds an IR.
+    #[inline]
+    pub fn is_loaded(&self, index: usize) -> bool {
+        self.bank.is_loaded(index)
+    }
+
+    /// Down-sampled waveform preview of slot `index`'s IR (channel 0), or
+    /// `None` if empty.  For the editor; **allocates** (off-RT).
+    pub fn waveform(
+        &self,
+        index: usize,
+        buckets: usize,
+    ) -> Option<rt_ir_plugin_core::WaveformSummary> {
+        let ir = self.bank.get(index)?;
+        let ch = ir.channel(0)?;
+        Some(rt_ir_plugin_core::compute_waveform(ch, buckets))
+    }
+
     /// Empty `index` (does not change what is currently playing).
     ///
     /// # Errors

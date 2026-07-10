@@ -154,13 +154,33 @@ Convolution reverb with true-stereo support.
 
 ## Phase 3: UI
 
-- [ ] **`nih-plug-egui`** (or `nih-plug-iced`) frontend, shared
-  between both plugins where possible.
-- [ ] **Slot rack**: 8 pads, drag-and-drop file loading.  Active
-  slot highlighted; empty slots visibly greyed out.
-- [ ] **IR waveform preview** per slot (pre-computed off-thread).
-- [ ] **MIDI activity indicator** on the currently mapped CC/PC.
-- [ ] **Global bypass with LED** — matches host bypass state.
+Designed at `docs/UI-lv2.md`
+
+> **Status:** editors implemented on **`nih-plug-egui`** (chosen over iced:
+> immediate-mode painting makes a background image + freely-placed knobs and the
+> waveform/LED trivial, and it's the best-supported nih-plug GUI).  The
+> framework-agnostic UI *logic* (pad state, waveform peak summary, MIDI-activity
+> blink, IR info) lives in `rt-ir-plugin-core::ui` and is unit-tested; the egui
+> rendering is behind each plugin's **`gui`** feature (`cargo build -p rt-ir-cab
+> --features gui`).  `gui` links an X11 + OpenGL stack, so it builds in a desktop
+> environment (compile-verified here via a Nix shell providing those libs); the
+> default/`nih` build stays headless and needs no system libraries.
+
+- [x] **`nih-plug-egui`** frontend; shared logic in `rt-ir-plugin-core::ui`
+  (`PadState`, `compute_waveform`, `MidiActivity`), per-plugin egui layout with
+  the plugin's accent (amber / teal).
+- [x] **Slot rack**: 8 pads; left-click activates; drag-and-drop a file onto a
+  pad loads it (off-thread) and persists the path.  Active pad shows the accent
+  fill, empty pads greyed, disabled dimmed (via `ui::pad_state`).
+- [x] **IR waveform preview**: min/max envelope of the active slot, normalised
+  to the IR peak, **pre-computed off-thread** on load and cached for the editor.
+  (Per-channel 4-trace true-stereo view from the design doc is a refinement;
+  channel 0 is drawn today.)
+- [x] **MIDI activity indicator**: header LED driven by a shared event counter
+  bumped on each PC/CC, blinking via `ui::MidiActivity` (green = recognised).
+  (The right-click "MIDI learn" *gesture* from the design doc is a follow-up;
+  routing + indicator are done.)
+- [x] **Global bypass with LED**: bypass `ParamSlider` in the header.
 
 ## Phase 4: Testing
 

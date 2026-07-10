@@ -29,6 +29,7 @@ pub mod handoff;
 pub mod ir;
 pub mod midi;
 pub mod slot;
+pub mod ui;
 
 pub use crossfade::{MonoConvolver, SlotCrossfader, ms_to_samples};
 pub use dsp::{BUTTERWORTH_Q, Biquad, db_to_gain};
@@ -36,3 +37,7 @@ pub use handoff::{IrConsumer, IrPublisher, ir_handoff};
 pub use ir::PreparedIr;
 pub use midi::{MidiRouter, SlotEvent, cc_to_slot, program_to_slot};
 pub use slot::{IrSlotBank, SlotError};
+pub use ui::{
+    MidiActivity, MidiStatus, PadState, WaveformSummary, channel_label, compute_waveform,
+    ir_duration_ms, pad_state,
+};

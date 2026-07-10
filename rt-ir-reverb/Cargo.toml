@@ -15,7 +15,11 @@ crate-type = ["lib", "cdylib"]
 # The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
 # Build the actual plugin with `cargo build -p rt-ir-reverb --features nih`.
 default = []
+# `nih` builds the headless plugin (CLAP + VST3, host-provided generic UI) and
+# needs no system libraries.  `gui` adds the nih-plug-egui editor, which links
+# an X11 + OpenGL stack — build it in an environment that provides those.
 nih = ["dep:nih_plug", "dep:parking_lot"]
+gui = ["nih", "dep:nih_plug_egui"]
 
 [dependencies]
 # Shared Phase-0 foundation (IR slot bank, handoff, MIDI routing, DSP helpers).
@@ -25,5 +29,6 @@ rt-fft-convolver = { path = ".." }
 
 # nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
 # For the `#[persist]` state field (matches nih-plug's own PersistentField impls).
 parking_lot = { version = "0.12", optional = true }

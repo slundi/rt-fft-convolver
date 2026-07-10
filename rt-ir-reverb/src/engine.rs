@@ -135,6 +135,24 @@ impl ReverbController {
         self.sample_rate
     }
 
+    /// Whether slot `index` holds an IR.
+    #[inline]
+    pub fn is_loaded(&self, index: usize) -> bool {
+        self.bank.is_loaded(index)
+    }
+
+    /// Down-sampled waveform preview of slot `index`'s IR (channel 0), or
+    /// `None` if the slot is empty.  For the editor; **allocates** (off-RT).
+    pub fn waveform(
+        &self,
+        index: usize,
+        buckets: usize,
+    ) -> Option<rt_ir_plugin_core::WaveformSummary> {
+        let ir = self.bank.get(index)?;
+        let ch = ir.channel(0)?;
+        Some(rt_ir_plugin_core::compute_waveform(ch, buckets))
+    }
+
     /// Route a MIDI event and activate the resulting slot, if any.
     pub fn handle_midi(&mut self, event: SlotEvent) -> Option<usize> {
         let slot = self.router.route(event)?;
