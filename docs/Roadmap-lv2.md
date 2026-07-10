@@ -82,30 +82,40 @@ Internal crate reused by both plugins.  Not published to crates.io.
 
 Guitar / bass cabinet simulator.
 
-- [ ] **I/O**:
-  - Mono in → stereo out (default), stereo in → stereo out.
-  - Uses `HybridConvolver` per output channel.
-- [ ] **Slot controls** (× 8):
-  - `IR File N` (LV2 patch:message, VST3/CLAP file path property).
-  - `Slot Enabled N` (bool) — allow disabling a slot without
-    unloading it.
-- [ ] **Global controls**:
+> **Status:** DSP + parameter model + `nih-plug` wrapper are done and tested.
+> The wrapper is behind the crate's `nih` feature
+> (`cargo build -p rt-ir-cab --features nih` → CLAP + VST3); `cargo test` runs
+> the framework-agnostic core.  Items needing a GUI (file drag-and-drop, the
+> MIDI-learn gesture, the CPU-meter readout) are wired in the engine but their
+> UI surface lands in **Phase 3**; host validation is **Phase 4**.
+
+- [x] **I/O**:
+  - Mono in → stereo out (default), stereo in → stereo out — two
+    `AudioIOLayout`s; a `StereoBlockAdapter` bridges variable host buffers to
+    the convolver's fixed block (reports `block_size` latency).
+  - Uses `HybridConvolver` per output channel (via `SlotCrossfader`).
+- [x] **Slot controls** (× 8):
+  - `IR File N` — persisted per-slot path, restored on load and (re)built off
+    the audio thread; the drag-and-drop assignment UI is Phase 3.
+  - `Slot Enabled N` (bool) — a disabled slot plays dry without unloading.
+- [x] **Global controls**:
   - `Current Slot` (int 0–7, automatable).
   - `Crossfade Time` (5–200 ms).
   - `Input Gain` (−24 … +24 dB).
   - `Output Gain` (−24 … +24 dB).
   - `Mix` (0–100 %, defaults to 100 %).
-  - `Low Cut` (20–500 Hz, 12 dB/oct, pre-convolution).
-  - `High Cut` (2–20 kHz, 12 dB/oct, post-convolution).
-  - `IR Normalize` (bool, uses the `Mixer` loudness computation).
-  - `Bypass` (LV2 standard).
-- [ ] **MIDI learn**:
-  - Right-click `Current Slot` → "MIDI learn" to bind a PC or CC.
-- [ ] **CPU meter**:
-  - Report partition count × block size as a read-only property.
-- [ ] **Presets**:
-  - Ship a handful of neutral tone-shaping presets (bright, dark,
-    scooped) that only touch the EQ — not the IR itself.
+  - `Low Cut` (20–500 Hz, 12 dB/oct, pre-convolution) — Butterworth biquad.
+  - `High Cut` (2–20 kHz, 12 dB/oct, post-convolution) — Butterworth biquad.
+  - `IR Normalize` (bool, uses the `Mixer` L2-norm gain).
+  - `Bypass`.
+- [x] **MIDI routing** (learn UI in Phase 3):
+  - Program Change → slot, assignable CC → slot, routed off-thread through the
+    `MidiRouter`.  `MidiConfig::MidiCCs` enabled.
+- [x] **CPU meter** (host readout in Phase 3):
+  - `CabProcessor::cpu_estimate()` = tail partitions × block size.
+- [x] **Presets**:
+  - `Flat` / `Bright` / `Dark` / `Scooped`, EQ-only (never touch the IR,
+    gains, or mix).
 
 ## Phase 2: `rt-ir-reverb` plugin
 

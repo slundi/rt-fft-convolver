@@ -3,11 +3,27 @@ name = "rt-ir-cab"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Guitar / bass cabinet simulator plugin (LV2/CLAP/VST3) built on rt-fft-convolver. Placeholder — implemented in Phase 1 of docs/Roadmap-lv2.md."
+description = "Guitar / bass cabinet simulator plugin (LV2/CLAP/VST3) built on rt-fft-convolver."
 repository = "https://codeberg.org/slundi/rt-fft-convolver"
 publish = false
 
+[lib]
+# `cdylib` is what the CLAP/VST3 bundles load; `rlib` keeps unit tests working.
+crate-type = ["lib", "cdylib"]
+
+[features]
+# The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
+# Build the actual plugin with `cargo build -p rt-ir-cab --features nih`.
+default = []
+nih = ["dep:nih_plug", "dep:parking_lot"]
+
 [dependencies]
-# Shared Phase-0 foundation. The nih-plug integration and the plugin's own
-# controls land in Phase 1.
+# Shared Phase-0 foundation (IR slot bank, handoff, MIDI routing, crossfader).
 rt-ir-plugin-core = { path = "../rt-ir-plugin-core" }
+# The convolution engine and IR loading types the cab renders with.
+rt-fft-convolver = { path = ".." }
+
+# nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+# For the `#[persist]` state field (matches nih-plug's own PersistentField impls).
+parking_lot = { version = "0.12", optional = true }
