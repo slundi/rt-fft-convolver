@@ -28,8 +28,9 @@ Plugin format target: **LV2 + CLAP + VST3** via
   (see [Roadmap-lv2.md](Roadmap-lv2.md)).  MIDI PC + CC + parameter
   automation all switch slots.
 - **SIMD kernels** for dense matmul, conv1d, and activation
-  functions.  Portable path first (`std::simd` or auto-vec), AVX2/NEON
-  path second.
+  functions via [`pulp`](https://github.com/sarah-quinones/pulp) —
+  automatic runtime dispatch across SSE/AVX2/AVX-512/NEON on stable
+  Rust (see Phase 0).
 - **This plugin does NOT include cab simulation** — it pairs
   naturally with `rt-ir-cab` in the user's signal chain.
 
@@ -97,27 +98,28 @@ None strictly required.  Optional reuse:
   Parsing, transposition, and packing all happen off the audio
   thread.
 
-## Phase 1: `rt-neural-core` (engine crate)
+## Phase 1: `rt-neural-core` (engine crate) ✅
 
 Internal crate, not published to crates.io initially.
 
-- [ ] **Workspace layout**:
+- **Workspace layout**:
   - `rt-neural-core` — inference engine.
   - `rt-neural-amp` — plugin.
-- [ ] **Layer primitives**, all `#[inline]` and allocation-free:
+- **Layer primitives**, all `#[inline]` and allocation-free:
   - Dense (matmul + bias).
   - Conv1D (causal, dilated).
   - LSTM cell.
   - Activations: tanh, sigmoid, ReLU, GELU (LUT-based fast paths).
-- [ ] **`PreparedModel`**:
+- **`PreparedModel`**:
   - Owns weight tensors in cache-friendly layout.
   - `process_sample(&mut self, x: f32) -> f32` — the RT entry point.
   - `reset()` — zeroes internal state (LSTM h/c, conv1d ring buffers).
-- [ ] **SIMD kernels**:
-  - Portable via `std::simd` first.
-  - Feature-gated AVX2 / NEON overrides.
-  - Benchmarked against a scalar baseline.
-- [ ] **Slot bank** analogous to `IrSlotBank`:
+- **SIMD kernels** (per Phase 0 decision):
+  - `pulp`-based kernels with automatic runtime dispatch
+    (SSE/AVX2/AVX-512/NEON) — stable Rust, one binary.
+  - Scalar baseline kept as reference implementation for tests.
+  - Benchmarked against the scalar baseline via `criterion`.
+- **Slot bank** analogous to `IrSlotBank`:
   - 8 `Option<PreparedModel>` slots.
   - Off-RT load via `nih-plug` background task.
   - Lock-free swap via `arc-swap` or `triple_buffer`.

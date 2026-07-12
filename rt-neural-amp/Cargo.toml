@@ -1,0 +1,18 @@
+[package]
+name = "rt-neural-amp"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time neural amp / pedal modelling plugin (LV2 / CLAP / VST3) built on rt-neural-core.  Scaffold only in Phase 1; filled out in Phase 2 (see docs/Roadmap-01-neural-amp.md)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+publish = false
+
+[lib]
+# Placeholder library target; Phase 2 will introduce cdylib for the plugin
+# bundle when nih-plug is wired up.
+crate-type = ["rlib"]
+
+[dependencies]
+rt-neural-core = { path = "../rt-neural-core" }
+rt-fft-convolver = { path = ".." }

@@ -14,14 +14,17 @@ edition = "2024"
 
 # --- Workspace ---
 # The root crate stays the published convolution library.  The LV2/CLAP/VST3
-# plugins and their shared foundation live here and depend on this
-# crate as a path dependency (see docs/Roadmap-lv2.md, Phase 0).
+# IR plugins (see docs/Roadmap-lv2.md) and the neural amp modelling engine
+# + plugin (see docs/Roadmap-01-neural-amp.md, Phase 1) live as sibling
+# crates and depend on this crate as a path dependency.
 [workspace]
 resolver = "2"
 members = [
     "rt-ir-plugin-core",
     "rt-ir-cab",
     "rt-ir-reverb",
+    "rt-neural-core",
+    "rt-neural-amp",
     "xtask",
 ]
 # `xtask` exists only for `cargo xtask …` (the bundler); keep it out of plain
@@ -31,6 +34,8 @@ default-members = [
     "rt-ir-plugin-core",
     "rt-ir-cab",
     "rt-ir-reverb",
+    "rt-neural-core",
+    "rt-neural-amp",
 ]
 
 [package.metadata.docs.rs]
