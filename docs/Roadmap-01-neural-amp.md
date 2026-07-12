@@ -124,15 +124,16 @@ Internal crate, not published to crates.io initially.
   - Off-RT load via `nih-plug` background task.
   - Lock-free swap via `arc-swap` or `triple_buffer`.
 
-## Phase 2: `rt-neural-amp` plugin
+## Phase 2: `rt-neural-amp` plugin ✅
 
-- [ ] **I/O**:
+- **I/O**:
   - Mono in → mono out (models are inherently mono).
   - Second instance for stereo (host places two on L/R).
-- [ ] **Slot controls** (× 8):
-  - `Model File N` (patch:message / file property).
+- **Slot controls** (× 8):
+  - `Model File N` (persisted state) — file loader itself is stubbed
+    with `LoaderError::NotImplemented` (Phase 1.5 follow-up).
   - `Slot Enabled N` (bool).
-- [ ] **Global controls**:
+- **Global controls**:
   - `Current Slot` (int 0–7, automatable).
   - `Crossfade Time` (5–200 ms).
   - `Input Gain` (−24 … +24 dB) — critical: neural models are
@@ -141,9 +142,19 @@ Internal crate, not published to crates.io initially.
   - `Mix` (0–100 %).
   - `Model Level Trim` (−12 … +12 dB, per-slot, non-automatable).
   - `Bypass`.
-- [ ] **MIDI learn**: right-click → learn PC / CC on `Current Slot`.
-- [ ] **CPU meter**: read-only property reporting inference time as
-  a % of the audio block deadline.
+- **MIDI learn**: PC / CC routing via `MidiRouter` from
+  `rt-ir-plugin-core`; right-click UI is Phase 3.
+- **CPU meter**: read-only property reporting inference time as
+  a % of the audio block deadline (last-block sample count exposed
+  via `AtomicU32`; final display widget is Phase 3).
+
+Notes:
+- The **NAM / Proteus JSON loader** is a stub in
+  `rt_neural_core::loader` and returns `LoaderError::NotImplemented`.
+  Wiring the parsers is the next focused chunk (Phase 1.5) before
+  Phase 3.  Everything downstream of the loader — slot bank, hand-off,
+  crossfade, MIDI, CPU meter — is fully functional and exercised by
+  unit tests using programmatically-built models.
 
 ## Phase 3: UI
 

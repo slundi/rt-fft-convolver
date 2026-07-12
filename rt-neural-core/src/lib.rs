@@ -50,11 +50,13 @@ pub mod conv1d;
 pub mod dense;
 pub mod error;
 pub mod kernels;
+pub mod loader;
 pub mod lstm;
 pub mod prepared;
 pub mod slot_bank;
 
 pub use error::ModelError;
+pub use loader::LoaderError;
 pub use prepared::{LstmModel, PreparedModel, WaveNetModel};
 pub use slot_bank::{ModelSlotBank, SLOT_COUNT};
 
