@@ -33,42 +33,77 @@ Plugin format target: **LV2 + CLAP + VST3** via
 - **This plugin does NOT include cab simulation** — it pairs
   naturally with `rt-ir-cab` in the user's signal chain.
 
-## Prerequisites in `rt-fft-convolver`
+## Prerequisites in `rt-fft-convolver` ✅
 
 None strictly required.  Optional reuse:
-- [ ] `DenormalGuard` from `utils/denormals.rs` — every inference tick
+- `DenormalGuard` from `utils/denormals.rs` — every inference tick
   must run with FTZ/DAZ set, since ReLU + saturation activations can
   produce denormals when the signal decays.
-- [ ] `CrossfadingConvolver` design pattern — reuse for model swap
+- `CrossfadingConvolver` design pattern — reuse for model swap
   (`from_model → to_model` linear crossfade over N samples).
 
-## Phase 0: Algorithm & format decisions
+## Phase 0: Algorithm & format decisions ✅
 
-- [ ] **Decide primary model architecture(s)** — [decision]:
+- **Decide primary model architecture(s)** — [decided]:
   - LSTM (small, ~1 % CPU, NAM/Proteus).
   - WaveNet-style dilated conv1d (larger, higher fidelity).
-  - Temporal Convolutional Network (TCN).
+  - ~~Temporal Convolutional Network (TCN).~~
   - Multiple, with a runtime dispatcher.
-- [ ] **Decide inference backend** — [decision]:
-  - Hand-rolled Rust + `std::simd`.
-  - [`candle`](https://github.com/huggingface/candle) with CPU
-    backend.
-  - [`tract`](https://github.com/sonos/tract) for ONNX.
-  - `ndarray` + `matrixmultiply`.
-- [ ] **Decide precision** — [decision]:
+
+  **→ Decision:** LSTM + WaveNet, with a runtime dispatcher.  LSTM
+  covers the majority of community models (NAM, Proteus, GuitarML)
+  at ~1 % CPU; WaveNet is added for higher-fidelity high-gain
+  captures.  TCN is deferred — few pre-trained models exist in the
+  wild today.
+- **Decide inference backend** — [decided]:
+  - ~~Hand-rolled Rust + `std::simd`~~ (nightly-only).
+  - ~~[`candle`](https://github.com/huggingface/candle)~~ (batched
+    tensor ops, allocates freely — wrong shape for streaming RT).
+  - ~~[`tract`](https://github.com/sonos/tract)~~ (graph dispatch
+    overhead dominates for tiny per-sample models).
+  - ~~`ndarray` + `matrixmultiply`~~ (dispatch overhead at 16×16
+    matmul; also no f16 story).
+
+  **→ Decision:** [`pulp`](https://github.com/sarah-quinones/pulp)
+  as the SIMD abstraction, with hand-written matmul, dilated
+  conv1d, and activation kernels on top.  Stable Rust, automatic
+  runtime dispatch across SSE/AVX2/AVX-512/NEON in a single binary,
+  BLAS-competitive performance (used by `faer`).  All scratch
+  buffers are pre-allocated at model load so the audio thread stays
+  allocation-free.
+- **Decide precision** — [decided]:
   - f32 only (safest).
-  - f16 / bf16 for smaller CPU footprint on ARM.
-- [ ] **Model file loader** (off-RT):
+  - ~~f16 / bf16 for smaller CPU footprint on ARM.~~
+
+  **→ Decision:** f32 only.  Matches training precision, keeps
+  bit-exact reference tests against Python feasible, and avoids the
+  ARMv8.2+ / Sapphire-Rapids-only hardware split where f16 compute
+  is actually faster than convert-through-f32.  Revisit fp16 if
+  profiling on a specific ARM target proves memory-bound.
+- **Model file loader** (off-RT):
   - Parse chosen format(s) to an internal `PreparedModel` struct
     with pre-transposed weight matrices and layer descriptors.
+
+  **→ Decision:** Support NAM (`.nam` JSON) + Proteus / GuitarML
+  (`.json`).  ONNX deferred.  Loader lives in `rt-neural-core` and
+  produces a `PreparedModel` enum with two variants:
+  - `PreparedModel::Lstm` — per-layer pre-transposed `w_ih`
+    (shape `[4·H, I]`, gate-major) and `w_hh` (shape `[4·H, H]`),
+    plus fused biases; ready for the `pulp` matmul kernel.
+  - `PreparedModel::WaveNet` — per-block dilation, channel count,
+    and packed dilated conv1d kernels in `[out, in, k]` layout
+    ready for the SIMD kernel.
+
+  Parsing, transposition, and packing all happen off the audio
+  thread.
 
 ## Phase 1: `rt-neural-core` (engine crate)
 
 Internal crate, not published to crates.io initially.
 
 - [ ] **Workspace layout**:
-  - `crates/rt-neural-core` — inference engine.
-  - `crates/rt-neural-amp` — plugin.
+  - `rt-neural-core` — inference engine.
+  - `rt-neural-amp` — plugin.
 - [ ] **Layer primitives**, all `#[inline]` and allocation-free:
   - Dense (matmul + bias).
   - Conv1D (causal, dilated).
