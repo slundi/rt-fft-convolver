@@ -136,6 +136,15 @@ impl<const N: usize> ModelSlotBank<N> {
         Ok(self.slots[slot_index].is_some())
     }
 
+    /// Read-only view of `slot_index`'s model, if any.
+    ///
+    /// Returns `Ok(None)` for an empty slot; `Err` only when the index is
+    /// out of range.
+    pub fn get(&self, slot_index: usize) -> Result<Option<&PreparedModel>, SlotError> {
+        self.check_index(slot_index)?;
+        Ok(self.slots[slot_index].as_ref())
+    }
+
     /// Ask that `slot_index` become the active slot at the next audio
     /// block boundary.  Empty slots are legal — see module docs.
     pub fn request_activation(&mut self, slot_index: usize) -> Result<(), SlotError> {

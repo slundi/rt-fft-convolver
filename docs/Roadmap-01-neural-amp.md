@@ -156,16 +156,39 @@ Notes:
   crossfade, MIDI, CPU meter — is fully functional and exercised by
   unit tests using programmatically-built models.
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** (or `nih-plug-iced`) — [decision, should
-  match choice made for `rt-ir-cab`].
-- [ ] **Slot rack**: 8 pads, drag-and-drop model loading.
-- [ ] **Input meter** with a "sweet spot" indicator (models are
-  input-level sensitive).
-- [ ] **Model metadata display**: architecture, parameter count,
-  training sample rate, source gear name.
-- [ ] **MIDI activity indicator**.
+- **`nih-plug-egui`** — [decided]: matches the `rt-ir-cab` choice.
+  Editor is feature-gated behind `--features gui` so the default
+  build stays offline.  Violet accent (`accent.neural = #7c5cff`,
+  added to `docs/UI-lv2.md`).
+- **Slot rack**: 8 pads with `Empty` / `Filled` / `Active` /
+  `Disabled` visual states (reuses `pad_state` from
+  `rt-ir-plugin-core`).  Drag-and-drop dispatches
+  `NeuralAmpTask::Load` (the loader is still stubbed under Phase 1.5,
+  but the drag-drop plumbing is fully wired end-to-end so it starts
+  working the moment the loader lands).
+- **Input meter** with a "sweet spot" indicator.  The band
+  defaults to −18 dBFS ±3 dB (community-standard NAM training level)
+  and is overridden per-slot by
+  `ModelMetadata::training_input_level_dbfs` when present.  Peak
+  level is written to an `AtomicU32<f32-bits>` by the audio thread
+  and polled by the editor at frame rate.
+- **Model metadata display**: architecture, parameter count,
+  training sample rate, source gear name, format.  Backed by a new
+  `ModelMetadata` struct in `rt-neural-core` and populated by
+  programmatic constructors today (loader will fill in Phase 1.5).
+- **MIDI activity indicator**: LED in the header, green on
+  recognised events, red on unrecognised, gray idle.  Reuses
+  `MidiActivity` from `rt-ir-plugin-core`.  Right-click on any slot
+  pad arms MIDI-learn on `Current Slot`; the next incoming CC binds,
+  or `Esc` cancels.
+
+Notes:
+- The `--features gui` build requires system X11 + OpenGL headers
+  (via `flake.nix` on nixOS or `libx11-dev` / `libgl-dev` on
+  Debian-family).  The default and `--features nih` builds stay
+  offline / library-only and are exercised by CI + `cargo test`.
 
 ## Phase 4: Testing
 

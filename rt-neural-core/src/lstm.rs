@@ -132,6 +132,14 @@ impl LstmCell {
         self.hidden_size
     }
 
+    /// Number of stored scalar parameters — the two dense weight blocks
+    /// plus their fused-bias vectors.  Excludes the recurrent `h` / `c`
+    /// state, which is inference-time storage, not a parameter.
+    #[inline]
+    pub fn parameter_count(&self) -> usize {
+        self.weights_ih.parameter_count() + self.weights_hh.parameter_count()
+    }
+
     /// Zero `h` and `c` — call on preset changes or stream restarts.
     ///
     /// **Real-time safe** — two contiguous `slice::fill(0.0)` stores.

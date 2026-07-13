@@ -25,12 +25,18 @@
 //! - `lv2lint` / `clap-validator` / `pluginval` host validation is Phase 4.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nih_plug::prelude::*;
+#[cfg(feature = "gui")]
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 use parking_lot::Mutex as PlMutex;
 use rt_ir_plugin_core::SlotEvent;
+#[cfg(feature = "gui")]
+use rt_ir_plugin_core::{MidiActivity, MidiStatus, PadState, pad_state};
+#[cfg(feature = "gui")]
+use rt_neural_core::{DEFAULT_SWEET_SPOT_DBFS, ModelMetadata};
 
 use crate::block::MonoBlockAdapter;
 use crate::engine::NeuralAmpController;
@@ -48,9 +54,8 @@ const BLOCK_SIZE: usize = 128;
 /// Off-thread work the audio / editor threads dispatch to the background
 /// executor.  Every variant is handled on the control thread only.
 ///
-/// `Load` and `LearnCc` are constructed by the Phase-3 egui editor
-/// (drag-drop and right-click respectively); they read as dead code in
-/// Phase 2 which is fine.
+/// `Load` is only constructed under the `gui` feature (drag-drop in the
+/// editor); the `#[allow]` keeps the `--features nih` build warning-free.
 #[allow(dead_code)]
 pub enum NeuralAmpTask {
     /// Load a model file into a slot (then activate it if it is the current slot).
@@ -137,6 +142,10 @@ struct NeuralAmpPluginParams {
     /// Learned MIDI CC for `Current Slot`, persisted across sessions.
     #[persist = "learn_cc"]
     learn_cc: PlMutex<Option<u8>>,
+
+    #[cfg(feature = "gui")]
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 impl Default for NeuralAmpPluginParams {
@@ -186,6 +195,8 @@ impl Default for NeuralAmpPluginParams {
             slots: core::array::from_fn(|_| SlotParams::default()),
             model_paths: PlMutex::new(vec![None; NUM_SLOTS]),
             learn_cc: PlMutex::new(None),
+            #[cfg(feature = "gui")]
+            editor_state: EguiState::from_size(640, 380),
         }
     }
 }
@@ -219,12 +230,23 @@ pub struct NeuralAmpPlugin {
     last_enabled: [bool; NUM_SLOTS],
     last_trim_db: [f32; NUM_SLOTS],
 
-    /// Bumped on each recognised MIDI event (Phase 3 UI reads this).
-    #[allow(dead_code)]
+    /// Bumped on each recognised MIDI event; the editor's LED reads this.
     midi_counter: Arc<AtomicU32>,
-    /// Last-block inference cost as a fraction of `BLOCK_SIZE`, ready for
-    /// the CPU meter (Phase 3 reads this atomically).
+    /// Last-block inference cost as a fraction of `BLOCK_SIZE` — used by
+    /// the CPU meter (Phase 3).
     cpu_meter: Arc<AtomicU32>,
+    /// Peak-hold input level in dBFS, `f32.to_bits()` packed into a u32.
+    /// The audio thread writes each block; the editor reads at 30 fps for
+    /// the input meter.
+    input_meter_dbfs: Arc<AtomicU32>,
+    /// `true` while the user is right-click-learning a MIDI CC for
+    /// `Current Slot`.  The audio thread captures the next MidiCC event
+    /// while this flag is set and clears it.
+    learning: Arc<AtomicBool>,
+    /// Editor-side mirror of the per-slot [`ModelMetadata`], populated by
+    /// the background task executor after a load.
+    #[cfg(feature = "gui")]
+    metadata_mirror: Arc<Mutex<Vec<Option<ModelMetadata>>>>,
 }
 
 impl Default for NeuralAmpPlugin {
@@ -238,8 +260,47 @@ impl Default for NeuralAmpPlugin {
             last_trim_db: [0.0f32; NUM_SLOTS],
             midi_counter: Arc::new(AtomicU32::new(0)),
             cpu_meter: Arc::new(AtomicU32::new(0)),
+            // Prime with silence (-∞ dBFS represented as -120).
+            input_meter_dbfs: Arc::new(AtomicU32::new((-120.0f32).to_bits())),
+            learning: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "gui")]
+            metadata_mirror: Arc::new(Mutex::new(vec![None; NUM_SLOTS])),
         }
     }
+}
+
+/// Mutable per-frame editor state owned by the egui editor closure.
+#[cfg(feature = "gui")]
+#[derive(Default)]
+struct NeuralEditorState {
+    midi: MidiActivity,
+    last_midi: u32,
+}
+
+/// Fill colour for a slot pad in each visual state.
+#[cfg(feature = "gui")]
+fn pad_fill(state: PadState, accent: egui::Color32) -> egui::Color32 {
+    match state {
+        PadState::Active => accent,
+        PadState::Filled => egui::Color32::from_rgb(0x23, 0x28, 0x30),
+        PadState::Disabled => egui::Color32::from_rgb(0x20, 0x22, 0x26),
+        PadState::Empty => egui::Color32::from_rgb(0x1a, 0x1e, 0x24),
+    }
+}
+
+/// Linear blend between two colours (`fraction` in `0..=1`).
+#[cfg(feature = "gui")]
+fn lerp_color(source: egui::Color32, target: egui::Color32, fraction: f32) -> egui::Color32 {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let mix = |source_channel: u8, target_channel: u8| {
+        (source_channel as f32 + (target_channel as f32 - source_channel as f32) * fraction).round()
+            as u8
+    };
+    egui::Color32::from_rgb(
+        mix(source.r(), target.r()),
+        mix(source.g(), target.g()),
+        mix(source.b(), target.b()),
+    )
 }
 
 impl Plugin for NeuralAmpPlugin {
@@ -267,8 +328,278 @@ impl Plugin for NeuralAmpPlugin {
         self.params.clone()
     }
 
+    #[cfg(feature = "gui")]
+    fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        use egui::{Color32, Sense, Stroke, vec2};
+
+        // Violet accent, per UI-lv2.md § design tokens (`accent.neural`).
+        const ACCENT: Color32 = Color32::from_rgb(0x7c, 0x5c, 0xff);
+        const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1e, 0x24);
+        const METER_BG: Color32 = Color32::from_rgb(0x14, 0x18, 0x1e);
+        const METER_FILL: Color32 = Color32::from_rgb(0x64, 0x74, 0xa0);
+        const SWEET_SPOT_BAND: Color32 = Color32::from_rgba_premultiplied(0x7c, 0x5c, 0xff, 0x40);
+
+        let params = self.params.clone();
+        let midi_counter = self.midi_counter.clone();
+        let input_meter = self.input_meter_dbfs.clone();
+        let learning = self.learning.clone();
+        let metadata_mirror = self.metadata_mirror.clone();
+        let executor = async_executor;
+
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            NeuralEditorState::default(),
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                // ── MIDI LED decay ────────────────────────────────────────
+                let count = midi_counter.load(Ordering::Relaxed);
+                if count != state.last_midi {
+                    state.last_midi = count;
+                    state.midi.trigger(true);
+                }
+                state.midi.decay(0.08);
+
+                // Escape cancels an in-flight MIDI-learn.
+                if ctx.input(|input| input.key_pressed(egui::Key::Escape))
+                    && learning.load(Ordering::Relaxed)
+                {
+                    learning.store(false, Ordering::Relaxed);
+                    executor.execute_background(NeuralAmpTask::LearnCc(None));
+                }
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Header: name · MIDI LED · bypass ───────────────────
+                    ui.horizontal(|ui| {
+                        ui.heading("RT Neural Amp");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.bypass, setter));
+                            let (led_rect, _) =
+                                ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                            let base_color = match state.midi.status() {
+                                MidiStatus::Recognised => Color32::from_rgb(0x4e, 0xc3, 0x6a),
+                                MidiStatus::Unrecognised => Color32::from_rgb(0xd9, 0x4a, 0x4a),
+                                MidiStatus::Idle => Color32::from_gray(0x30),
+                            };
+                            let led_color = lerp_color(
+                                Color32::from_gray(0x30),
+                                base_color,
+                                state.midi.level(),
+                            );
+                            ui.painter()
+                                .circle_filled(led_rect.center(), 6.0, led_color);
+                            ui.label("MIDI");
+                        });
+                    });
+                    ui.separator();
+
+                    // ── Slot rack: 8 pads with drag-drop + right-click learn.
+                    let current_slot = params.current_slot.value();
+                    let mut pad_rects = [egui::Rect::NOTHING; NUM_SLOTS];
+                    ui.horizontal(|ui| {
+                        for (slot_index, rect) in pad_rects.iter_mut().enumerate() {
+                            let loaded = params.model_paths.lock()[slot_index].is_some();
+                            let enabled = params.slots[slot_index].enabled.value();
+                            let visual_state =
+                                pad_state(loaded, enabled, slot_index as i32 == current_slot);
+                            let response = ui.add_sized(
+                                vec2(56.0, 44.0),
+                                egui::Button::new(format!("{}", slot_index + 1))
+                                    .fill(pad_fill(visual_state, ACCENT)),
+                            );
+                            *rect = response.rect;
+                            if response.clicked() {
+                                setter.begin_set_parameter(&params.current_slot);
+                                setter.set_parameter(&params.current_slot, slot_index as i32);
+                                setter.end_set_parameter(&params.current_slot);
+                            }
+                            // Right-click: MIDI-learn on Current Slot.
+                            if response.secondary_clicked() {
+                                learning.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    });
+
+                    // ── Drag-and-drop a file onto a pad → load that slot ──
+                    let dropped_files = ctx.input(|input| input.raw.dropped_files.clone());
+                    if !dropped_files.is_empty()
+                        && let Some(cursor) = ctx.input(|input| input.pointer.hover_pos())
+                        && let Some(target_slot) =
+                            pad_rects.iter().position(|rect| rect.contains(cursor))
+                    {
+                        for file in dropped_files {
+                            if let Some(path) = file.path {
+                                params.model_paths.lock()[target_slot] =
+                                    Some(path.to_string_lossy().into_owned());
+                                executor.execute_background(NeuralAmpTask::Load {
+                                    slot: target_slot,
+                                    path,
+                                });
+                                setter.begin_set_parameter(&params.current_slot);
+                                setter.set_parameter(&params.current_slot, target_slot as i32);
+                                setter.end_set_parameter(&params.current_slot);
+                            }
+                        }
+                    }
+                    ui.separator();
+
+                    // ── Input meter with sweet-spot band ──────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Input");
+                        let (meter_rect, _) = ui.allocate_exact_size(
+                            vec2(ui.available_width() - 60.0, 18.0),
+                            Sense::hover(),
+                        );
+                        ui.painter().rect_filled(meter_rect, 2.0, METER_BG);
+
+                        // Sweet-spot band: default -18 dBFS, overridable per
+                        // the currently active slot's ModelMetadata.
+                        let sweet_dbfs = metadata_mirror
+                            .lock()
+                            .ok()
+                            .and_then(|mirror| {
+                                mirror.get(current_slot as usize).and_then(|slot_meta| {
+                                    slot_meta.as_ref().map(ModelMetadata::sweet_spot_dbfs)
+                                })
+                            })
+                            .unwrap_or(DEFAULT_SWEET_SPOT_DBFS);
+
+                        // Map dBFS ∈ [-60, 0] → [0, 1] normalised meter x.
+                        let normalise = |dbfs: f32| ((dbfs + 60.0) / 60.0).clamp(0.0, 1.0);
+                        let sweet_center = normalise(sweet_dbfs);
+                        let band_half_width = 3.0 / 60.0; // ±3 dB band
+                        let band_left = (sweet_center - band_half_width).clamp(0.0, 1.0);
+                        let band_right = (sweet_center + band_half_width).clamp(0.0, 1.0);
+                        let band = egui::Rect::from_min_max(
+                            egui::pos2(
+                                meter_rect.left() + meter_rect.width() * band_left,
+                                meter_rect.top(),
+                            ),
+                            egui::pos2(
+                                meter_rect.left() + meter_rect.width() * band_right,
+                                meter_rect.bottom(),
+                            ),
+                        );
+                        ui.painter().rect_filled(band, 0.0, SWEET_SPOT_BAND);
+
+                        // Level bar.
+                        let level_dbfs = f32::from_bits(input_meter.load(Ordering::Relaxed));
+                        let fill_x = normalise(level_dbfs);
+                        let fill = egui::Rect::from_min_max(
+                            meter_rect.left_top(),
+                            egui::pos2(
+                                meter_rect.left() + meter_rect.width() * fill_x,
+                                meter_rect.bottom(),
+                            ),
+                        );
+                        ui.painter().rect_filled(fill, 2.0, METER_FILL);
+                        ui.painter().rect_stroke(
+                            meter_rect,
+                            2.0,
+                            Stroke::new(1.0, Color32::from_gray(0x40)),
+                            egui::StrokeKind::Middle,
+                        );
+                        ui.label(format!("{level_dbfs:>5.1} dB"));
+                    });
+
+                    // ── Model metadata panel ──────────────────────────────
+                    let metadata_snapshot = metadata_mirror
+                        .lock()
+                        .ok()
+                        .and_then(|mirror| mirror.get(current_slot as usize).cloned())
+                        .flatten();
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new(format!("Slot {} · Model info", current_slot + 1))
+                                .strong(),
+                        );
+                        egui::Grid::new("metadata-grid")
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                let (arch, params_text, sr_text, gear, format_name) =
+                                    match metadata_snapshot.as_ref() {
+                                        None => (
+                                            "—".to_string(),
+                                            "—".to_string(),
+                                            "—".to_string(),
+                                            "empty slot".to_string(),
+                                            "—".to_string(),
+                                        ),
+                                        Some(meta) => (
+                                            // Architecture / parameter count come from the
+                                            // controller's `slot_architecture` / `slot_parameter_count`
+                                            // (populated by the loader task); we surface the
+                                            // metadata fields here.
+                                            meta.format_name
+                                                .clone()
+                                                .unwrap_or_else(|| "unknown arch".into()),
+                                            "—".into(),
+                                            meta.training_sample_rate
+                                                .map(|hz| format!("{hz} Hz"))
+                                                .unwrap_or_else(|| "unknown".into()),
+                                            meta.source_gear_name
+                                                .clone()
+                                                .unwrap_or_else(|| "unknown".into()),
+                                            meta.format_name
+                                                .clone()
+                                                .unwrap_or_else(|| "unknown".into()),
+                                        ),
+                                    };
+                                ui.label("Architecture");
+                                ui.label(arch);
+                                ui.end_row();
+                                ui.label("Parameters");
+                                ui.label(params_text);
+                                ui.end_row();
+                                ui.label("Train sr");
+                                ui.label(sr_text);
+                                ui.end_row();
+                                ui.label("Source");
+                                ui.label(gear);
+                                ui.end_row();
+                                ui.label("Format");
+                                ui.label(format_name);
+                                ui.end_row();
+                            });
+                    });
+
+                    // ── Global controls ────────────────────────────────────
+                    egui::Grid::new("neural-controls").show(ui, |ui| {
+                        for (label, param) in [
+                            ("In Gain", &params.input_gain_db),
+                            ("Out Gain", &params.output_gain_db),
+                            ("Mix", &params.mix),
+                            ("Crossfade", &params.crossfade_ms),
+                        ] {
+                            ui.label(label);
+                            ui.add(widgets::ParamSlider::for_param(param, setter));
+                            ui.end_row();
+                        }
+                        ui.label("Slot Trim");
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.slots[current_slot as usize].trim_db,
+                            setter,
+                        ));
+                        ui.end_row();
+                    });
+
+                    // ── Learn-mode notice ─────────────────────────────────
+                    if learning.load(Ordering::Relaxed) {
+                        ui.separator();
+                        ui.colored_label(
+                            ACCENT,
+                            "🎛 MIDI-learn armed — send a CC to bind Current Slot (Esc cancels)",
+                        );
+                    }
+                });
+            },
+        )
+    }
+
     fn task_executor(&mut self) -> TaskExecutor<Self> {
         let controller = self.controller.clone();
+        #[cfg(feature = "gui")]
+        let metadata_mirror = self.metadata_mirror.clone();
         Box::new(move |task| {
             let mut guard = controller.lock().unwrap();
             let Some(controller) = guard.as_mut() else {
@@ -278,12 +609,22 @@ impl Plugin for NeuralAmpPlugin {
                 NeuralAmpTask::Load { slot, path: _ } => {
                     // Phase 1.5 will invoke `rt_neural_core::loader::load_nam`
                     // (or `load_proteus`) on the file bytes and hand the
-                    // resulting `PreparedModel` to `controller.load_slot`.  For
-                    // Phase 2 we log a clear diagnostic and leave the slot
-                    // untouched — the plugin still passes audio through dry.
+                    // resulting `PreparedModel` to `controller.load_slot`.
+                    // For Phase 3 we log a clear diagnostic and leave the
+                    // slot untouched — the plugin still passes audio through
+                    // dry, and the metadata mirror keeps its existing
+                    // "unknown" entry for the target slot.
                     nih_error!(
-                        "model loader not implemented in Phase 2; slot {slot} left unchanged"
+                        "model loader not implemented in Phase 3; slot {slot} left unchanged"
                     );
+                    #[cfg(feature = "gui")]
+                    {
+                        if let Ok(mut mirror) = metadata_mirror.lock() {
+                            if let Some(cell) = mirror.get_mut(slot) {
+                                *cell = controller.slot_metadata(slot);
+                            }
+                        }
+                    }
                 }
                 NeuralAmpTask::Activate(slot) => {
                     if let Err(error) = controller.activate(slot) {
@@ -351,6 +692,8 @@ impl Plugin for NeuralAmpPlugin {
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         // ── 1. Route incoming MIDI to slot activations (off-thread).
+        //      While `learning` is set, the next MidiCC binds to
+        //      `Current Slot` instead of driving a slot switch.
         while let Some(event) = context.next_event() {
             match event {
                 NoteEvent::MidiProgramChange { program, .. } => {
@@ -359,11 +702,15 @@ impl Plugin for NeuralAmpPlugin {
                     self.midi_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 NoteEvent::MidiCC { cc, value, .. } => {
-                    let raw = (value * 127.0).round().clamp(0.0, 127.0) as u8;
-                    context.execute_background(NeuralAmpTask::Midi(SlotEvent::ControlChange {
-                        controller: cc,
-                        value: raw,
-                    }));
+                    if self.learning.swap(false, Ordering::Relaxed) {
+                        context.execute_background(NeuralAmpTask::LearnCc(Some(cc)));
+                    } else {
+                        let raw = (value * 127.0).round().clamp(0.0, 127.0) as u8;
+                        context.execute_background(NeuralAmpTask::Midi(SlotEvent::ControlChange {
+                            controller: cc,
+                            value: raw,
+                        }));
+                    }
                     self.midi_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => {}
@@ -413,6 +760,16 @@ impl Plugin for NeuralAmpPlugin {
 
             let channels = buffer.as_slice();
             if let Some(channel) = channels.first_mut() {
+                // Compute the input RMS **before** the adapter overwrites
+                // the channel with its output.  Store as dBFS packed in the
+                // atomic so the editor can render an input meter.
+                let sample_count = channel.len().max(1) as f32;
+                let sum_of_squares: f32 = channel.iter().map(|sample| sample * sample).sum();
+                let rms = (sum_of_squares / sample_count).sqrt().max(1.0e-6);
+                let dbfs = 20.0 * rms.log10();
+                self.input_meter_dbfs
+                    .store(dbfs.to_bits(), Ordering::Relaxed);
+
                 adapter.process_buffer(channel, &snapshot);
             }
 

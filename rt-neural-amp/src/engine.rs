@@ -34,7 +34,7 @@ use rt_ir_plugin_core::{
     IrConsumer, IrPublisher, MidiRouter, SlotCrossfader, SlotError, SlotEvent, db_to_gain,
     ir_handoff, ms_to_samples,
 };
-use rt_neural_core::{ModelSlotBank, PreparedModel};
+use rt_neural_core::{ModelMetadata, ModelSlotBank, PreparedModel};
 
 use crate::params::{NUM_SLOTS, NeuralAmpParams};
 
@@ -194,6 +194,33 @@ impl NeuralAmpController {
     /// Clear `slot_index` — the slot is now empty (dry pass-through).
     pub fn clear_slot(&mut self, slot_index: usize) -> Result<(), SlotError> {
         self.bank.clear(slot_index).map_err(map_slot_error)
+    }
+
+    /// Snapshot of the metadata attached to the model in `slot_index`.
+    ///
+    /// Returns `None` when the slot is empty; the metadata itself may
+    /// still be `ModelMetadata::default()` (every field unknown) if the
+    /// caller built the model without populating it — that is a legal
+    /// state the editor renders as "unknown".
+    ///
+    /// **Not** real-time safe (clones one small struct).
+    pub fn slot_metadata(&self, slot_index: usize) -> Option<ModelMetadata> {
+        self.bank
+            .get(slot_index)
+            .ok()?
+            .map(|model| model.metadata().clone())
+    }
+
+    /// Human-readable architecture name of the model in `slot_index`
+    /// (`"LSTM"` / `"WaveNet"`), or `None` if the slot is empty.
+    pub fn slot_architecture(&self, slot_index: usize) -> Option<&'static str> {
+        Some(self.bank.get(slot_index).ok()??.architecture_name())
+    }
+
+    /// Parameter count of the model in `slot_index`, or `None` if the
+    /// slot is empty.  Editor uses this in the metadata panel.
+    pub fn slot_parameter_count(&self, slot_index: usize) -> Option<usize> {
+        Some(self.bank.get(slot_index).ok()??.parameter_count())
     }
 
     /// Enable / disable `slot_index`.  A disabled slot renders dry.
@@ -657,5 +684,51 @@ mod tests {
         );
         assert!(controller.clear_slot(NUM_SLOTS).is_err());
         assert!(controller.activate(NUM_SLOTS).is_err());
+    }
+
+    // ── Slot-level metadata / architecture / parameter-count accessors ──────
+
+    /// The metadata accessor mirrors what the loaded model carries.
+    #[test]
+    fn slot_metadata_reflects_loaded_model() {
+        use rt_neural_core::ModelMetadata;
+        use rt_neural_core::lstm::LstmCell;
+        use rt_neural_core::prepared::LstmModel;
+
+        let hidden_size = 2;
+        let cell = LstmCell::new(
+            vec![0.0f32; 4 * hidden_size],
+            vec![0.0f32; 4 * hidden_size * hidden_size],
+            vec![0.0f32; 4 * hidden_size],
+            1,
+            hidden_size,
+        )
+        .expect("cell");
+        let model = PreparedModel::Lstm(
+            LstmModel::new(vec![cell], vec![0.0f32; hidden_size], 0.0).with_metadata(
+                ModelMetadata {
+                    source_gear_name: Some("Marshall JCM800".into()),
+                    format_name: Some("NAM".into()),
+                    ..ModelMetadata::default()
+                },
+            ),
+        );
+        let params = NeuralAmpParams::default();
+        let (mut controller, _processor) = NeuralAmpController::new(4, 48_000, &params);
+        controller.load_slot(1, model).expect("load");
+
+        let meta = controller.slot_metadata(1).expect("slot 1 has a model");
+        assert_eq!(meta.source_gear_name.as_deref(), Some("Marshall JCM800"));
+        assert_eq!(meta.format_name.as_deref(), Some("NAM"));
+        assert_eq!(controller.slot_architecture(1), Some("LSTM"));
+        assert!(
+            controller
+                .slot_parameter_count(1)
+                .is_some_and(|count| count > 0)
+        );
+        // Empty slot returns None on every accessor.
+        assert!(controller.slot_metadata(0).is_none());
+        assert!(controller.slot_architecture(0).is_none());
+        assert!(controller.slot_parameter_count(0).is_none());
     }
 }

@@ -85,6 +85,14 @@ impl Dense {
         self.output_size
     }
 
+    /// Number of stored scalar parameters (weights + bias).
+    ///
+    /// Cheap and RT-safe — just returns the buffer lengths.
+    #[inline]
+    pub fn parameter_count(&self) -> usize {
+        self.weights.len() + self.bias.len()
+    }
+
     /// Compute `output = weights · input + bias`.
     ///
     /// - `input.len()` must equal [`input_size`](Self::input_size).

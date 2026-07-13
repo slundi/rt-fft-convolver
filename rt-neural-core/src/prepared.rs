@@ -30,6 +30,7 @@
 
 use crate::conv1d::Conv1d;
 use crate::lstm::LstmCell;
+use crate::metadata::ModelMetadata;
 
 // ─── LSTM model ──────────────────────────────────────────────────────────────
 
@@ -51,6 +52,9 @@ pub struct LstmModel {
     head_bias: f32,
     /// Scratch buffer of length 1 (`process_sample` returns f32 via this).
     output_scratch: [f32; 1],
+    /// Provenance / training metadata (unknown by default; populated by
+    /// the loader or [`with_metadata`](Self::with_metadata)).
+    metadata: ModelMetadata,
 }
 
 impl LstmModel {
@@ -72,7 +76,43 @@ impl LstmModel {
             head_weights: head_weights.into_boxed_slice(),
             head_bias,
             output_scratch: [0.0f32; 1],
+            metadata: ModelMetadata::default(),
         }
+    }
+
+    /// Attach provenance / training metadata to the model.  Chainable —
+    /// callers typically do
+    /// `LstmModel::new(..).with_metadata(loader_metadata)`.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: ModelMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Read-only view of the attached metadata.
+    #[inline]
+    pub fn metadata(&self) -> &ModelMetadata {
+        &self.metadata
+    }
+
+    /// Total number of stored scalar parameters across the LSTM stack and
+    /// the dense head (`+1` for `head_bias`).
+    pub fn parameter_count(&self) -> usize {
+        let layers_count: usize = self.layers.iter().map(LstmCell::parameter_count).sum();
+        layers_count + self.head_weights.len() + 1
+    }
+
+    /// Number of stacked LSTM layers.
+    #[inline]
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Hidden width shared by all layers (LSTM stacks in NAM / Proteus
+    /// carry a single hidden width across the stack).
+    #[inline]
+    pub fn hidden_size(&self) -> usize {
+        self.layers.first().map(LstmCell::hidden_size).unwrap_or(0)
     }
 
     /// Zero every layer's recurrent state.
@@ -163,6 +203,13 @@ impl WaveNetBlock {
         self.channels
     }
 
+    /// Total number of stored scalar parameters (dilated conv + 1×1
+    /// projection weights + projection bias).
+    #[inline]
+    pub fn parameter_count(&self) -> usize {
+        self.conv.parameter_count() + self.projection_weights.len() + self.projection_bias.len()
+    }
+
     /// Zero the internal conv1d history.
     #[inline]
     fn reset(&mut self) {
@@ -216,6 +263,9 @@ pub struct WaveNetModel {
     /// Scratch buffer sized to `channels`, reused every sample.
     frame_scratch: Box<[f32]>,
     channels: usize,
+    /// Provenance / training metadata (unknown by default; populated by
+    /// the loader or [`with_metadata`](Self::with_metadata)).
+    metadata: ModelMetadata,
 }
 
 impl WaveNetModel {
@@ -248,7 +298,39 @@ impl WaveNetModel {
             projection_bias,
             frame_scratch: vec![0.0f32; channels].into_boxed_slice(),
             channels,
+            metadata: ModelMetadata::default(),
         }
+    }
+
+    /// Attach provenance / training metadata to the model.  Chainable.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: ModelMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Read-only view of the attached metadata.
+    #[inline]
+    pub fn metadata(&self) -> &ModelMetadata {
+        &self.metadata
+    }
+
+    /// Total number of stored scalar parameters (lift-in weights + bias,
+    /// every block's parameters, project-out weights, and the scalar
+    /// projection bias).
+    pub fn parameter_count(&self) -> usize {
+        let blocks_count: usize = self.blocks.iter().map(WaveNetBlock::parameter_count).sum();
+        self.lift_weights.len()
+            + self.lift_bias.len()
+            + blocks_count
+            + self.projection_weights.len()
+            + 1
+    }
+
+    /// Number of residual blocks in the stack.
+    #[inline]
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
     }
 
     /// Zero every block's history.
@@ -325,6 +407,35 @@ impl PreparedModel {
         match self {
             PreparedModel::Lstm(model) => model.reset(),
             PreparedModel::WaveNet(model) => model.reset(),
+        }
+    }
+
+    /// Read-only view of the provenance / training metadata carried with
+    /// this model.  Used by the plugin editor's model-info panel.
+    #[inline]
+    pub fn metadata(&self) -> &ModelMetadata {
+        match self {
+            PreparedModel::Lstm(model) => model.metadata(),
+            PreparedModel::WaveNet(model) => model.metadata(),
+        }
+    }
+
+    /// Human-readable name of the architecture — used by the editor's
+    /// metadata panel.
+    #[inline]
+    pub fn architecture_name(&self) -> &'static str {
+        match self {
+            PreparedModel::Lstm(_) => "LSTM",
+            PreparedModel::WaveNet(_) => "WaveNet",
+        }
+    }
+
+    /// Total number of stored scalar parameters in the model.
+    #[inline]
+    pub fn parameter_count(&self) -> usize {
+        match self {
+            PreparedModel::Lstm(model) => model.parameter_count(),
+            PreparedModel::WaveNet(model) => model.parameter_count(),
         }
     }
 }
@@ -411,6 +522,91 @@ mod tests {
             let output = prepared.process_sample(step as f32);
             assert!((output - 0.25).abs() < 1e-6);
         }
+    }
+
+    /// Parameter counts sum weights + biases across every stored layer.
+    #[test]
+    fn parameter_count_matches_manual_sum() -> Result<(), ModelError> {
+        // LSTM: 1 layer, hidden=4, input=1.
+        // W_ih  = 4·4·1 = 16 weights, bias = 4·4 = 16.
+        // W_hh  = 4·4·4 = 64 weights, bias = 4·4 = 16.
+        // Head weights = 4, head bias = 1.
+        // Total = 16 + 16 + 64 + 16 + 4 + 1 = 117.
+        let hidden_size = 4;
+        let input_size = 1;
+        let cell = LstmCell::new(
+            vec![0.0f32; 4 * hidden_size * input_size],
+            vec![0.0f32; 4 * hidden_size * hidden_size],
+            vec![0.0f32; 4 * hidden_size],
+            input_size,
+            hidden_size,
+        )?;
+        let lstm = PreparedModel::Lstm(LstmModel::new(vec![cell], vec![0.0f32; hidden_size], 0.0));
+        assert_eq!(lstm.parameter_count(), 117);
+        assert_eq!(lstm.architecture_name(), "LSTM");
+
+        // WaveNet: channels=3, 1 block, kernel_size=1.
+        // Conv1d weights = 3·1·3 = 9, bias = 3.
+        // Projection weights = 3·3 = 9, projection bias = 3.
+        // Lift weights = 3, lift bias = 3.
+        // Project-out weights = 3, projection scalar bias = 1.
+        // Total = 9 + 3 + 9 + 3 + 3 + 3 + 3 + 1 = 34.
+        let channels = 3;
+        let conv = Conv1d::new(
+            vec![0.0f32; channels * channels],
+            vec![0.0f32; channels],
+            channels,
+            channels,
+            1,
+            1,
+        )?;
+        let block = WaveNetBlock::new(
+            conv,
+            vec![0.0f32; channels * channels],
+            vec![0.0f32; channels],
+        );
+        let wavenet = PreparedModel::WaveNet(WaveNetModel::new(
+            vec![0.0f32; channels],
+            vec![0.0f32; channels],
+            vec![block],
+            vec![0.0f32; channels],
+            0.0,
+        ));
+        assert_eq!(wavenet.parameter_count(), 34);
+        assert_eq!(wavenet.architecture_name(), "WaveNet");
+        Ok(())
+    }
+
+    /// Attaching metadata via `with_metadata` and reading it back through
+    /// the enum accessor round-trips cleanly.
+    #[test]
+    fn metadata_round_trips_through_prepared_model() -> Result<(), ModelError> {
+        use crate::metadata::ModelMetadata;
+
+        let hidden_size = 2;
+        let cell = LstmCell::new(
+            vec![0.0f32; 4 * hidden_size],
+            vec![0.0f32; 4 * hidden_size * hidden_size],
+            vec![0.0f32; 4 * hidden_size],
+            1,
+            hidden_size,
+        )?;
+        let meta = ModelMetadata {
+            source_gear_name: Some("Fender Twin".into()),
+            training_sample_rate: Some(48_000),
+            training_input_level_dbfs: Some(-20.0),
+            format_name: Some("NAM".into()),
+        };
+        let lstm =
+            LstmModel::new(vec![cell], vec![0.0f32; hidden_size], 0.0).with_metadata(meta.clone());
+        let prepared = PreparedModel::Lstm(lstm);
+
+        let read = prepared.metadata();
+        assert_eq!(read.source_gear_name.as_deref(), Some("Fender Twin"));
+        assert_eq!(read.training_sample_rate, Some(48_000));
+        assert!((read.sweet_spot_dbfs() - (-20.0)).abs() < f32::EPSILON);
+        assert_eq!(read.format_name.as_deref(), Some("NAM"));
+        Ok(())
     }
 
     /// `reset` on the enum dispatches correctly to each variant.

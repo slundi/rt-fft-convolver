@@ -145,6 +145,15 @@ impl Conv1d {
         self.out_channels
     }
 
+    /// Number of stored scalar parameters (weights + bias).
+    ///
+    /// The ring-buffer history is inference state, not a parameter, and
+    /// is deliberately excluded.
+    #[inline]
+    pub fn parameter_count(&self) -> usize {
+        self.weights.len() + self.bias.len()
+    }
+
     /// Zero the history buffer.  Used when the surrounding model resets
     /// (e.g., a bypass toggle or a preset change).
     ///
