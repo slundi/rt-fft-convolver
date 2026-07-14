@@ -243,15 +243,25 @@ impl Downsampler2x {
             output.len() * 2,
             "downsample: input must be 2×"
         );
-        for (index, sample) in output.iter_mut().enumerate() {
-            // The stream starts at index 0 (even), so the first of each pair is
-            // the even-position sample.
-            push_history(&mut self.history_even, input[2 * index]);
-            push_history(&mut self.history_odd, input[2 * index + 1]);
-            let even = self.kernels.fir_dot(&self.phase_even, &self.history_even);
-            let odd = self.kernels.fir_dot(&self.phase_odd, &self.history_odd);
-            // No ×2 here: Σ(phase_even) + Σ(phase_odd) = 1 already → unity DC.
-            *sample = even + odd;
+        // Decimation `y[n] = Σ_k h[k]·u[2n−k]` split by tap parity: the even
+        // taps pair with the even-position samples `u[2n], u[2n−2], …` and the
+        // odd taps with the odd-position samples `u[2n−1], u[2n−3], …` — all of
+        // which *precede* `u[2n]`.  So we walk the high-rate stream in order,
+        // routing each sample to its phase history, and emit one output as each
+        // even sample completes it (the preceding odd sample is already in
+        // place).  Even-length blocks keep the parity aligned across calls.
+        let mut out_index = 0;
+        for (high_index, &sample) in input.iter().enumerate() {
+            if high_index.is_multiple_of(2) {
+                push_history(&mut self.history_even, sample);
+                let even = self.kernels.fir_dot(&self.phase_even, &self.history_even);
+                let odd = self.kernels.fir_dot(&self.phase_odd, &self.history_odd);
+                // No ×2 here: Σ(phase_even) + Σ(phase_odd) = 1 already → unity DC.
+                output[out_index] = even + odd;
+                out_index += 1;
+            } else {
+                push_history(&mut self.history_odd, sample);
+            }
         }
     }
 
@@ -283,7 +293,15 @@ impl Oversampler {
     /// aliasing-floor target with margin.
     pub const DEFAULT_ATTEN_DB: f64 = 96.0;
     /// Default normalised transition width (fraction of `fs`).
-    pub const DEFAULT_TRANSITION: f64 = 0.05;
+    ///
+    /// Chosen so the final 2×→1× decimation stage's stop-band starts *below*
+    /// the 5th harmonic of a 5 kHz tone (25 kHz, just above the 24 kHz base
+    /// Nyquist) — the worst-case aliasing stress from the roadmap.  A wider
+    /// transition leaves that harmonic in the transition band and caps the
+    /// aliasing floor around −70 dBFS regardless of oversampling factor (the
+    /// final stage is identical for every factor).  See the Phase-4
+    /// `spectral` tests.
+    pub const DEFAULT_TRANSITION: f64 = 0.018;
 
     /// Create an oversampler for `factor ∈ {1, 2, 4, 8, 16}` and a maximum
     /// input block of `max_block` samples, using the default filter design.

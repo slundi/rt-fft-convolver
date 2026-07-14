@@ -23,3 +23,15 @@ rt-fft-convolver = { path = ".." }
 toml-span = "0.7"
 # Structured, span-carrying pedal-load error type.
 thiserror = "2"
+
+[dev-dependencies]
+# FFT for the Phase-4 spectral tests (round-trip fidelity + aliasing floor).
+realfft = "3.5"
+# Micro-benchmarks: each shaper at each oversampling factor.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+[[bench]]
+name = "drive"
+harness = false

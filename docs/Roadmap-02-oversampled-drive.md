@@ -15,7 +15,9 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Design principles
 
 - **Aliasing floor below −80 dBFS** at 48 kHz for the loudest input,
-  worst-case shaper.  Achieved via oversampling + FIR anti-aliasing.
+  worst-case shaper.  Achieved via oversampling + FIR anti-aliasing —
+  measured met at **16×** (Phase 4); 4× ≈ −62 dBFS worst-case (efficiency
+  mode), 8× ≈ −77.
 - **Oversampling factor is a user setting** — 2× / 4× / 8× / 16× —
   with 4× as the default for the "quality" mode and 2× for the
   "efficiency" mode.
@@ -60,7 +62,9 @@ Internal crate, reusable by other nonlinear-effect plugins.
 - **Polyphase FIR resampler** (`resampler.rs`):
   - Half-band FIR chained per octave up to 16× (`Oversampler` cascade of
     2× `Upsampler2x` / `Downsampler2x` stages).
-  - Kaiser-window design; default stopband 96 dB, transition 0.05 × fs.
+  - Kaiser-window design; default stopband 96 dB, transition 0.018 × fs
+  (tightened from 0.05 in Phase 4 so 16× clears the −80 dBFS aliasing
+  floor; ~409 taps).
   - **Deviation**: coefficients are computed once in `Oversampler::new`
     (off the audio thread), *not* `const fn` — stable Rust can't evaluate
     the Bessel-I₀ Kaiser window in const context.  Tables are then fixed
@@ -226,20 +230,36 @@ drawing is a thin layer in the `gui`-gated editor.
 
 ## Phase 4: Testing
 
-- [ ] **Unit tests** (`rt-drive-core`):
-  - Resampler round-trip: `downsample(upsample(x)) ≈ x` within
-    −80 dB at the highest oversampling factor.
-  - Each shaper: monotonicity check (or documented non-monotonic
-    intent).
-  - DC-blocker attenuates a DC step by > 60 dB after 500 ms.
-- [ ] **Aliasing floor test**:
-  - Feed a 5 kHz sine at full scale through each shaper, measure the
-    spectrum in a headroom-aware bin selection, assert
-    aliases < −80 dBFS at 4×.
-- [ ] **RT-safety audit**:
-  - Allocator hook: zero allocations in `process()`.
-  - Bench each shaper at each oversampling factor with `criterion`.
-- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval`.
+- [x] **Unit tests** (`rt-drive-core`):
+  - Resampler round-trip (`tests/spectral.rs`): magnitude-transparent to
+    **< −99 dB** in the passband at the highest factor (delay-invariant
+    magnitude comparison at exact FFT bins).
+  - Each shaper: monotonicity + origin + boundedness (`shaper.rs`).
+  - DC-blocker attenuates a DC step by > 60 dB after 500 ms (`dc_block.rs`).
+  - **Bug found & fixed by these tests**: the decimator's polyphase odd
+    branch was misaligned by one output sample (used `u[2n+1]` instead of
+    `u[2n−1]`), which wrecked the anti-alias stop-band (round-trip was
+    −15 dB, not −96).  Fixed in `Downsampler2x::process`.
+- [x] **Aliasing floor test** (`tests/spectral.rs`): a full-scale ≈5 kHz
+  sine through each shaper, FFT the output, take the loudest non-harmonic
+  bin.  **Every shaper is < −80 dBFS at 16×** (worst: hard clip −88).
+  - **Correction to the "at 4×" target**: −80 dBFS worst-case is **not**
+    achievable at 4× — a 5 kHz full-scale clip's harmonics always straddle
+    some decimation stage's transition band (4× ≈ −62, 8× ≈ −77, 16× ≈ −88;
+    the final 96→48 kHz stage is identical for every factor).  −80 is the
+    **max-quality (16×)** figure; 4× is the efficiency/quality trade-off.
+  - The default half-band transition was tightened `0.05 → 0.018 × fs`
+    (~409 taps) so 16× clears −80 with margin.
+- [x] **RT-safety audit**:
+  - Allocator hook (`tests/rt_safety.rs`): a counting global allocator
+    proves **zero allocations** across 128 `process_block` calls + live
+    setters after warm-up.
+  - `criterion` bench (`benches/drive.rs`): each shaper × 1×…16×
+    oversampling (`cargo bench -p rt-drive-core`).
+- [ ] **Host validation**: `lv2lint` / `clap-validator` / `pluginval` —
+  deferred to Phase 5/CI: needs the built bundle *and* external validator
+  binaries (and the `gui` build needs X11/GL), none available in the unit
+  sandbox.  The `nih` (CLAP/VST3) cdylib does compile.
 
 ## Phase 5: Packaging & release
 
