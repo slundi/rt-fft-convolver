@@ -30,16 +30,16 @@ Plugin format target: **LV2 + CLAP + VST3** via
 - **Denormal-safe** — the shaper output can decay very slowly on
   release; FTZ/DAZ must be set for the whole callback.
 
-## Prerequisites in `rt-fft-convolver`
+## Prerequisites in `rt-fft-convolver` ✅
 
-- [x] `DenormalGuard` (available in `utils/denormals.rs`) — RAII FTZ/DAZ
+- `DenormalGuard` (available in `utils/denormals.rs`) — RAII FTZ/DAZ
   guard, RT-safe (one MXCSR/FPCR read+write on entry/exit, no alloc/lock).
   Wrap the whole render callback with it.  A software `flush_to_zero`
   fallback is also available.
-- [x] `mixer.rs` dry/wet crossfade — equal-power (cos/sin) blend with
+- `mixer.rs` dry/wet crossfade — equal-power (cos/sin) blend with
   `ir_gain` folded into `wet_gain` so `process()` is two mul/sample.
   Reusable directly.
-- [ ] **dB↔linear helpers** — NOT present in the crate today (the mixer
+- **dB↔linear helpers** — NOT present in the crate today (the mixer
   works purely in linear gains; there is no `db_to_linear`/`linear_to_db`
   anywhere in `src/`).  Must be written for `Level` (−24…+24 dB) and
   `Bias`.  [decision] where they live — recommended: a shared
@@ -47,32 +47,46 @@ Plugin format target: **LV2 + CLAP + VST3** via
   roadmapped plugins reuse one implementation, rather than duplicating in
   `rt-drive-core`.
 
-## Phase 0: DSP primitives (`rt-drive-core`)
+## Phase 0: DSP primitives (`rt-drive-core`) ✅
 
 Internal crate, reusable by other nonlinear-effect plugins.
 
-- [ ] **Workspace layout**:
-  - `rt-drive-core` — resampling + shapers + tone stack.
-  - `rt-drive` — plugin.
-- [ ] **Polyphase FIR resampler**:
-  - Half-band FIR chained per octave up to 16×.
-  - Kaiser-window design; stopband > 96 dB, transition < 0.05 × fs.
-  - Fixed coefficient tables at compile time (`const fn` or
-    generated at build).
-- [ ] **Shaper curves** — [decision] on primary set:
-  - Soft: `tanh`, `x / sqrt(1 + x²)`, cubic soft-clip.
-  - Hard: symmetric and asymmetric clip.
-  - Diode: exponential model (single/double stage).
-  - Tube: Koren-style triode approximation.
-  - Tape: Chowning / SATURN-style bias-shifted tanh.
-- [ ] **Tone stack**:
-  - Baxandall (2-band, low/high) as default.
-  - Optional: state-variable topology mirroring Fender / Marshall
-    tone stacks (bass, mid, treble).
-- [ ] **DC-blocker** post-shaper (1-pole HPF ~ 20 Hz).
-- [ ] **SIMD kernels**:
-  - Vectorised shaper evaluation (batch of 4 / 8 samples).
-  - Vectorised polyphase FIR (SIMD-across-taps).
+- **Workspace layout**:
+  - `rt-drive-core` — resampling + shapers + tone stack + DC blocker +
+    SIMD kernels.  Added to the workspace; framework-agnostic (no
+    plugin-format dep), mirrors the `rt-neural-core` layout.
+  - `rt-drive` — plugin.  **Deferred to Phase 2** (needs `nih-plug`; an
+    empty shell would not build).
+- **Polyphase FIR resampler** (`resampler.rs`):
+  - Half-band FIR chained per octave up to 16× (`Oversampler` cascade of
+    2× `Upsampler2x` / `Downsampler2x` stages).
+  - Kaiser-window design; default stopband 96 dB, transition 0.05 × fs.
+  - **Deviation**: coefficients are computed once in `Oversampler::new`
+    (off the audio thread), *not* `const fn` — stable Rust can't evaluate
+    the Bessel-I₀ Kaiser window in const context.  Tables are then fixed
+    for the object's lifetime; render path is allocation-free.  A
+    `build.rs` can emit const tables later if wanted.
+- **Shaper curves** — [decision] resolved, full set shipped as the
+  `Shaper` enum (`shaper.rs`), all monotonic + origin-passing + bounded:
+  - Soft: `Tanh`, `Reciprocal` (`x/√(1+x²)`), `CubicSoft`.
+  - Hard: `HardClip { threshold, asymmetry }` (symmetric + asymmetric).
+  - Diode: `Diode { drive }` (exponential clipper).
+  - Tube: `Tube` — simplified asymmetric triode-style curve (*not* a full
+    Koren plate-current model; that stays circuit-modelling / out of scope).
+  - Tape: `Tape { bias }` (bias-shifted tanh).
+- **Tone stack** (`tone.rs`), RBJ-cookbook biquads:
+  - `Baxandall` (2-band low/high shelf) as default.
+  - `ThreeBand` (low-shelf + peaking mid + high-shelf) for a
+    Fender/Marshall-style bass/mid/treble control.
+- **DC-blocker** post-shaper — `DcBlocker`, 1-pole HPF (default 20 Hz).
+- **SIMD kernels** (`kernels.rs`, `pulp` — same choice as
+  `rt-neural-core`):
+  - Vectorised soft-clip block (`soft_clip_block`).
+  - Vectorised polyphase FIR dot (`fir_dot`, SIMD-across-taps), backs the
+    resampler.
+  - Note: transcendental shapers (`tanh`/exp families) stay scalar for now
+    (LLVM auto-vectorises the rational ones); a SIMD `tanh` approximation
+    is a follow-up if profiling warrants it.
 
 ## Phase 1: Engine integration
 

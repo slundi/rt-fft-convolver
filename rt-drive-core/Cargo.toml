@@ -1,0 +1,16 @@
+[package]
+name = "rt-drive-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time oversampled nonlinear-drive DSP primitives: Kaiser half-band polyphase resampler, waveshaper curve bank, biquad tone stacks and a DC blocker.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "distortion", "waveshaping", "oversampling", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Portable SIMD abstraction with automatic runtime dispatch across
+# SSE/AVX2/AVX-512/NEON on stable Rust.  Same choice as `rt-neural-core`
+# (see its Phase 0 decision) so the two cores share one SIMD strategy.
+pulp = "0.22"

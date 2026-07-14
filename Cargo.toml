@@ -25,6 +25,7 @@ members = [
     "rt-ir-reverb",
     "rt-neural-core",
     "rt-neural-amp",
+    "rt-drive-core",
     "xtask",
 ]
 # `xtask` exists only for `cargo xtask …` (the bundler); keep it out of plain
@@ -36,6 +37,7 @@ default-members = [
     "rt-ir-reverb",
     "rt-neural-core",
     "rt-neural-amp",
+    "rt-drive-core",
 ]
 
 [package.metadata.docs.rs]
