@@ -163,23 +163,40 @@ pub struct PedalModel {
 
 ## Phase 2: `rt-drive` plugin
 
-- [ ] **I/O**:
-  - Mono in → mono out; stereo in → stereo out (independent per
-    channel).
-- [ ] **Preset controls**:
-  - `Model` (dropdown, 8+ shipped shapers × tone stacks).
-  - `Drive` (0–100 %).
-  - `Level` (−24 … +24 dB, post-shaper).
-  - `Tone` (Baxandall) — `Bass`, `Mid` (if 3-band), `Treble`.
-  - `Mix` (0–100 %).
-- [ ] **Quality controls**:
-  - `Oversampling` (1× / 2× / 4× / 8× / 16×).
-  - `Bias` (−1 … +1, injects DC pre-shaper for asymmetric flavour).
+Implemented as the `rt-drive` crate: framework-agnostic `params` + `engine`
+(unit-tested, offline), with the `nih-plug` wrapper behind the opt-in `nih`
+feature (`cargo build -p rt-drive --features nih`) — same convention as
+`rt-neural-amp`.  The engine uses the lock-free `rt-ir-plugin-core` handoff:
+the control thread rebuilds per-channel `DriveStage`s on structural changes
+(model / oversampling), the audio thread applies continuous controls in place.
+
+- [x] **I/O**: mono → mono and stereo → stereo, one independent `DriveStage`
+  per channel (two `AudioIOLayout`s).
+- [x] **Preset controls**:
+  - `Model` — `IntParam` over the runtime TOML bank, index → pedal name via
+    a value-to-string formatter (runtime-sized, so not a compile-time enum).
+  - `Drive` (0–100 %) → ±24 dB input-gain offset on the pedal (50 % = as
+    authored).
+  - `Level` (−24 … +24 dB) → offset on the pedal's output gain.
+  - `Tone` — `Bass` / `Mid` / `Treble` (−12…+12 dB), a plugin-owned 3-band
+    stack (independent of the pedal's authored voicing; 0 dB = flat).
+  - `Mix` (0–100 %) — dry/wet.
+- [x] **Quality controls**:
+  - `Oversampling` (`Preset` / 1× / 2× / 4× / 8× / 16×; `Preset` = pedal
+    default).
+  - `Bias` (−1 … +1) → offset on the pedal's pre-shaper DC bias.
   - `Bypass`.
-- [ ] **MIDI**:
-  - CC on `Drive` and `Level` at minimum.
-  - Program Change → preset index.
-- [ ] **CPU meter** as read-only property.
+- [x] **MIDI**:
+  - Program Change → `Model` index (via `program_to_slot`).
+  - CC on `Drive` / `Level`: all continuous controls are automatable
+    `nih-plug` params, bound to any CC via host-side MIDI learn (the
+    idiomatic path — `nih-plug` has no in-`process` setter for continuous
+    params).
+- [x] **CPU meter**: last-block render-time / wall-clock-budget, packed into
+  an `AtomicU32` for the (Phase-3) editor to read.
+- [ ] **Deferred to Phase 3/leftover**: `nih-plug-egui` editor; user-pedal
+  directory discovery + hot-swap; `DenormalGuard` is already applied per
+  callback.
 
 ## Phase 3: UI
 

@@ -28,7 +28,7 @@
 //! panic in release builds, provided `input.len() <= max_block`.
 
 use crate::DcBlocker;
-use crate::pedal::PedalModel;
+use crate::pedal::{PedalModel, ToneConfig};
 use crate::resampler::Oversampler;
 use crate::shaper::Shaper;
 use crate::tone::ToneStack;
@@ -49,6 +49,8 @@ pub struct DriveStage {
     output_gain: f32,
     dc_blocker: DcBlocker,
     tone: ToneStack,
+    /// Base rate, kept so [`DriveStage::set_tone`] can redesign the biquads.
+    sample_rate: f32,
     /// Reported latency in base-rate samples (linear-phase group delay).
     latency: usize,
     /// Oversampled scratch buffer, capacity `max_block * factor`.
@@ -99,10 +101,41 @@ impl DriveStage {
             output_gain: db_to_linear(model.output_gain_db),
             dc_blocker: DcBlocker::new(DC_BLOCK_HZ, sample_rate),
             tone: model.tone.build(sample_rate),
+            sample_rate,
             latency,
             oversampled: vec![0.0; max_block * factor],
             max_block,
         }
+    }
+
+    /// Set the pre-shaper drive gain, in dB.  **Real-time safe** — one `powf`,
+    /// no rebuild.
+    #[inline]
+    pub fn set_input_gain_db(&mut self, gain_db: f32) {
+        self.input_gain = db_to_linear(gain_db);
+    }
+
+    /// Set the post-shaper make-up gain, in dB.  **Real-time safe.**
+    #[inline]
+    pub fn set_output_gain_db(&mut self, gain_db: f32) {
+        self.output_gain = db_to_linear(gain_db);
+    }
+
+    /// Set the pre-shaper DC bias.  **Real-time safe.**
+    #[inline]
+    pub fn set_bias(&mut self, bias: f32) {
+        self.bias = bias;
+    }
+
+    /// Replace the tone stack from a [`ToneConfig`].
+    ///
+    /// Redesigns the biquad coefficients (a few transcendentals, no
+    /// allocation) and resets the filter state, so call it only when the tone
+    /// actually changes — a per-block call on every block would zip the tone
+    /// filters' memory and can click.  Cheap enough for occasional automation.
+    #[inline]
+    pub fn set_tone(&mut self, tone: ToneConfig) {
+        self.tone = tone.build(self.sample_rate);
     }
 
     /// Reported latency in base-rate samples (for host delay compensation).
@@ -321,6 +354,36 @@ mod tests {
         let stage =
             DriveStage::with_design(&model(Shaper::Tanh, 1), SAMPLE_RATE, 64, atten, transition);
         assert_eq!(stage.latency_samples(), 0);
+    }
+
+    /// Live setters change the output without a rebuild: more input gain into a
+    /// saturating shaper yields a hotter (but still bounded) output.
+    #[test]
+    fn live_input_gain_setter_changes_output() {
+        let (atten, transition) = light();
+        let mut stage =
+            DriveStage::with_design(&model(Shaper::Tanh, 2), SAMPLE_RATE, 128, atten, transition);
+        let input: Vec<f32> = (0..128)
+            .map(|n| 0.1 * (TAU * 0.02 * n as f32).sin())
+            .collect();
+
+        stage.set_input_gain_db(0.0);
+        let mut quiet = vec![0.0f32; 128];
+        stage.process_block(&input, &mut quiet);
+
+        stage.reset();
+        stage.set_input_gain_db(24.0);
+        let mut loud = vec![0.0f32; 128];
+        stage.process_block(&input, &mut loud);
+
+        let energy = |buffer: &[f32]| buffer.iter().map(|s| (s * s) as f64).sum::<f64>();
+        assert!(
+            energy(&loud) > energy(&quiet) * 2.0,
+            "more drive should raise output energy: quiet={}, loud={}",
+            energy(&quiet),
+            energy(&loud)
+        );
+        assert!(loud.iter().all(|&s| s.is_finite() && s.abs() <= 1.5));
     }
 
     /// An asymmetric shaper with bias injects DC, and the in-stage DC blocker
