@@ -88,9 +88,9 @@ Internal crate, reusable by other nonlinear-effect plugins.
     (LLVM auto-vectorises the rational ones); a SIMD `tanh` approximation
     is a follow-up if profiling warrants it.
 
-## Phase 1: Engine integration
+## Phase 1: Engine integration ✅
 
-- [x] **`DriveStage` struct** (`stage.rs`):
+- **`DriveStage` struct** (`stage.rs`):
   - Owns `Oversampler`, `Shaper` (enum dispatch), `DcBlocker`, `ToneStack`,
     plus pre-shaper gain+bias and post-shaper make-up gain.
   - `process_block(&mut self, input, output)` — RT-safe (no alloc/lock/
@@ -99,11 +99,11 @@ Internal crate, reusable by other nonlinear-effect plugins.
     nonlinearity inside the oversampled region.
   - Built from a `PedalModel` via `from_model` / `with_design`; gains use
     the shared `rt_fft_convolver::db_to_linear`.
-- [x] **`ShaperBank`** — realised as the data-driven `PedalModel` + the
+- **`ShaperBank`** — realised as the data-driven `PedalModel` + the
   `const PEDALS` bank (`pedal.rs`).  The `Shaper` enum already carries the
   per-curve params (drive, asymmetry, bias); a pedal is pure data over the
   shared engine, so new pedals need no engine change.
-- [x] **Latency reporting** (`DriveStage::latency_samples`):
+- **Latency reporting** (`DriveStage::latency_samples`):
   - **Correction to the original note**: the linear-phase half-band cascade
     is **not** 0 samples.  The up- and down-leg group delays *add* (they do
     not cancel — "same on both legs" only means the filter is symmetric),
@@ -161,7 +161,7 @@ pub struct PedalModel {
   `rt_fft_convolver::db_to_linear` helper (Prerequisites decision resolved
   — it lives in the root crate; `rt-drive-core` now depends on it).
 
-## Phase 2: `rt-drive` plugin
+## Phase 2: `rt-drive` plugin ✅
 
 Implemented as the `rt-drive` crate: framework-agnostic `params` + `engine`
 (unit-tested, offline), with the `nih-plug` wrapper behind the opt-in `nih`
@@ -170,9 +170,9 @@ feature (`cargo build -p rt-drive --features nih`) — same convention as
 the control thread rebuilds per-channel `DriveStage`s on structural changes
 (model / oversampling), the audio thread applies continuous controls in place.
 
-- [x] **I/O**: mono → mono and stereo → stereo, one independent `DriveStage`
+- **I/O**: mono → mono and stereo → stereo, one independent `DriveStage`
   per channel (two `AudioIOLayout`s).
-- [x] **Preset controls**:
+- **Preset controls**:
   - `Model` — `IntParam` over the runtime TOML bank, index → pedal name via
     a value-to-string formatter (runtime-sized, so not a compile-time enum).
   - `Drive` (0–100 %) → ±24 dB input-gain offset on the pedal (50 % = as
@@ -181,31 +181,48 @@ the control thread rebuilds per-channel `DriveStage`s on structural changes
   - `Tone` — `Bass` / `Mid` / `Treble` (−12…+12 dB), a plugin-owned 3-band
     stack (independent of the pedal's authored voicing; 0 dB = flat).
   - `Mix` (0–100 %) — dry/wet.
-- [x] **Quality controls**:
+- **Quality controls**:
   - `Oversampling` (`Preset` / 1× / 2× / 4× / 8× / 16×; `Preset` = pedal
     default).
   - `Bias` (−1 … +1) → offset on the pedal's pre-shaper DC bias.
   - `Bypass`.
-- [x] **MIDI**:
+- **MIDI**:
   - Program Change → `Model` index (via `program_to_slot`).
   - CC on `Drive` / `Level`: all continuous controls are automatable
     `nih-plug` params, bound to any CC via host-side MIDI learn (the
     idiomatic path — `nih-plug` has no in-`process` setter for continuous
     params).
-- [x] **CPU meter**: last-block render-time / wall-clock-budget, packed into
+- **CPU meter**: last-block render-time / wall-clock-budget, packed into
   an `AtomicU32` for the (Phase-3) editor to read.
-- [ ] **Deferred to Phase 3/leftover**: `nih-plug-egui` editor; user-pedal
+- **Deferred to Phase 3/leftover**: `nih-plug-egui` editor; user-pedal
   directory discovery + hot-swap; `DenormalGuard` is already applied per
   callback.
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
-- [ ] **Shaper transfer curve visualiser**: real-time x-y plot of
-  the current shaper + drive setting.
-- [ ] **Input / output VU meters**.
-- [ ] **Oversampling badge** showing current factor and estimated CPU.
-- [ ] **Preset A/B compare** with copy-to-clipboard.
+Behind the opt-in `gui` feature (`cargo build -p rt-drive --features gui`).
+All UI *logic* lives in the framework-agnostic, unit-tested `rt-drive/src/ui.rs`
+(transfer-curve sampling, VU ballistics, badge formatting, A/B state); the egui
+drawing is a thin layer in the `gui`-gated editor.
+
+- **`nih-plug-egui`** — [decision] resolved (egui 0.31, consistent with the
+  sibling `rt-neural-amp`; not iced).
+- **Shaper transfer-curve visualiser**: `ui::transfer_curve` samples
+  `y = f(x · effective_drive)` for the current pedal's shaper; the editor
+  draws it as a line over zero-axes.
+- **Input / output VU meters**: `process()` writes per-block input/output
+  peak (`ui::peak_dbfs`) to atomics; the editor smooths them with
+  `ui::LevelMeter` (instant attack / eased release) and draws two bars.
+- **Oversampling + CPU badge**: current resolved factor
+  (`ui::format_oversampling`) and last-block CPU load (`ui::format_cpu`).
+- **Preset A/B compare** (`ui::AbState`) + **copy-to-clipboard**
+  (`ui::clipboard_string` → `ctx.copy_text`).
+
+> **Build note**: the `gui` feature needs system X11/GL dev libraries
+> (`nih-plug-egui` → `glow`/`winit` → `x11`).  It builds where those are
+> present; it could not be compiled in the current CI sandbox (no X11
+> headers).  The `gui`-free `nih` plugin build and all `ui.rs` unit tests do
+> run offline.  Host validation of the built plugin is Phase 4.
 
 ## Phase 4: Testing
 

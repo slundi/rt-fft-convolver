@@ -15,9 +15,10 @@ crate-type = ["lib", "cdylib"]
 [features]
 # The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
 # Build the actual plugin with `cargo build -p rt-drive --features nih`.
-# `gui` (Phase 3) will add the nih-plug-egui editor.
+# `gui` adds the nih-plug-egui editor (Phase 3).
 default = []
 nih = ["dep:nih_plug"]
+gui = ["nih", "dep:nih_plug_egui"]
 
 [dependencies]
 # The oversampled-drive DSP engine.
@@ -29,3 +30,4 @@ rt-fft-convolver = { path = ".." }
 
 # nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

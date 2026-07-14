@@ -33,11 +33,20 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nih_plug::prelude::*;
+#[cfg(feature = "gui")]
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
+#[cfg(feature = "gui")]
+use rt_drive_core::PedalModel;
 use rt_drive_core::shipped_pedals;
 use rt_ir_plugin_core::program_to_slot;
 
 use crate::engine::{DriveController, DriveProcessor};
 use crate::params::{BIAS_RANGE, DriveParams, LEVEL_DB_RANGE, OversampleChoice, TONE_DB_RANGE};
+#[cfg(feature = "gui")]
+use crate::ui::{
+    AbSlot, AbState, LevelMeter, clipboard_string, format_cpu, format_oversampling, transfer_curve,
+};
+use crate::ui::{SILENCE_DBFS, peak_dbfs};
 
 /// Off-thread work dispatched to the background executor (control thread only).
 pub enum DriveTask {
@@ -76,6 +85,20 @@ impl OversampleParam {
             OversampleParam::X16 => OversampleChoice::X16,
         }
     }
+
+    /// Map a framework-agnostic [`OversampleChoice`] back to the param enum
+    /// (used when A/B recall pushes a snapshot to the host).
+    #[cfg(feature = "gui")]
+    fn from_choice(choice: OversampleChoice) -> Self {
+        match choice {
+            OversampleChoice::Preset => OversampleParam::Preset,
+            OversampleChoice::X1 => OversampleParam::X1,
+            OversampleChoice::X2 => OversampleParam::X2,
+            OversampleChoice::X4 => OversampleParam::X4,
+            OversampleChoice::X8 => OversampleParam::X8,
+            OversampleChoice::X16 => OversampleParam::X16,
+        }
+    }
 }
 
 /// Host-visible parameters.
@@ -101,6 +124,10 @@ struct DrivePluginParams {
     bias: FloatParam,
     #[id = "byp"]
     bypass: BoolParam,
+
+    #[cfg(feature = "gui")]
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 impl Default for DrivePluginParams {
@@ -160,6 +187,8 @@ impl Default for DrivePluginParams {
             ),
             bypass: BoolParam::new("Bypass", false)
                 .with_value_to_string(formatters::v2s_bool_bypass()),
+            #[cfg(feature = "gui")]
+            editor_state: EguiState::from_size(560, 480),
         }
     }
 }
@@ -208,8 +237,12 @@ pub struct DrivePlugin {
     last_oversampling: OversampleParam,
 
     /// Last-block CPU load as a fraction of the block's wall-clock budget,
-    /// `f32.to_bits()` packed — read by the (Phase-3) CPU meter.
+    /// `f32.to_bits()` packed — read by the CPU badge.
     cpu_meter: Arc<AtomicU32>,
+    /// Per-block input peak in dBFS, `f32.to_bits()` packed (editor VU meter).
+    input_meter_dbfs: Arc<AtomicU32>,
+    /// Per-block output peak in dBFS, `f32.to_bits()` packed (editor VU meter).
+    output_meter_dbfs: Arc<AtomicU32>,
 }
 
 impl Default for DrivePlugin {
@@ -221,8 +254,81 @@ impl Default for DrivePlugin {
             last_model: 0,
             last_oversampling: OversampleParam::Preset,
             cpu_meter: Arc::new(AtomicU32::new(0)),
+            // Prime with silence (−120 dBFS).
+            input_meter_dbfs: Arc::new(AtomicU32::new((-120.0f32).to_bits())),
+            output_meter_dbfs: Arc::new(AtomicU32::new((-120.0f32).to_bits())),
         }
     }
+}
+
+/// Per-frame editor state owned by the egui closure.
+#[cfg(feature = "gui")]
+struct DriveEditorState {
+    input_meter: LevelMeter,
+    output_meter: LevelMeter,
+    ab: AbState,
+}
+
+#[cfg(feature = "gui")]
+impl DriveEditorState {
+    fn new(initial: DriveParams) -> Self {
+        Self {
+            input_meter: LevelMeter::new(),
+            output_meter: LevelMeter::new(),
+            ab: AbState::new(initial),
+        }
+    }
+}
+
+/// Draw a horizontal VU bar for `dbfs`, mapping `[-60, 0] dBFS → [0, 1]`.
+#[cfg(feature = "gui")]
+fn draw_meter(
+    ui: &mut egui::Ui,
+    label: &str,
+    dbfs: f32,
+    background: egui::Color32,
+    fill: egui::Color32,
+) {
+    ui.horizontal(|ui| {
+        ui.monospace(label);
+        let width = (ui.available_width() - 56.0).max(40.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 14.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, background);
+        let normalised = ((dbfs + 60.0) / 60.0).clamp(0.0, 1.0);
+        let fill_rect = egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.left() + rect.width() * normalised, rect.bottom()),
+        );
+        ui.painter().rect_filled(fill_rect, 2.0, fill);
+        ui.monospace(format!("{dbfs:>5.0}"));
+    });
+}
+
+/// Push a full [`DriveParams`] snapshot to the host (A/B recall).
+#[cfg(feature = "gui")]
+fn apply_params(setter: &ParamSetter, params: &DrivePluginParams, values: &DriveParams) {
+    set_param(setter, &params.model, values.model_index as i32);
+    set_param(setter, &params.drive, values.drive);
+    set_param(setter, &params.level_db, values.level_db);
+    set_param(setter, &params.bass_db, values.bass_db);
+    set_param(setter, &params.mid_db, values.mid_db);
+    set_param(setter, &params.treble_db, values.treble_db);
+    set_param(setter, &params.mix, values.mix);
+    set_param(setter, &params.bias, values.bias);
+    set_param(setter, &params.bypass, values.bypass);
+    set_param(
+        setter,
+        &params.oversampling,
+        OversampleParam::from_choice(values.oversampling),
+    );
+}
+
+/// Set one parameter with a complete begin/set/end automation gesture.
+#[cfg(feature = "gui")]
+fn set_param<P: Param>(setter: &ParamSetter, param: &P, value: P::Plain) {
+    setter.begin_set_parameter(param);
+    setter.set_parameter(param, value);
+    setter.end_set_parameter(param);
 }
 
 impl Plugin for DrivePlugin {
@@ -254,6 +360,166 @@ impl Plugin for DrivePlugin {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    #[cfg(feature = "gui")]
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        use egui::Color32;
+
+        // Orange accent for a drive/distortion pedal.
+        const ACCENT: Color32 = Color32::from_rgb(0xff, 0x8c, 0x32);
+        const PANEL: Color32 = Color32::from_rgb(0x16, 0x18, 0x1c);
+        const CURVE_GRID: Color32 = Color32::from_rgb(0x2a, 0x2e, 0x36);
+        const METER_BG: Color32 = Color32::from_rgb(0x14, 0x16, 0x1a);
+        const IN_FILL: Color32 = Color32::from_rgb(0x5a, 0x74, 0xa0);
+        const OUT_FILL: Color32 = Color32::from_rgb(0xff, 0x8c, 0x32);
+
+        let params = self.params.clone();
+        let cpu_meter = self.cpu_meter.clone();
+        let input_meter = self.input_meter_dbfs.clone();
+        let output_meter = self.output_meter_dbfs.clone();
+        let pedals: Vec<PedalModel> = shipped_pedals().unwrap_or_default();
+
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            DriveEditorState::new(self.params.snapshot()),
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                let snapshot = params.snapshot();
+                // Keep the active A/B slot in sync with the live controls.
+                state.ab.store(snapshot);
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Header: name + bypass ─────────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.heading("RT Drive");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.bypass, setter));
+                        });
+                    });
+                    ui.separator();
+
+                    // ── Model + oversampling / CPU badge ──────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Model");
+                        ui.add(widgets::ParamSlider::for_param(&params.model, setter));
+                    });
+                    let model_index = snapshot.model_index;
+                    let pedal = pedals.get(model_index);
+                    let factor = pedal
+                        .map(|pedal| snapshot.oversampling.factor(pedal.default_oversampling))
+                        .unwrap_or(1);
+                    let cpu = f32::from_bits(cpu_meter.load(Ordering::Relaxed));
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("OS {}", format_oversampling(factor)))
+                                .color(ACCENT),
+                        );
+                        ui.separator();
+                        ui.label(format!("CPU {}", format_cpu(cpu)));
+                    });
+
+                    // ── Transfer-curve visualiser ─────────────────────────
+                    if let Some(pedal) = pedal {
+                        let effective_gain = pedal.input_gain_db + snapshot.drive_offset_db();
+                        let curve = transfer_curve(pedal.shaper, effective_gain, 96);
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 130.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 4.0, PANEL);
+                        // Zero axes.
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(rect.center().x, rect.top()),
+                                egui::pos2(rect.center().x, rect.bottom()),
+                            ],
+                            egui::Stroke::new(1.0, CURVE_GRID),
+                        );
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(rect.left(), rect.center().y),
+                                egui::pos2(rect.right(), rect.center().y),
+                            ],
+                            egui::Stroke::new(1.0, CURVE_GRID),
+                        );
+                        let points: Vec<egui::Pos2> = curve
+                            .iter()
+                            .map(|&(x, y)| {
+                                egui::pos2(
+                                    rect.left() + (x * 0.5 + 0.5) * rect.width(),
+                                    rect.center().y - y * (rect.height() * 0.45),
+                                )
+                            })
+                            .collect();
+                        ui.painter()
+                            .add(egui::Shape::line(points, egui::Stroke::new(2.0, ACCENT)));
+                    }
+
+                    // ── Controls ──────────────────────────────────────────
+                    ui.separator();
+                    egui::Grid::new("controls").num_columns(2).show(ui, |ui| {
+                        let float_controls: [(&str, &FloatParam); 7] = [
+                            ("Drive", &params.drive),
+                            ("Level", &params.level_db),
+                            ("Bass", &params.bass_db),
+                            ("Mid", &params.mid_db),
+                            ("Treble", &params.treble_db),
+                            ("Mix", &params.mix),
+                            ("Bias", &params.bias),
+                        ];
+                        for (label, param) in float_controls {
+                            ui.label(label);
+                            ui.add(widgets::ParamSlider::for_param(param, setter));
+                            ui.end_row();
+                        }
+                        ui.label("Oversampling");
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.oversampling,
+                            setter,
+                        ));
+                        ui.end_row();
+                    });
+
+                    // ── VU meters ─────────────────────────────────────────
+                    ui.separator();
+                    let input_dbfs = state
+                        .input_meter
+                        .update(f32::from_bits(input_meter.load(Ordering::Relaxed)), 0.2);
+                    draw_meter(ui, "In ", input_dbfs, METER_BG, IN_FILL);
+                    let output_dbfs = state
+                        .output_meter
+                        .update(f32::from_bits(output_meter.load(Ordering::Relaxed)), 0.2);
+                    draw_meter(ui, "Out", output_dbfs, METER_BG, OUT_FILL);
+
+                    // ── A/B compare + clipboard ───────────────────────────
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(state.ab.active() == AbSlot::A, "A")
+                            .clicked()
+                        {
+                            let recalled = state.ab.activate(AbSlot::A);
+                            apply_params(setter, &params, &recalled);
+                        }
+                        if ui
+                            .selectable_label(state.ab.active() == AbSlot::B, "B")
+                            .clicked()
+                        {
+                            let recalled = state.ab.activate(AbSlot::B);
+                            apply_params(setter, &params, &recalled);
+                        }
+                        if ui.button("Copy → other").clicked() {
+                            state.ab.copy_active_to_other();
+                        }
+                        if ui.button("Copy to clipboard").clicked() {
+                            let name = pedal.map(|pedal| pedal.name.as_str()).unwrap_or("—");
+                            ctx.copy_text(clipboard_string(&snapshot, name));
+                        }
+                    });
+                });
+            },
+        )
     }
 
     fn task_executor(&mut self) -> TaskExecutor<Self> {
@@ -341,9 +607,27 @@ impl Plugin for DrivePlugin {
         let num_samples = buffer.samples();
 
         if let Some(processor) = self.processor.as_mut() {
+            // Input peak (pre-render) for the VU meter.
+            let input_dbfs = buffer
+                .as_slice()
+                .iter()
+                .map(|channel| peak_dbfs(channel))
+                .fold(SILENCE_DBFS, f32::max);
+            self.input_meter_dbfs
+                .store(input_dbfs.to_bits(), Ordering::Relaxed);
+
             let start = std::time::Instant::now();
             processor.process(buffer.as_slice(), &snapshot);
             let elapsed = start.elapsed().as_secs_f32();
+
+            // Output peak (post-render) for the VU meter.
+            let output_dbfs = buffer
+                .as_slice()
+                .iter()
+                .map(|channel| peak_dbfs(channel))
+                .fold(SILENCE_DBFS, f32::max);
+            self.output_meter_dbfs
+                .store(output_dbfs.to_bits(), Ordering::Relaxed);
 
             // CPU load = render time / block wall-clock budget.
             let sample_rate = context.transport().sample_rate;

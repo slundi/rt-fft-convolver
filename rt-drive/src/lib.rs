@@ -18,11 +18,13 @@
 
 pub mod engine;
 pub mod params;
+pub mod ui;
 
 pub use engine::{DriveController, DriveProcessor, PreparedDrive};
 pub use params::{
     BIAS_RANGE, DRIVE_SWING_DB, DriveParams, LEVEL_DB_RANGE, OversampleChoice, TONE_DB_RANGE,
 };
+pub use ui::{AbSlot, AbState, LevelMeter, clipboard_string, peak_dbfs, transfer_curve};
 
 // Re-export the DSP core so downstream callers only depend on one crate.
 pub use rt_drive_core as drive_core;
