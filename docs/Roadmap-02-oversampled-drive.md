@@ -32,9 +32,20 @@ Plugin format target: **LV2 + CLAP + VST3** via
 
 ## Prerequisites in `rt-fft-convolver`
 
-- [ ] `DenormalGuard` (already available in `utils/denormals.rs`).
-- [ ] `mixer.rs` gain-staging patterns — reuse the dB-to-linear
-  utilities and dry/wet crossfade.
+- [x] `DenormalGuard` (available in `utils/denormals.rs`) — RAII FTZ/DAZ
+  guard, RT-safe (one MXCSR/FPCR read+write on entry/exit, no alloc/lock).
+  Wrap the whole render callback with it.  A software `flush_to_zero`
+  fallback is also available.
+- [x] `mixer.rs` dry/wet crossfade — equal-power (cos/sin) blend with
+  `ir_gain` folded into `wet_gain` so `process()` is two mul/sample.
+  Reusable directly.
+- [ ] **dB↔linear helpers** — NOT present in the crate today (the mixer
+  works purely in linear gains; there is no `db_to_linear`/`linear_to_db`
+  anywhere in `src/`).  Must be written for `Level` (−24…+24 dB) and
+  `Bias`.  [decision] where they live — recommended: a shared
+  `rt-fft-convolver::utils::gain` module so `rt-neural-amp` and the other
+  roadmapped plugins reuse one implementation, rather than duplicating in
+  `rt-drive-core`.
 
 ## Phase 0: DSP primitives (`rt-drive-core`)
 
@@ -76,6 +87,43 @@ Internal crate, reusable by other nonlinear-effect plugins.
 - [ ] **Latency reporting**:
   - Report 0 samples (FIR delays cancel between up- and down-leg).
   - Verify with a unit-impulse round-trip.
+
+## Pedal model format (Phase 0/1)
+
+A "pedal" is **not** a plugin, binary, or DSP module — it is a
+**data-driven preset descriptor** that parameterises the one shared
+`DriveStage` engine.  A pedal carries *no code*, only coefficients and
+enum selectors; this is what makes "add a new pedal without touching the
+plugin code" (Phase 1, `ShaperBank`) actually true.
+
+A pedal is a point in the *(input gain × shaper × bias × tone stack ×
+output gain)* space:
+
+```rust
+/// One "pedal" = coefficients + enum selectors over the shared engine.
+/// Purely data — no DSP lives here.
+pub struct PedalModel {
+    pub name: &'static str,          // display name (see Sourcing & legal)
+    pub input_gain_db: f32,          // pre-shaper drive trim
+    pub shaper: Shaper,              // SoftTanh | AsymDiode { .. } | Tube { .. } | …
+    pub bias: f32,                   // DC injected pre-shaper (asymmetry)
+    pub tone: ToneStack,             // Baxandall { .. } | Svf3Band { bass, mid, treble }
+    pub output_gain_db: f32,         // post-shaper make-up
+    pub default_oversampling: u8,    // 2 / 4 / 8 / 16
+}
+```
+
+- [ ] **Authoring format**: human-editable `RON` or `TOML` curve set
+  under `pedals/`, deserialised via `serde`.
+- [ ] **Compile-time bake** (default, matches Phase 5 "ships in-plugin,
+  not external files"): a `build.rs` reads `pedals/*.toml` and codegens a
+  `static [PedalModel]` table.  Zero runtime cost, allocation-free on the
+  render thread.
+- [ ] **Runtime-loadable** (deferred): same struct via `serde`, loaded
+  off the audio thread into a double-buffered slot for user-authored
+  pedals.
+- [ ] **Note**: `input_gain_db` / `output_gain_db` depend on the dB↔linear
+  helper listed in Prerequisites — resolve that decision first.
 
 ## Phase 2: `rt-drive` plugin
 
@@ -132,9 +180,40 @@ Internal crate, reusable by other nonlinear-effect plugins.
   `.exe`.
 - [ ] **Preset pack**: ~20 pedal / amp-stage emulations covering
   clean-boost → high-gain distortion → tape saturation.  Ships
-  in-plugin (not as external files).
+  in-plugin (not as external files).  Each preset is a `PedalModel`
+  (see "Pedal model format").
 - [ ] **Documentation**: manual under `docs/`, per-shaper transfer
   curve reference.
+
+### Sourcing & legal (preset pack)
+
+We model *transfer functions + tone stacks*, not firmware, so the source
+material is circuit-level:
+
+- **Circuit analysis / schematics** (public, hobbyist):
+  - **electrosmash.com** — best single resource; full mathematical
+    analysis of the Boss DS-1, Ibanez TS808/TS9, ProCo Rat, Big Muff Pi,
+    MXR Distortion+, including clipping-stage transfer functions and
+    tone-stack RC networks.  Nearly direct → `Shaper` + `ToneStack` params.
+  - **freestompboxes.org**, **diystompboxes.com** — schematics + measured
+    behaviour.
+  - **Klon Centaur** — fully reverse-engineered; schematic + germanium
+    diode clipping stage public.
+- **Deriving the curve**:
+  - **SPICE** (ngspice / LTspice) — build the schematic, DC sweep →
+    static transfer curve, AC sweep → tone-stack response; fit to a
+    `Shaper` enum (e.g. asymmetric diode → exponential model).
+  - **Direct measurement** — slow full-scale sine/ramp through a real
+    pedal via an interface; good for validation, messier than SPICE for
+    primary sourcing (nonlinearity + the pedal's own filtering).
+  - **Academic** — Yeh/Abel/Smith (CCRMA) diode-clipper & tube papers,
+    DAFx proceedings — parametric models directly.
+- **⚠️ Trademark**: "Tube Screamer", "Klon", "RAT", "DS-1", "Big Muff"
+  are trademarks.  The circuits/topologies are fair to model, but ship
+  presets under descriptive / punning names (industry norm: TS → *Green
+  808*, Klon → *Gold Centaur*, Rat → *Rodent*, DS-1 → *Orange Dist*).
+  Keep any "modelled after…" reference in the manual, not on the preset
+  name.
 
 ## Out of scope (future work)
 
