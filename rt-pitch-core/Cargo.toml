@@ -1,0 +1,25 @@
+[package]
+name = "rt-pitch-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time pitch-shifting DSP primitives: selectable phase-vocoder / WSOLA / PSOLA shifters, spectral-envelope formant preservation, and an 8-slot preset bank with click-free crossfade.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "pitch-shift", "phase-vocoder", "wsola", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Real-to-complex FFT wrapper reused for the phase-vocoder STFT (Roadmap-03
+# Prerequisites: same `realfft`-backed abstraction, different consumer).
+realfft = "3.5"
+# Shared RT-safe primitives from the root crate: the fixed-capacity `Ring<T>`
+# FIFO (Roadmap-03 ring-buffer decision, Option C) backing STFT framing, and
+# the `DenormalGuard` for near-silent spectral bins.
+rt-fft-convolver = { path = ".." }
+
+[dev-dependencies]
+# Micro-benchmarks: each shifter at each FFT size / ratio.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }

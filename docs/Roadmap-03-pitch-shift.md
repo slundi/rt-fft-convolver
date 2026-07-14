@@ -80,32 +80,38 @@ Plugin format target: **LV2 + CLAP + VST3** via
   deterministic for host compensation and the RT-safety audit; may
   become an "Advanced" control post-1.0.
 
-## Phase 1: `rt-pitch-core` (engine crate)
+## Phase 1: `rt-pitch-core` (engine crate) ✅
 
-- [ ] **Workspace layout**:
-  - `rt-pitch-core` — algorithm.
-  - `rt-pitch` — plugin.
-- [ ] **`Shifter` trait** (dispatch boundary for the three algorithms):
+- **Workspace layout**:
+  - `rt-pitch-core` — algorithm. **Done** (`rt-pitch` plugin is Phase 2).
+- **`Shifter` trait** (dispatch boundary for the three algorithms):
   - `latency_samples(&self) -> usize`, `reset(&mut self)`,
     `process_block(&mut self, in: &[f32], out: &mut [f32])`.
   - Selection swapped off-RT (`Box<dyn Shifter>`); each impl owns its
     own buffers and reports its own latency.
-- [ ] **PV shifter** (STFT via `realfft`, Hann default; Blackman-Harris
-  optional):
-  - Puckette peak-locking.
-  - Transient detection (bypass phase update on strong onsets).
-- [ ] **WSOLA shifter** (time-domain, correlation search window).
-- [ ] **PSOLA shifter** + **monophonic pitch tracker** (epoch detection);
-  polyphony detector → warn / bypass.
-- [ ] **Shifter core (shared)**:
-  - `set_ratio(f32)` — off-RT; the RT path reads an atomic-updated
-    ratio.
-- [ ] **Formant preservation** (spectral/PV mode; three estimators):
-  - Cepstral liftering (default), LPC, True Envelope (capped iterations).
-  - Envelope estimation on the input frame, re-application on the
-    shifted frame.
-- [ ] **Preset bank**:
-  - 8 slots with click-free crossfade between ratios.
+- **PV shifter** (STFT via `realfft`, Hann default; Blackman-Harris
+  optional) — `phase_vocoder.rs`, bin-remap (`smbPitchShift`):
+  - Puckette peak-locking (toggle, default on).
+  - Transient detection (spectral flux → phase reset on strong onsets).
+- **WSOLA shifter** (time-domain, resample ∘ similarity-search
+  time-stretch) — `wsola.rs`.
+- **PSOLA shifter** + **monophonic pitch tracker** — `psola.rs`,
+  `pitch.rs` (octave-error-corrected autocorrelation); polyphony
+  detector → warn / bypass.
+- **Shifter core (shared)** — `shifter.rs`:
+  - `set_ratio(f32)` (smoothed); lock-free `SharedRatio` atomic cell for
+    the GUI→RT parameter; semitone/ratio helpers.
+- **Formant preservation** (spectral/PV mode; three estimators) —
+  `formant.rs`:
+  - Cepstral liftering (default), LPC (Levinson-Durbin), True Envelope
+    (capped iterations).  Whiten on analysis, re-impose the original
+    envelope on synthesis; user-selectable via `set_formant_preservation`.
+- **Preset bank** — `preset.rs`:
+  - 8 slots with click-free **equal-power** crossfade between ratios.
+
+*(All 44 `rt-pitch-core` unit tests pass; `cargo clippy -D warnings`
+clean; RT-safety: `DenormalGuard` on each `process_block`, buffers sized
+at construction, output FIFOs on the shared `Ring<T>`.)*
 
 ## Phase 2: `rt-pitch` plugin
 
