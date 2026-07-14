@@ -32,3 +32,6 @@ pub use utils::resampler::{IrData, load_ir, resample};
 
 /// Anti-denormal protection helpers for the audio render thread.
 pub use utils::denormals::{DenormalGuard, flush_to_zero};
+
+/// Decibel ↔ linear-amplitude gain conversions.
+pub use utils::gain::{db_to_linear, linear_to_db};
