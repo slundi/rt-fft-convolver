@@ -44,42 +44,66 @@ Plugin format target: **LV2 + CLAP + VST3** via
   — it is a SIMD sliding window, not a FIFO, so it is not refactored
   onto `Ring<T>`.
 
-## Phase 0: Algorithm decisions
+## Phase 0: Algorithm decisions ✅
 
-- [ ] **Primary algorithm** — [decision]:
-  - Phase Vocoder (STFT + phase-lock).
-  - WSOLA (time-domain, cheaper, lower quality on complex signals).
-  - SOLA-FS or PSOLA (better for monophonic voice).
-  - Hybrid (phase vocoder for polyphonic, WSOLA for percussive).
-- [ ] **Formant-preservation strategy** — [decision]:
-  - LPC-based spectral envelope resampling.
-  - Cepstral liftering.
-  - True Envelope estimation.
-  - None (formants shift with pitch — cheaper, "chipmunk" artefact).
-- [ ] **FFT sizes to expose**:
-  - 512 (~11 ms @ 48 kHz) — "Live" mode.
-  - 1024 (~21 ms) — "Standard" mode.
-  - 2048 (~43 ms) — "Studio" mode.
-- [ ] **Overlap factor**: 4× fixed, or exposed as control — [decision].
+- **Primary algorithm** — **decision: all three selectable** behind an
+  off-RT `Shifter` trait (`Box<dyn Shifter>` swapped at preset/param
+  change; RT path unaffected).  Each mode reports its own
+  `latency_samples()` so the host recompensates on switch.
+  - **Phase Vocoder** ("Smooth") — STFT + Puckette peak-lock;
+    polyphonic/chords, arbitrary ratios.  Default mode.
+  - **WSOLA** ("Tight/Mono") — time-domain, low latency, punchy
+    transients, best on monophonic leads.
+  - **PSOLA / SOLA-FS** ("Mono Voice") — pitch-synchronous OLA for
+    monophonic voice.
+    - ⚠️ Requires a monophonic pitch tracker and **degrades on
+      polyphonic input**.  Constraint: label the mode "Mono Voice" and
+      auto-warn / bypass when polyphony is detected.
+  - *(Hybrid PV+time-domain routing deferred to a post-1.0 upgrade — the
+    `Shifter` trait leaves room for it.)*
+- **Formant-preservation strategy** — **decision: user on/off toggle
+  + selectable method**.  Exposes a `Formant Method` control:
+  - **Cepstral liftering** — default; reuses the PV spectrum, cheapest.
+  - **LPC-based** spectral envelope resampling — voice-tuned.
+  - **True Envelope** estimation — highest quality; iteration count
+    capped for RT bounding.
+  - ⚠️ Cost: three RT-bounded envelope estimators to implement + test.
+    Formant methods apply only to spectral (PV) mode; document behaviour
+    under WSOLA/PSOLA (PSOLA is already partially formant-preserving).
+- **FFT sizes to expose** — **settled**: at 4× overlap the
+  algorithmic latency ≈ one frame.
+  - 512 (~10.7 ms @ 48 kHz) — "Live" mode.
+  - 1024 (~21.3 ms) — "Standard" mode.
+  - 2048 (~42.7 ms) — "Studio" mode.
+- **Overlap factor** — **decision: 4× fixed** (hop = frame/4,
+  satisfies Hann COLA).  Keeps buffer sizes and reported latency
+  deterministic for host compensation and the RT-safety audit; may
+  become an "Advanced" control post-1.0.
 
 ## Phase 1: `rt-pitch-core` (engine crate)
 
 - [ ] **Workspace layout**:
   - `rt-pitch-core` — algorithm.
   - `rt-pitch` — plugin.
-- [ ] **Analysis / synthesis frame**:
-  - Windowed STFT via `realfft`.
-  - Hann or Blackman-Harris window (Hann default).
-- [ ] **Phase-lock heuristics** (if phase vocoder chosen):
+- [ ] **`Shifter` trait** (dispatch boundary for the three algorithms):
+  - `latency_samples(&self) -> usize`, `reset(&mut self)`,
+    `process_block(&mut self, in: &[f32], out: &mut [f32])`.
+  - Selection swapped off-RT (`Box<dyn Shifter>`); each impl owns its
+    own buffers and reports its own latency.
+- [ ] **PV shifter** (STFT via `realfft`, Hann default; Blackman-Harris
+  optional):
   - Puckette peak-locking.
   - Transient detection (bypass phase update on strong onsets).
-- [ ] **Shifter core**:
+- [ ] **WSOLA shifter** (time-domain, correlation search window).
+- [ ] **PSOLA shifter** + **monophonic pitch tracker** (epoch detection);
+  polyphony detector → warn / bypass.
+- [ ] **Shifter core (shared)**:
   - `set_ratio(f32)` — off-RT; the RT path reads an atomic-updated
     ratio.
-  - `process_block(&mut self, in: &[f32], out: &mut [f32])`.
-- [ ] **Formant preservation** (if enabled):
-  - Envelope estimation on the input frame.
-  - Envelope re-application on the shifted frame.
+- [ ] **Formant preservation** (spectral/PV mode; three estimators):
+  - Cepstral liftering (default), LPC, True Envelope (capped iterations).
+  - Envelope estimation on the input frame, re-application on the
+    shifted frame.
 - [ ] **Preset bank**:
   - 8 slots with click-free crossfade between ratios.
 
@@ -94,10 +118,13 @@ Plugin format target: **LV2 + CLAP + VST3** via
 - [ ] **Global controls**:
   - `Current Preset` (int 0–7).
   - `Crossfade Time` (5–200 ms).
+  - `Algorithm` (Smooth / Tight-Mono / Mono-Voice — selects the
+    `Shifter`; "Mono-Voice" = PSOLA, warns on polyphony).
   - `Quality` (Live / Standard / Studio — sets FFT size).
   - `Mix` (0–100 %, wet/dry).
-  - `Formant Preservation` (bool) — only if the algorithm supports
-    it.
+  - `Formant Preservation` (bool) — spectral (PV) mode only.
+  - `Formant Method` (Cepstral / LPC / True Envelope) — active when
+    formant preservation is on.
   - `Dry Delay Compensation` (bool) — align dry with wet after
     reported latency.
   - `Bypass`.
