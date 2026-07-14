@@ -35,3 +35,6 @@ pub use utils::denormals::{DenormalGuard, flush_to_zero};
 
 /// Decibel ↔ linear-amplitude gain conversions.
 pub use utils::gain::{db_to_linear, linear_to_db};
+
+/// Real-time-safe fixed-capacity FIFO ring buffer (delay lines, STFT framing).
+pub use utils::ring::Ring;

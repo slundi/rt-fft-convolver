@@ -26,14 +26,23 @@ Plugin format target: **LV2 + CLAP + VST3** via
 - **8 pitch presets / intervals** with click-free crossfade on
   change (see `CrossfadingConvolver` design principle).
 
-## Prerequisites in `rt-fft-convolver`
+## Prerequisites in `rt-fft-convolver` ✅
 
-- [ ] Reuse `dsp/fft_handler.rs` (`realfft`-backed real-to-complex
+- Reuse `dsp/fft_handler.rs` (`realfft`-backed real-to-complex
   wrapper).  Same abstraction, different consumer.
-- [ ] `DenormalGuard` — spectral processing produces denormals when
+- `DenormalGuard` — spectral processing produces denormals when
   bins are near-silent.
-- [ ] Ring-buffer utilities — [decision] whether to extract a shared
-  `Ring<T>` into the core crate or keep it private to `rt-pitch`.
+- Ring-buffer utilities — **decision: split (Option C)**.  Core
+  half **done**: generic, RT-safe `Ring<T: Copy + Default>` FIFO
+  implemented in `utils/ring.rs` and re-exported as
+  `rt_fft_convolver::Ring` — reused by delay / pre-delay / lookahead
+  effects across the `rt-*` family.  The STFT overlap-add framer
+  (`OverlapAdd` / `StftFramer`) remains private to `rt-pitch`
+  (Phase 1) until a second consumer justifies promoting it (its shape
+  depends on the Phase 0
+  algorithm choice).  The `DirectConvolver` doubled-buffer stays as-is
+  — it is a SIMD sliding window, not a FIFO, so it is not refactored
+  onto `Ring<T>`.
 
 ## Phase 0: Algorithm decisions
 
