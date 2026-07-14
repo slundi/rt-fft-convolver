@@ -55,8 +55,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Phase 1: `rt-fdn-core` (engine crate)
 
 - [ ] **Workspace layout**:
-  - `crates/rt-fdn-core` — reverb engine.
-  - `crates/rt-fdn-reverb` — plugin.
+  - `rt-fdn-core` — reverb engine.
+  - `rt-fdn-reverb` — plugin.
 - [ ] **Delay-line primitives**:
   - `ModulatedDelay { buf: Vec<f32>, mod_lfo, mod_depth }`.
   - All-pass diffuser (Schroeder-style) chain.

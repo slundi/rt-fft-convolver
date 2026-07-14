@@ -41,8 +41,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 Internal crate, reusable by other nonlinear-effect plugins.
 
 - [ ] **Workspace layout**:
-  - `crates/rt-drive-core` — resampling + shapers + tone stack.
-  - `crates/rt-drive` — plugin.
+  - `rt-drive-core` — resampling + shapers + tone stack.
+  - `rt-drive` — plugin.
 - [ ] **Polyphase FIR resampler**:
   - Half-band FIR chained per octave up to 16×.
   - Kaiser-window design; stopband > 96 dB, transition < 0.05 × fs.

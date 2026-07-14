@@ -56,8 +56,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Phase 1: `rt-limiter-core` (engine crate)
 
 - [ ] **Workspace layout**:
-  - `crates/rt-limiter-core` — engine.
-  - `crates/rt-limiter` — plugin.
+  - `rt-limiter-core` — engine.
+  - `rt-limiter` — plugin.
 - [ ] **Oversampler**:
   - Reuse `rt-drive-core`'s polyphase FIR chain.
 - [ ] **True-peak detector**:

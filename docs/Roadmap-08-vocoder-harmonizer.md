@@ -58,8 +58,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Phase 1: `rt-vox-core` (engine crate)
 
 - [ ] **Workspace layout**:
-  - `crates/rt-vox-core` — engine.
-  - `crates/rt-vox` — plugin.
+  - `rt-vox-core` — engine.
+  - `rt-vox` — plugin.
 - [ ] **Pitch tracker** (YIN or chosen):
   - Frame size, hop size, confidence output.
   - Off-RT-safe: uses only fixed-size scratch buffers.

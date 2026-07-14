@@ -55,8 +55,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Phase 1: `rt-adaptive-core` (engine crate)
 
 - [ ] **Workspace layout**:
-  - `crates/rt-adaptive-core` — engine.
-  - `crates/rt-adaptive` — plugin.
+  - `rt-adaptive-core` — engine.
+  - `rt-adaptive` — plugin.
 - [ ] **LMS / NLMS / RLS** primitives:
   - `AdaptiveFilter<const N: usize>` — fixed-length tap vector.
   - `update(&mut self, input: f32, error: f32)` — per-sample update.

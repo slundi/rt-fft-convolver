@@ -52,8 +52,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Phase 1: `rt-loudness-core` (engine crate)
 
 - [ ] **Workspace layout**:
-  - `crates/rt-loudness-core` — measurement engine.
-  - `crates/rt-loudness-meter` — plugin.
+  - `rt-loudness-core` — measurement engine.
+  - `rt-loudness-meter` — plugin.
 - [ ] **K-weighting filter** (BS.1770-4):
   - Two biquad stages (pre-filter + RLB high-pass).
   - Per-channel state.

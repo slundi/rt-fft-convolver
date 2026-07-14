@@ -61,8 +61,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Phase 1: `rt-spectral-core` (engine crate)
 
 - [ ] **Workspace layout**:
-  - `crates/rt-spectral-core` — algorithms.
-  - `crates/rt-spectral` — plugin(s).
+  - `rt-spectral-core` — algorithms.
+  - `rt-spectral` — plugin(s).
 - [ ] **STFT front-end**:
   - Windowed real FFT via `realfft`.
   - COLA-verified hop/window pair.

@@ -52,8 +52,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Phase 1: `rt-physical-core` (engine crate)
 
 - [ ] **Workspace layout**:
-  - `crates/rt-physical-core` — model primitives + voice manager.
-  - `crates/rt-physical` — plugin.
+  - `rt-physical-core` — model primitives + voice manager.
+  - `rt-physical` — plugin.
 - [ ] **Delay-line primitives**:
   - Fractional-delay (Lagrange or all-pass) for pitch-continuous
     waveguides.

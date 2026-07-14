@@ -56,8 +56,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Phase 1: `rt-pitch-core` (engine crate)
 
 - [ ] **Workspace layout**:
-  - `crates/rt-pitch-core` — algorithm.
-  - `crates/rt-pitch` — plugin.
+  - `rt-pitch-core` — algorithm.
+  - `rt-pitch` — plugin.
 - [ ] **Analysis / synthesis frame**:
   - Windowed STFT via `realfft`.
   - Hann or Blackman-Harris window (Hann default).

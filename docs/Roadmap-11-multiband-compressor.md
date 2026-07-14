@@ -65,8 +65,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 ## Phase 1: `rt-multiband-core` (engine crate)
 
 - [ ] **Workspace layout**:
-  - `crates/rt-multiband-core` — engine.
-  - `crates/rt-multiband` — plugin.
+  - `rt-multiband-core` — engine.
+  - `rt-multiband` — plugin.
 - [ ] **Crossover primitives**:
   - Linkwitz-Riley 4th-order biquad pairs.
   - Optional linear-phase FIR via `rt-fft-convolver`.
