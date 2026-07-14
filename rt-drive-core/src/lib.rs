@@ -22,6 +22,10 @@
 //!   [`ThreeBand`] (bass/mid/treble) tone stacks.
 //! - [`kernels`] — `pulp`-dispatched SIMD kernels (FIR dot product, soft-clip
 //!   block) backing the resampler and shaper hot paths.
+//! - [`stage`] — [`DriveStage`], the integrated engine wiring the above into
+//!   the full `↑ → drive → shape → ↓ → DC-block → tone` path (Phase 1).
+//! - [`pedal`] — [`PedalModel`], the data-driven preset descriptor, plus the
+//!   shipped [`pedal::PEDALS`] bank.
 //!
 //! # Real-time safety
 //!
@@ -42,12 +46,16 @@
 
 pub mod dc_block;
 pub mod kernels;
+pub mod pedal;
 pub mod resampler;
 pub mod shaper;
+pub mod stage;
 pub mod tone;
 
 pub use dc_block::DcBlocker;
 pub use kernels::Kernels;
+pub use pedal::{PEDALS, PedalModel, ToneConfig};
 pub use resampler::{Downsampler2x, Oversampler, Upsampler2x};
 pub use shaper::Shaper;
-pub use tone::{Baxandall, Biquad, ThreeBand};
+pub use stage::DriveStage;
+pub use tone::{Baxandall, Biquad, ThreeBand, ToneStack};

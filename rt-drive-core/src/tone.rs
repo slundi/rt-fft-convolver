@@ -253,6 +253,53 @@ impl ThreeBand {
     }
 }
 
+/// A live tone stack chosen at build time — the stateful counterpart of
+/// [`crate::pedal::ToneConfig`].
+///
+/// A [`crate::stage::DriveStage`] owns one of these; `Bypass` lets a pedal
+/// that models its tone elsewhere skip the filters entirely.
+#[derive(Debug, Clone, Copy)]
+pub enum ToneStack {
+    /// No tone shaping — a straight passthrough.
+    Bypass,
+    /// 2-band Baxandall shelving stack.
+    Baxandall(Baxandall),
+    /// 3-band bass/mid/treble stack.
+    ThreeBand(ThreeBand),
+}
+
+impl ToneStack {
+    /// Filter one sample. **Real-time safe.**
+    #[inline]
+    pub fn process_sample(&mut self, input: f32) -> f32 {
+        match self {
+            ToneStack::Bypass => input,
+            ToneStack::Baxandall(stack) => stack.process_sample(input),
+            ToneStack::ThreeBand(stack) => stack.process_sample(input),
+        }
+    }
+
+    /// Filter a block in place. **Real-time safe.**
+    #[inline]
+    pub fn process_block(&mut self, buffer: &mut [f32]) {
+        match self {
+            ToneStack::Bypass => {}
+            ToneStack::Baxandall(stack) => stack.process_block(buffer),
+            ToneStack::ThreeBand(stack) => stack.process_block(buffer),
+        }
+    }
+
+    /// Reset any filter state.
+    #[inline]
+    pub fn reset(&mut self) {
+        match self {
+            ToneStack::Bypass => {}
+            ToneStack::Baxandall(stack) => stack.reset(),
+            ToneStack::ThreeBand(stack) => stack.reset(),
+        }
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

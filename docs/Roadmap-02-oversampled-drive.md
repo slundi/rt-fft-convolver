@@ -90,17 +90,28 @@ Internal crate, reusable by other nonlinear-effect plugins.
 
 ## Phase 1: Engine integration
 
-- [ ] **`DriveStage` struct**:
-  - Owns: upsampler, shaper (fn pointer or enum dispatch), downsampler,
-    DC-blocker.
-  - `process_block(&mut self, in: &[f32], out: &mut [f32])` — RT-safe.
-- [ ] **`ShaperBank`**:
-  - Enum of shipped shapers with parameters (drive, asymmetry, bias).
-  - Data-driven so new shapers can be added without touching the
-    plugin code.
-- [ ] **Latency reporting**:
-  - Report 0 samples (FIR delays cancel between up- and down-leg).
-  - Verify with a unit-impulse round-trip.
+- [x] **`DriveStage` struct** (`stage.rs`):
+  - Owns `Oversampler`, `Shaper` (enum dispatch), `DcBlocker`, `ToneStack`,
+    plus pre-shaper gain+bias and post-shaper make-up gain.
+  - `process_block(&mut self, input, output)` — RT-safe (no alloc/lock/
+    panic; scratch pre-sized to `max_block × factor`).  Chain:
+    `↑ → ×gain → +bias → shaper → ↓ → ×level → DC-block → tone`, with the
+    nonlinearity inside the oversampled region.
+  - Built from a `PedalModel` via `from_model` / `with_design`; gains use
+    the shared `rt_fft_convolver::db_to_linear`.
+- [x] **`ShaperBank`** — realised as the data-driven `PedalModel` + the
+  `const PEDALS` bank (`pedal.rs`).  The `Shaper` enum already carries the
+  per-curve params (drive, asymmetry, bias); a pedal is pure data over the
+  shared engine, so new pedals need no engine change.
+- [x] **Latency reporting** (`DriveStage::latency_samples`):
+  - **Correction to the original note**: the linear-phase half-band cascade
+    is **not** 0 samples.  The up- and down-leg group delays *add* (they do
+    not cancel — "same on both legs" only means the filter is symmetric),
+    giving a non-zero integer latency reported for host compensation.
+    factor = 1 reports 0.  IIR DC-block/tone add phase, not reportable
+    latency.
+  - Measured once at construction via a unit-impulse round trip; a unit
+    test asserts the reported value matches the impulse peak (±1).
 
 ## Pedal model format (Phase 0/1)
 
@@ -127,17 +138,23 @@ pub struct PedalModel {
 }
 ```
 
+- [x] **`PedalModel` struct + shipped bank** implemented in `pedal.rs`
+  (`const PEDALS`, 5 presets: Clean Boost, Green Overdrive, Rodent
+  Distortion, Tube Warmth, Tape Saturator).  Tone carried as a data-only
+  `ToneConfig` (Bypass / Baxandall / ThreeBand) built into a live
+  `ToneStack` at construction.
 - [ ] **Authoring format**: human-editable `RON` or `TOML` curve set
-  under `pedals/`, deserialised via `serde`.
-- [ ] **Compile-time bake** (default, matches Phase 5 "ships in-plugin,
-  not external files"): a `build.rs` reads `pedals/*.toml` and codegens a
-  `static [PedalModel]` table.  Zero runtime cost, allocation-free on the
-  render thread.
+  under `pedals/`, deserialised via `serde`.  *(Deferred — the bank is a
+  hand-written `const` table for now.)*
+- [ ] **Compile-time bake from files**: a `build.rs` reads `pedals/*.toml`
+  and codegens the `static [PedalModel]` table.  *(Deferred; the `const`
+  table already gives the zero-runtime-cost, allocation-free property.)*
 - [ ] **Runtime-loadable** (deferred): same struct via `serde`, loaded
   off the audio thread into a double-buffered slot for user-authored
   pedals.
-- [ ] **Note**: `input_gain_db` / `output_gain_db` depend on the dB↔linear
-  helper listed in Prerequisites — resolve that decision first.
+- [x] **Note**: `input_gain_db` / `output_gain_db` use the shared
+  `rt_fft_convolver::db_to_linear` helper (Prerequisites decision resolved
+  — it lives in the root crate; `rt-drive-core` now depends on it).
 
 ## Phase 2: `rt-drive` plugin
 

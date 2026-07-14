@@ -14,3 +14,6 @@ categories = ["multimedia::audio"]
 # SSE/AVX2/AVX-512/NEON on stable Rust.  Same choice as `rt-neural-core`
 # (see its Phase 0 decision) so the two cores share one SIMD strategy.
 pulp = "0.22"
+# Shared dB↔linear gain helpers (Roadmap-02 Prerequisites decision: the
+# helper lives in the root crate so every plugin core reuses one copy).
+rt-fft-convolver = { path = ".." }
