@@ -1,0 +1,14 @@
+# Asymmetric triode-style warmth with a small even-harmonic bias.
+name = "Tube Warmth"
+input_gain_db = 6.0
+bias = 0.1
+output_gain_db = -3.0
+default_oversampling = 4
+
+[shaper]
+kind = "tube"
+
+[tone]
+kind = "baxandall"
+bass_db = 2.0
+treble_db = 1.0

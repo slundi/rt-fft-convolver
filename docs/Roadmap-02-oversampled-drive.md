@@ -139,19 +139,24 @@ pub struct PedalModel {
 ```
 
 - [x] **`PedalModel` struct + shipped bank** implemented in `pedal.rs`
-  (`const PEDALS`, 5 presets: Clean Boost, Green Overdrive, Rodent
-  Distortion, Tube Warmth, Tape Saturator).  Tone carried as a data-only
-  `ToneConfig` (Bypass / Baxandall / ThreeBand) built into a live
-  `ToneStack` at construction.
-- [ ] **Authoring format**: human-editable `RON` or `TOML` curve set
-  under `pedals/`, deserialised via `serde`.  *(Deferred — the bank is a
-  hand-written `const` table for now.)*
-- [ ] **Compile-time bake from files**: a `build.rs` reads `pedals/*.toml`
-  and codegens the `static [PedalModel]` table.  *(Deferred; the `const`
-  table already gives the zero-runtime-cost, allocation-free property.)*
-- [ ] **Runtime-loadable** (deferred): same struct via `serde`, loaded
-  off the audio thread into a double-buffered slot for user-authored
-  pedals.
+  (5 presets: Clean Boost, Green Overdrive, Rodent Distortion, Tube
+  Warmth, Tape Saturator).  Tone carried as a data-only `ToneConfig`
+  (Bypass / Baxandall / ThreeBand) built into a live `ToneStack` at
+  construction.
+- [x] **Authoring format** — [decision] **TOML via `toml-span`** (not
+  `serde`/RON).  Pedals live in `pedals/*.toml`; `toml-span`'s byte-offset
+  spans give IDE-style `PedalLoadError`s on hand-edited files.  Manual
+  `ValueInner`-walking parser with range validation; `[shaper]`/`[tone]`
+  tables tagged by a `kind` string.
+- [x] **Ships in-plugin**: the shipped `pedals/*.toml` are
+  `include_str!`-embedded and parsed once at start-up by `shipped_pedals()`
+  — no external files at run time, allocation-free render path.  (Chosen
+  over a `build.rs` const bake so TOML stays the single source of truth
+  and the same parser serves user pedals.)
+- [ ] **Runtime-loadable user pedals**: `PedalModel::from_toml_str` already
+  parses arbitrary documents; the remaining piece — discovering a user
+  pedal directory (XDG) and a double-buffered hot-swap slot — is
+  **deferred to Phase 2** (plugin).
 - [x] **Note**: `input_gain_db` / `output_gain_db` use the shared
   `rt_fft_convolver::db_to_linear` helper (Prerequisites decision resolved
   — it lives in the root crate; `rt-drive-core` now depends on it).

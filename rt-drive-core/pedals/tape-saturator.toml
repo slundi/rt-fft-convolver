@@ -1,0 +1,13 @@
+# Bias-shifted tanh tape saturation, no tone shaping.
+name = "Tape Saturator"
+input_gain_db = 3.0
+bias = 0.0
+output_gain_db = 0.0
+default_oversampling = 2
+
+[shaper]
+kind = "tape"
+bias = 0.2
+
+[tone]
+kind = "bypass"

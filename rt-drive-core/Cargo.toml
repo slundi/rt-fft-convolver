@@ -17,3 +17,9 @@ pulp = "0.22"
 # Shared dB↔linear gain helpers (Roadmap-02 Prerequisites decision: the
 # helper lives in the root crate so every plugin core reuses one copy).
 rt-fft-convolver = { path = ".." }
+# Span-aware TOML parser for the pedal authoring format ([decision]): gives
+# byte-offset diagnostics on hand-edited pedal files.  Manual ValueInner
+# walking — no serde.
+toml-span = "0.7"
+# Structured, span-carrying pedal-load error type.
+thiserror = "2"

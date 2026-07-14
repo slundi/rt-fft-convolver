@@ -205,7 +205,7 @@ fn measure_oversampler_latency(oversampler: &mut Oversampler, max_block: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pedal::{PEDALS, ToneConfig};
+    use crate::pedal::{ToneConfig, shipped_pedals};
     use std::f32::consts::TAU;
 
     const SAMPLE_RATE: f32 = 48_000.0;
@@ -217,7 +217,7 @@ mod tests {
 
     fn model(shaper: Shaper, oversampling: u8) -> PedalModel {
         PedalModel {
-            name: "Test",
+            name: "Test".to_string(),
             input_gain_db: 0.0,
             shaper,
             bias: 0.0,
@@ -235,7 +235,7 @@ mod tests {
     /// long enough for the blocker to settle, then check the final block.
     #[test]
     fn silence_in_silence_out() {
-        for pedal in PEDALS {
+        for pedal in &shipped_pedals().unwrap() {
             let (atten, transition) = light();
             let mut stage = DriveStage::with_design(pedal, SAMPLE_RATE, 64, atten, transition);
             let input = vec![0.0f32; 64];
@@ -254,7 +254,7 @@ mod tests {
     /// Output stays finite and bounded for a hot input, for every pedal.
     #[test]
     fn hot_input_stays_bounded() {
-        for pedal in PEDALS {
+        for pedal in &shipped_pedals().unwrap() {
             let (atten, transition) = light();
             let mut stage = DriveStage::with_design(pedal, SAMPLE_RATE, 256, atten, transition);
             let input: Vec<f32> = (0..256)
@@ -329,7 +329,7 @@ mod tests {
     fn dc_blocker_removes_bias_offset() {
         let (atten, transition) = light();
         let pedal = PedalModel {
-            name: "Biased",
+            name: "Biased".to_string(),
             input_gain_db: 6.0,
             shaper: Shaper::Tube,
             bias: 0.3,

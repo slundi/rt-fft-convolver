@@ -1,0 +1,16 @@
+# ProCo-Rat-style hard, buzzy distortion.
+name = "Rodent Distortion"
+input_gain_db = 20.0
+bias = 0.05
+output_gain_db = -10.0
+default_oversampling = 8
+
+[shaper]
+kind = "hard_clip"
+threshold = 0.7
+asymmetry = 0.2
+
+[tone]
+kind = "baxandall"
+bass_db = -2.0
+treble_db = 3.0

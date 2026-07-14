@@ -24,8 +24,8 @@
 //!   block) backing the resampler and shaper hot paths.
 //! - [`stage`] — [`DriveStage`], the integrated engine wiring the above into
 //!   the full `↑ → drive → shape → ↓ → DC-block → tone` path (Phase 1).
-//! - [`pedal`] — [`PedalModel`], the data-driven preset descriptor, plus the
-//!   shipped [`pedal::PEDALS`] bank.
+//! - [`pedal`] — [`PedalModel`], the TOML-authored preset descriptor, plus
+//!   the shipped bank via [`pedal::shipped_pedals`].
 //!
 //! # Real-time safety
 //!
@@ -54,7 +54,7 @@ pub mod tone;
 
 pub use dc_block::DcBlocker;
 pub use kernels::Kernels;
-pub use pedal::{PEDALS, PedalModel, ToneConfig};
+pub use pedal::{PedalLoadError, PedalModel, ToneConfig, shipped_pedals};
 pub use resampler::{Downsampler2x, Oversampler, Upsampler2x};
 pub use shaper::Shaper;
 pub use stage::DriveStage;
