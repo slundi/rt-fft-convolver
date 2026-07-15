@@ -268,14 +268,33 @@ feature.  16 unit + integration tests; `cargo fmt`/`clippy` clean (default and
   in `initialize` since the FFT size is fixed at the Phase-0 "Studio" default
   (2048).  Transient soft-bypass runs with its Phase-0 defaults (always on).
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
-- [ ] **Real-time spectrogram** (last N seconds) — highest-value UI
-  feature for this plugin class.
-- [ ] **Noise-profile display** overlaid on the spectrum.
-- [ ] **Per-mode enable / bypass indicators**.
-- [ ] **Metering**: input, output, gain reduction (per operator).
+Implemented behind the `gui` feature (`cargo build -p rt-spectral --features
+gui`), mirroring the `rt-pitch` split: all pure, framework-agnostic UI logic
+lives in `rt-spectral/src/ui.rs` (log-frequency down-sampling, dB / intensity
+mapping, the `Spectrogram` history ring, `Meter` ballistics, formatters) and is
+unit-tested without `egui`; the `egui` drawing is a thin `gui`-gated layer in
+`plugin.rs`.  The audio thread feeds the editor a per-block [`TelemetryFrame`]
+(down-sampled output spectrum + aggregated meters + Learn progress) over a
+lock-free `triple_buffer`; the noise-profile overlay is read from the controller
+under its mutex on the editor thread.  New engine telemetry (`EngineMeters`,
+`spectrum_magnitude()`) added to `rt-spectral-core`.
+
+- **`nih-plug-egui`** — **decision**: `egui`, matching the `rt-pitch` /
+  `rt-drive` editors (shared idioms, one UI toolkit across the suite).
+- **Real-time spectrogram** (scrolling, newest at the right, log-frequency
+  Y axis) — rendered from the `Spectrogram` ring into an `egui` texture.
+- **Noise-profile display** overlaid on a spectrum plot (current output
+  spectrum in the accent colour, learned profile overlaid).
+- **Per-mode enable indicators** — a row of five dots lit per operator's
+  enable flag; the `Bypass` toggle sits in the header.
+- **Metering**: input, output, and per-operator gain reduction (denoise /
+  gate / compressor), each measured in the core engine from spectral energy
+  around each operator and smoothed with peak-hold + decay ballistics.
+- ⚠️ The `gui` feature needs system `gl` / `x11` (via `nih-plug-egui`), so it is
+  built in CI / on a desktop, not in the headless dev shell — identical to the
+  other plugins' editors.  Default / `nih` builds and all tests stay offline.
 
 ## Phase 4: Testing
 

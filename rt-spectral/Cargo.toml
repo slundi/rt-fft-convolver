@@ -15,9 +15,10 @@ crate-type = ["lib", "cdylib"]
 [features]
 # The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
 # Build the actual plugin with `cargo build -p rt-spectral --features nih`.
-# The nih-plug-egui editor (spectrogram, profile overlay) lands in Phase 3.
+# `gui` adds the nih-plug-egui editor (spectrogram, profile overlay, meters).
 default = []
 nih = ["dep:nih_plug"]
+gui = ["nih", "dep:nih_plug_egui"]
 
 [dependencies]
 # The spectral DSP engine (STFT front-end + per-bin / time-domain operators).
@@ -30,3 +31,4 @@ triple_buffer = "8.1"
 
 # nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

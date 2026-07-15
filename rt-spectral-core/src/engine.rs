@@ -74,6 +74,27 @@ impl Default for SpectralParams {
     }
 }
 
+/// Level / gain-reduction telemetry for one processed block, for the Phase-3
+/// editor's meters.  All fields are in dB; gain-reduction values are `<= 0`
+/// (`0` = the operator is disabled or transparent this block).  Cheap to copy.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EngineMeters {
+    /// Input RMS level in dBFS over the block (`-inf`-floored to [`METER_FLOOR_DB`]).
+    pub input_db: f32,
+    /// Output (post-mix) RMS level in dBFS over the block.
+    pub output_db: f32,
+    /// Mean spectral gain reduction applied by the denoiser, in dB (`<= 0`).
+    pub gr_denoise_db: f32,
+    /// Mean spectral gain reduction applied by the gate, in dB (`<= 0`).
+    pub gr_gate_db: f32,
+    /// Mean spectral gain reduction applied by the compressor, in dB (`<= 0`).
+    pub gr_compress_db: f32,
+}
+
+/// Floor for the level / gain-reduction meters — quieter than this reads as
+/// "silence" and clamps here rather than diverging to `-inf`.
+pub const METER_FLOOR_DB: f32 = -120.0;
+
 /// Single-channel spectral processor.
 pub struct SpectralEngine {
     sample_rate: u32,
@@ -105,6 +126,20 @@ pub struct SpectralEngine {
     spectrum: Vec<Complex<f32>>, // half-spectrum (N/2 + 1)
     work: Vec<f32>,              // wet working buffer (<= max_block)
     dry: Vec<f32>,               // delayed dry buffer (<= max_block)
+
+    // ── Telemetry (Phase-3 editor); updated every block, never read on the
+    //    audio thread beyond the cheap accumulation below. ──
+    /// Most recent processed frame's output magnitude spectrum (`N/2 + 1`).
+    last_mag: Vec<f32>,
+    /// Per-block accumulators for the input / output RMS meters.
+    in_energy: f64,
+    out_energy: f64,
+    meter_samples: usize,
+    /// Per-block accumulators for the mean per-operator gain reduction (dB).
+    gr_denoise_sum: f32,
+    gr_gate_sum: f32,
+    gr_compress_sum: f32,
+    gr_frames: usize,
 }
 
 impl SpectralEngine {
@@ -176,6 +211,14 @@ impl SpectralEngine {
             spectrum: vec![Complex::default(); num_bins],
             work: vec![0.0; max_block],
             dry: vec![0.0; max_block],
+            last_mag: vec![0.0; num_bins],
+            in_energy: 0.0,
+            out_energy: 0.0,
+            meter_samples: 0,
+            gr_denoise_sum: 0.0,
+            gr_gate_sum: 0.0,
+            gr_compress_sum: 0.0,
+            gr_frames: 0,
         }
     }
 
@@ -209,6 +252,40 @@ impl SpectralEngine {
         self.spectrum.len()
     }
 
+    /// Most recent processed frame's **output** magnitude spectrum (`N/2 + 1`
+    /// bins).  Updated once per frame; holds the last value across blocks that
+    /// produced no frame.  For the Phase-3 spectrogram / spectrum display.
+    #[inline]
+    pub fn spectrum_magnitude(&self) -> &[f32] {
+        &self.last_mag
+    }
+
+    /// Level / gain-reduction telemetry for the block just processed (all in
+    /// dB).  Values are `0` before the first block.  For the Phase-3 meters.
+    pub fn meters(&self) -> EngineMeters {
+        let rms_db = |energy: f64, samples: usize| {
+            if samples == 0 {
+                return METER_FLOOR_DB;
+            }
+            let rms = (energy / samples as f64).sqrt() as f32;
+            (20.0 * rms.max(1e-12).log10()).max(METER_FLOOR_DB)
+        };
+        let mean = |sum: f32, frames: usize| {
+            if frames == 0 {
+                0.0
+            } else {
+                sum / frames as f32
+            }
+        };
+        EngineMeters {
+            input_db: rms_db(self.in_energy, self.meter_samples),
+            output_db: rms_db(self.out_energy, self.meter_samples),
+            gr_denoise_db: mean(self.gr_denoise_sum, self.gr_frames),
+            gr_gate_db: mean(self.gr_gate_sum, self.gr_frames),
+            gr_compress_db: mean(self.gr_compress_sum, self.gr_frames),
+        }
+    }
+
     /// Flush every internal delay line, envelope and SNR memory to silence.
     /// The dry-delay priming is restored so latency stays correct.
     pub fn reset(&mut self) {
@@ -225,6 +302,21 @@ impl SpectralEngine {
         for _ in 0..self.latency {
             self.dry_delay.push(0.0);
         }
+        self.last_mag.fill(0.0);
+        self.reset_meters();
+    }
+
+    /// Zero the per-block meter accumulators (called at the top of every
+    /// [`process_block`](Self::process_block)).
+    #[inline]
+    fn reset_meters(&mut self) {
+        self.in_energy = 0.0;
+        self.out_energy = 0.0;
+        self.meter_samples = 0;
+        self.gr_denoise_sum = 0.0;
+        self.gr_gate_sum = 0.0;
+        self.gr_compress_sum = 0.0;
+        self.gr_frames = 0;
     }
 
     /// Process one host block: `input` → `output` (equal length, may alias
@@ -236,6 +328,10 @@ impl SpectralEngine {
     pub fn process_block(&mut self, input: &[f32], output: &mut [f32], params: &SpectralParams) {
         debug_assert_eq!(input.len(), output.len());
         let _guard = DenormalGuard::new();
+
+        // Telemetry is per-block: clear the accumulators, then each chunk adds
+        // into them (see `process_chunk`).
+        self.reset_meters();
 
         let mut offset = 0;
         while offset < input.len() {
@@ -253,6 +349,10 @@ impl SpectralEngine {
     fn process_chunk(&mut self, input: &[f32], output: &mut [f32], params: &SpectralParams) {
         let n = input.len();
         let win = self.window.as_slice();
+
+        // Input level meter: accumulate the dry input energy for this chunk.
+        self.in_energy += input.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+        self.meter_samples += n;
 
         // --- Wet path -------------------------------------------------------
         // Time-domain click repair (always imposes its delay; repairs only when
@@ -272,16 +372,32 @@ impl SpectralEngine {
             // Transient soft-bypass depth from spectral flux (Phase 0).
             let depth = self.transient.observe(&self.spectrum, &params.transient);
 
-            // Per-bin chain: denoise → gate → compress.
+            // Per-bin chain: denoise → gate → compress.  Spectral energy is
+            // sampled around each operator so the editor can meter per-operator
+            // gain reduction (a power ratio → `10·log10`).
+            let e_pre = spectrum_energy(&self.spectrum);
             self.denoiser.process(
                 &mut self.spectrum,
                 &params.denoise,
                 self.profile.current(),
                 depth,
             );
+            let e_denoise = spectrum_energy(&self.spectrum);
             self.gate.process(&mut self.spectrum, &params.gate);
+            let e_gate = spectrum_energy(&self.spectrum);
             self.comp
                 .process(&mut self.spectrum, &params.compress, depth);
+            let e_comp = spectrum_energy(&self.spectrum);
+
+            self.gr_denoise_sum += gain_reduction_db(e_pre, e_denoise);
+            self.gr_gate_sum += gain_reduction_db(e_denoise, e_gate);
+            self.gr_compress_sum += gain_reduction_db(e_gate, e_comp);
+            self.gr_frames += 1;
+
+            // Latest output magnitude spectrum for the spectrogram / display.
+            for (dst, bin) in self.last_mag.iter_mut().zip(self.spectrum.iter()) {
+                *dst = bin.norm();
+            }
 
             self.fft.inverse(&mut self.spectrum, &mut self.frame);
             // Synthesis window (→ Hann² weighting, compensated by the COLA norm).
@@ -314,6 +430,28 @@ impl SpectralEngine {
                 (d * (1.0 - mix) + w * mix) * out_gain
             };
         }
+
+        // Output level meter: accumulate the post-mix output energy.
+        self.out_energy += output.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+    }
+}
+
+/// Total energy (`Σ |X(k)|²`) of a half-spectrum.
+#[inline]
+fn spectrum_energy(spectrum: &[Complex<f32>]) -> f32 {
+    spectrum.iter().map(|bin| bin.norm_sqr()).sum()
+}
+
+/// Gain reduction from `before` → `after` spectral energy, in dB (`<= 0`),
+/// floored at [`METER_FLOOR_DB`].  A non-reducing (or amplifying) step reports
+/// `0`; a silent input reports `0` (nothing to reduce).
+#[inline]
+fn gain_reduction_db(before: f32, after: f32) -> f32 {
+    if before <= 0.0 || after >= before {
+        0.0
+    } else {
+        // Power ratio → 10·log10; already known `< 1`, so the result is `< 0`.
+        (10.0 * (after / before).log10()).max(METER_FLOOR_DB)
     }
 }
 
@@ -458,5 +596,109 @@ mod tests {
         eng.reset();
         eng.process_block(&block, &mut out, &params);
         assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn gain_reduction_db_is_monotone_and_bounded() {
+        // No reduction (or amplification) → 0 dB.
+        assert_eq!(gain_reduction_db(0.0, 5.0), 0.0);
+        assert_eq!(gain_reduction_db(4.0, 4.0), 0.0);
+        assert_eq!(gain_reduction_db(4.0, 8.0), 0.0);
+        // Halving the power ≈ −3 dB.
+        let gr = gain_reduction_db(1.0, 0.5);
+        assert!((gr + 3.01).abs() < 0.05, "half-power GR = {gr}");
+        // Silence floors, never diverges.
+        assert_eq!(gain_reduction_db(1.0, 0.0), METER_FLOOR_DB);
+    }
+
+    /// The input meter tracks a known-RMS signal; with all operators off the
+    /// output meter matches it (delayed pass-through, same long-run level) and
+    /// no gain reduction is reported.
+    #[test]
+    fn meters_track_levels_and_zero_gr_when_disabled() {
+        let mut eng = engine(1024, 256);
+        let params = SpectralParams::default();
+
+        // Full-scale 0.5-amplitude sine: RMS = 0.5/√2 ≈ 0.3536 → ≈ −9.03 dBFS.
+        let block: Vec<f32> = (0..256)
+            .map(|n| 0.5 * (2.0 * PI * 5.0 * n as f32 / 256.0).sin())
+            .collect();
+        let mut out = vec![0.0f32; 256];
+        for _ in 0..64 {
+            eng.process_block(&block, &mut out, &params);
+        }
+        let meters = eng.meters();
+        assert!(
+            (meters.input_db + 9.03).abs() < 0.5,
+            "input meter {} dB",
+            meters.input_db
+        );
+        // All bin operators disabled → no gain reduction.
+        assert_eq!(meters.gr_denoise_db, 0.0);
+        assert_eq!(meters.gr_gate_db, 0.0);
+        assert_eq!(meters.gr_compress_db, 0.0);
+        // Output settled to the same level as the (delayed) input.
+        assert!(
+            (meters.output_db - meters.input_db).abs() < 1.0,
+            "in {} out {}",
+            meters.input_db,
+            meters.output_db
+        );
+    }
+
+    /// A silent input floors both level meters.
+    #[test]
+    fn meters_floor_on_silence() {
+        let mut eng = engine(512, 128);
+        let params = SpectralParams::default();
+        let silence = vec![0.0f32; 128];
+        let mut out = vec![0.0f32; 128];
+        eng.process_block(&silence, &mut out, &params);
+        let meters = eng.meters();
+        assert_eq!(meters.input_db, METER_FLOOR_DB);
+        assert_eq!(meters.output_db, METER_FLOOR_DB);
+    }
+
+    /// An engaged gate on a low-level broadband input reports a negative gain
+    /// reduction, and the exposed magnitude spectrum is populated.
+    #[test]
+    fn gate_reports_reduction_and_magnitude_is_exposed() {
+        let mut eng = engine(1024, 256);
+        let params = SpectralParams {
+            gate: GateParams {
+                enabled: true,
+                threshold_db: -20.0, // above the quiet noise floor → bins gate
+                range_db: 48.0,
+                attack_ms: 1.0,
+                release_ms: 10.0,
+            },
+            transient: TransientParams {
+                enabled: false,
+                ..TransientParams::default()
+            },
+            ..SpectralParams::default()
+        };
+        // Low-level broadband noise spreads energy across bins, each sitting
+        // below the threshold so the expander attenuates them.
+        let mut state = 0x9E37_79B9u32;
+        let mut noise = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            0.01 * ((state as f32 / u32::MAX as f32) * 2.0 - 1.0)
+        };
+        let mut out = vec![0.0f32; 256];
+        for _ in 0..64 {
+            let block: Vec<f32> = (0..256).map(|_| noise()).collect();
+            eng.process_block(&block, &mut out, &params);
+        }
+        assert!(
+            eng.meters().gr_gate_db < -0.3,
+            "gate GR = {}",
+            eng.meters().gr_gate_db
+        );
+        // Magnitude spectrum has the expected length and holds finite values.
+        assert_eq!(eng.spectrum_magnitude().len(), 1024 / 2 + 1);
+        assert!(eng.spectrum_magnitude().iter().all(|m| m.is_finite()));
     }
 }

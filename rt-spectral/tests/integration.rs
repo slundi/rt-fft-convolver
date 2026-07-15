@@ -21,7 +21,7 @@ fn rms(buf: &[f32]) -> f32 {
 
 /// Run a mono signal through the processor in `BLOCK`-sized chunks.
 fn run_mono(signal: &[f32], params: &SpectralParams) -> Vec<f32> {
-    let (_controller, mut processor) = spectral_engine(SR, FFT, BLOCK, 1);
+    let (_controller, mut processor, _telemetry) = spectral_engine(SR, FFT, BLOCK, 1);
     let mut out = vec![0.0f32; signal.len()];
     for (chunk_in, chunk_out) in signal.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
         let mut block = chunk_in.to_vec();
@@ -71,7 +71,7 @@ fn hum_notch_attenuates_mains_tone() {
 /// pass-through, delayed by exactly the reported latency.
 #[test]
 fn all_operators_off_reconstructs_input() {
-    let (_controller, processor) = spectral_engine(SR, FFT, BLOCK, 1);
+    let (_controller, processor, _telemetry) = spectral_engine(SR, FFT, BLOCK, 1);
     let lat = processor.latency_samples();
     drop(processor);
 
@@ -115,7 +115,7 @@ fn output_gain_scales_signal() {
 /// Every operator enabled at once renders finite, non-exploding stereo output.
 #[test]
 fn all_operators_on_is_stable_stereo() {
-    let (_controller, mut processor) = spectral_engine(SR, FFT, BLOCK, 2);
+    let (_controller, mut processor, _telemetry) = spectral_engine(SR, FFT, BLOCK, 2);
 
     let params = clamp_params(SpectralParams {
         denoise: rt_spectral::spectral_core::DenoiseParams {
@@ -179,7 +179,7 @@ fn all_operators_on_is_stable_stereo() {
 /// noise, learn off-thread, then denoise pulls a fresh noise floor down.
 #[test]
 fn learn_round_trip_denoises() {
-    let (mut controller, mut processor) = spectral_engine(SR, FFT, BLOCK, 1);
+    let (mut controller, mut processor, _telemetry) = spectral_engine(SR, FFT, BLOCK, 1);
 
     let mut state = 0xC0FF_EE01u32;
     let mut noise = || {

@@ -31,11 +31,57 @@
 //! [`SpectralProcessor::latency_samples`].
 
 use rt_spectral_core::{
-    NoiseProfile, ProfileSender, SpectralEngine, SpectralParams, learn_profile, profile_channel,
+    EngineMeters, METER_FLOOR_DB, NoiseProfile, ProfileSender, SpectralEngine, SpectralParams,
+    learn_profile, profile_channel,
 };
 use triple_buffer::{Input, Output, TripleBuffer};
 
 use crate::params::{MAX_LEARN_MS, learn_samples};
+use crate::ui::{SPECTROGRAM_BINS, downsample_log};
+
+/// A snapshot of the audio thread's state for the Phase-3 editor, published
+/// once per block through a lock-free [`triple_buffer`].  Cloned three times at
+/// construction so publishing it (writing in place) never reallocates.
+#[derive(Clone, Debug)]
+pub struct TelemetryFrame {
+    /// Latest output magnitude spectrum, down-sampled to [`SPECTROGRAM_BINS`]
+    /// log-spaced display bins (linear magnitude).
+    pub spectrum: Vec<f32>,
+    /// Aggregated level / gain-reduction meters (loudest channel; deepest
+    /// gain reduction).
+    pub meters: EngineMeters,
+    /// `true` while a Learn capture is recording.
+    pub learning: bool,
+    /// Learn capture progress in `0.0..=1.0` (meaningful only while learning).
+    pub learn_progress: f32,
+}
+
+impl TelemetryFrame {
+    fn empty() -> Self {
+        Self {
+            spectrum: vec![0.0; SPECTROGRAM_BINS],
+            meters: EngineMeters::default(),
+            learning: false,
+            learn_progress: 0.0,
+        }
+    }
+}
+
+/// Editor-thread reader of the audio-thread [`TelemetryFrame`] stream.
+///
+/// Held by the plugin and shared into the `egui` editor; [`latest`](Self::latest)
+/// is a wait-free read of the freshest published frame.
+pub struct SpectralTelemetry {
+    output: Output<TelemetryFrame>,
+}
+
+impl SpectralTelemetry {
+    /// The freshest published telemetry frame.
+    #[inline]
+    pub fn latest(&mut self) -> &TelemetryFrame {
+        self.output.read()
+    }
+}
 
 /// Fixed-capacity mono capture clip handed audio → control for `Learn`.
 ///
@@ -58,6 +104,9 @@ pub struct SpectralController {
     capture: Output<CaptureClip>,
     /// One profile publisher per channel (all receive the same profile).
     profile_senders: Vec<ProfileSender>,
+    /// The most recently learned profile, retained for the editor's overlay
+    /// (read on the editor thread under the controller's mutex — never RT).
+    last_profile: NoiseProfile,
     fft_size: usize,
     hop: usize,
 }
@@ -80,6 +129,7 @@ impl SpectralController {
         for sender in &mut self.profile_senders {
             sender.publish(profile.clone());
         }
+        self.last_profile = profile;
         true
     }
 
@@ -87,6 +137,14 @@ impl SpectralController {
     #[inline]
     pub fn fft_size(&self) -> usize {
         self.fft_size
+    }
+
+    /// Per-bin power of the most recently learned noise profile (`N/2 + 1`
+    /// bins; all-zero until the first successful [`learn`](Self::learn)).  For
+    /// the editor's noise-profile overlay — read off the audio thread.
+    #[inline]
+    pub fn profile_power(&self) -> &[f32] {
+        self.last_profile.power()
     }
 }
 
@@ -97,6 +155,8 @@ pub struct SpectralProcessor {
     engines: Vec<SpectralEngine>,
     /// Producer side of the audio → control Learn capture hand-off.
     capture: Input<CaptureClip>,
+    /// Producer side of the audio → editor telemetry hand-off.
+    telemetry: Input<TelemetryFrame>,
     /// Scratch input copy so each engine can render in place (`process_block`
     /// needs disjoint input/output slices).
     io_scratch: Vec<f32>,
@@ -170,6 +230,49 @@ impl SpectralProcessor {
                 offset += chunk;
             }
         }
+
+        self.publish_telemetry();
+    }
+
+    /// Publish this block's spectrogram column + meters + learn progress to the
+    /// editor.  Writes the pre-sized telemetry slot in place (no allocation).
+    fn publish_telemetry(&mut self) {
+        let meters = self.aggregate_meters();
+        let learning = self.capturing;
+        let progress = if self.capture_target == 0 {
+            0.0
+        } else {
+            (self.capture_pos as f32 / self.capture_target as f32).clamp(0.0, 1.0)
+        };
+        // Channel 0 drives the spectrogram display.
+        let mag = self.engines[0].spectrum_magnitude();
+        let frame = self.telemetry.input_buffer_mut();
+        downsample_log(mag, &mut frame.spectrum);
+        frame.meters = meters;
+        frame.learning = learning;
+        frame.learn_progress = progress;
+        self.telemetry.publish();
+    }
+
+    /// Aggregate per-channel meters into one: loudest level, deepest gain
+    /// reduction.
+    fn aggregate_meters(&self) -> EngineMeters {
+        let mut agg = EngineMeters {
+            input_db: METER_FLOOR_DB,
+            output_db: METER_FLOOR_DB,
+            gr_denoise_db: 0.0,
+            gr_gate_db: 0.0,
+            gr_compress_db: 0.0,
+        };
+        for engine in &self.engines {
+            let meters = engine.meters();
+            agg.input_db = agg.input_db.max(meters.input_db);
+            agg.output_db = agg.output_db.max(meters.output_db);
+            agg.gr_denoise_db = agg.gr_denoise_db.min(meters.gr_denoise_db);
+            agg.gr_gate_db = agg.gr_gate_db.min(meters.gr_gate_db);
+            agg.gr_compress_db = agg.gr_compress_db.min(meters.gr_compress_db);
+        }
+        agg
     }
 
     /// Record the mono-summed input block into the capture producer slot.
@@ -229,7 +332,7 @@ pub fn spectral_engine(
     fft_size: usize,
     max_block: usize,
     channels: usize,
-) -> (SpectralController, SpectralProcessor) {
+) -> (SpectralController, SpectralProcessor, SpectralTelemetry) {
     assert!(channels > 0, "channels must be > 0");
     let hop = fft_size / 4;
     let num_bins = fft_size / 2 + 1;
@@ -243,6 +346,7 @@ pub fn spectral_engine(
         len: 0,
     };
     let (capture_in, capture_out) = TripleBuffer::new(&seed).split();
+    let (telemetry_in, telemetry_out) = TripleBuffer::new(&TelemetryFrame::empty()).split();
 
     let mut engines = Vec::with_capacity(channels);
     let mut profile_senders = Vec::with_capacity(channels);
@@ -261,12 +365,14 @@ pub fn spectral_engine(
     let controller = SpectralController {
         capture: capture_out,
         profile_senders,
+        last_profile: NoiseProfile::silent(num_bins),
         fft_size,
         hop,
     };
     let processor = SpectralProcessor {
         engines,
         capture: capture_in,
+        telemetry: telemetry_in,
         io_scratch: vec![0.0; max_block],
         max_block,
         capturing: false,
@@ -275,7 +381,10 @@ pub fn spectral_engine(
         pending_learn: false,
         latency,
     };
-    (controller, processor)
+    let telemetry = SpectralTelemetry {
+        output: telemetry_out,
+    };
+    (controller, processor, telemetry)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -312,7 +421,7 @@ mod tests {
 
     #[test]
     fn builds_and_renders_stereo() {
-        let (_controller, mut processor) = spectral_engine(SR, FFT, 128, 2);
+        let (_controller, mut processor, _telemetry) = spectral_engine(SR, FFT, 128, 2);
         assert_eq!(processor.channels(), 2);
         let params = SpectralParams::default();
         let mut left = vec![0.1f32; 128];
@@ -327,7 +436,7 @@ mod tests {
 
     #[test]
     fn latency_is_frame_plus_click() {
-        let (controller, processor) = spectral_engine(SR, 2048, 256, 2);
+        let (controller, processor, _telemetry) = spectral_engine(SR, 2048, 256, 2);
         assert_eq!(controller.fft_size(), 2048);
         // One full frame (2048) plus the 5-tap click despiker delay (2).
         assert_eq!(processor.latency_samples(), 2048 + 2);
@@ -339,7 +448,7 @@ mod tests {
             bypass: true,
             ..SpectralParams::default()
         };
-        let (_controller, mut processor) = spectral_engine(SR, FFT, 256, 1);
+        let (_controller, mut processor, _telemetry) = spectral_engine(SR, FFT, 256, 1);
         let lat = processor.latency_samples();
 
         let input: Vec<f32> = (0..8192)
@@ -365,7 +474,7 @@ mod tests {
     #[test]
     fn learn_capture_then_denoise_reduces_noise() {
         let block_size = 256;
-        let (mut controller, mut processor) = spectral_engine(SR, FFT, block_size, 1);
+        let (mut controller, mut processor, _telemetry) = spectral_engine(SR, FFT, block_size, 1);
 
         let mut noise = noise_source(0.1);
 
@@ -416,14 +525,14 @@ mod tests {
     /// Without a completed capture the controller has nothing to learn.
     #[test]
     fn learn_without_capture_is_noop() {
-        let (mut controller, _processor) = spectral_engine(SR, FFT, 128, 1);
+        let (mut controller, _processor, _telemetry) = spectral_engine(SR, FFT, 128, 1);
         assert!(!controller.learn());
     }
 
     #[test]
     fn begin_learn_clamps_to_capacity_and_completes() {
         let block_size = 512;
-        let (_controller, mut processor) = spectral_engine(SR, FFT, block_size, 1);
+        let (_controller, mut processor, _telemetry) = spectral_engine(SR, FFT, block_size, 1);
         // Ask for far more than the buffer holds; it is clamped and still ends.
         processor.begin_learn(usize::MAX);
         assert!(processor.is_capturing());
@@ -445,7 +554,7 @@ mod tests {
 
     #[test]
     fn reset_cancels_capture_and_clears_flag() {
-        let (_controller, mut processor) = spectral_engine(SR, FFT, 128, 1);
+        let (_controller, mut processor, _telemetry) = spectral_engine(SR, FFT, 128, 1);
         processor.begin_learn(FFT * 8);
         assert!(processor.is_capturing());
         processor.reset();
@@ -456,7 +565,7 @@ mod tests {
     #[test]
     fn stereo_capture_learns_from_both_channels() {
         let block_size = 256;
-        let (mut controller, mut processor) = spectral_engine(SR, FFT, block_size, 2);
+        let (mut controller, mut processor, _telemetry) = spectral_engine(SR, FFT, block_size, 2);
         processor.begin_learn(FFT * 16);
 
         let mut noise = noise_source(0.1);
@@ -476,5 +585,96 @@ mod tests {
         assert!(completed);
         // Both channels receive the published profile.
         assert!(controller.learn());
+    }
+
+    /// The telemetry hand-off reports the output level and a populated
+    /// spectrogram column after audio has flowed.
+    #[test]
+    fn telemetry_reports_levels_and_spectrum() {
+        let (_controller, mut processor, mut telemetry) = spectral_engine(SR, FFT, 256, 1);
+        let params = SpectralParams::default();
+        for block_index in 0..40 {
+            let mut block: Vec<f32> = (0..256)
+                .map(|k| {
+                    let t = (block_index * 256 + k) as f32 / SR as f32;
+                    0.4 * (TAU * 440.0 * t).sin()
+                })
+                .collect();
+            let mut channels: [&mut [f32]; 1] = [&mut block];
+            processor.process(&mut channels, &params);
+        }
+        let frame = telemetry.latest();
+        assert_eq!(frame.spectrum.len(), crate::ui::SPECTROGRAM_BINS);
+        assert!(
+            frame.spectrum.iter().any(|&m| m > 0.0),
+            "spectrogram column is empty"
+        );
+        assert!(
+            frame.meters.output_db > METER_FLOOR_DB,
+            "output meter did not register: {}",
+            frame.meters.output_db
+        );
+        assert!(!frame.learning);
+    }
+
+    /// While a Learn capture runs the telemetry reports progress; it clears
+    /// once the capture completes.
+    #[test]
+    fn telemetry_tracks_learn_progress() {
+        let block_size = 256;
+        let (_controller, mut processor, mut telemetry) = spectral_engine(SR, FFT, block_size, 1);
+        processor.begin_learn(block_size * 20);
+        let mut noise = noise_source(0.1);
+
+        // One block in: learning, with partial progress.
+        {
+            let mut block: Vec<f32> = (0..block_size).map(|_| noise()).collect();
+            let mut channels: [&mut [f32]; 1] = [&mut block];
+            processor.process(&mut channels, &SpectralParams::default());
+        }
+        let frame = telemetry.latest();
+        assert!(frame.learning, "should be capturing");
+        assert!(
+            frame.learn_progress > 0.0 && frame.learn_progress < 1.0,
+            "progress {}",
+            frame.learn_progress
+        );
+
+        // Drain the rest of the capture.
+        for _ in 0..40 {
+            let mut block: Vec<f32> = (0..block_size).map(|_| noise()).collect();
+            let mut channels: [&mut [f32]; 1] = [&mut block];
+            processor.process(&mut channels, &SpectralParams::default());
+            if processor.take_pending_learn() {
+                break;
+            }
+        }
+        assert!(!telemetry.latest().learning, "capture should have ended");
+    }
+
+    /// The controller's retained profile is silent until a learn, then carries
+    /// power afterward (for the editor's overlay).
+    #[test]
+    fn controller_profile_power_updates_after_learn() {
+        let block_size = 256;
+        let (mut controller, mut processor, _telemetry) = spectral_engine(SR, FFT, block_size, 1);
+        assert!(controller.profile_power().iter().all(|&p| p == 0.0));
+
+        processor.begin_learn(FFT * 16);
+        let mut noise = noise_source(0.2);
+        for _ in 0..200 {
+            let mut block: Vec<f32> = (0..block_size).map(|_| noise()).collect();
+            let mut channels: [&mut [f32]; 1] = [&mut block];
+            processor.process(&mut channels, &SpectralParams::default());
+            if processor.take_pending_learn() {
+                break;
+            }
+        }
+        assert!(controller.learn());
+        assert!(
+            controller.profile_power().iter().any(|&p| p > 0.0),
+            "profile still silent after learn"
+        );
+        assert_eq!(controller.profile_power().len(), FFT / 2 + 1);
     }
 }

@@ -56,7 +56,7 @@ pub use biquad::Biquad;
 pub use click::{ClickParams, ClickRepair};
 pub use compress::{CompressParams, SpectralCompressor};
 pub use denoise::{DenoiseParams, Denoiser};
-pub use engine::{SpectralEngine, SpectralParams};
+pub use engine::{EngineMeters, METER_FLOOR_DB, SpectralEngine, SpectralParams};
 pub use gate::{GateParams, SpectralGate};
 pub use hum::{HumNotchBank, HumParams};
 pub use profile::{NoiseProfile, ProfileReceiver, ProfileSender, learn_profile, profile_channel};

@@ -27,12 +27,19 @@
 
 pub mod engine;
 pub mod params;
+pub mod ui;
 
-pub use engine::{SpectralController, SpectralProcessor, spectral_engine};
+pub use engine::{
+    SpectralController, SpectralProcessor, SpectralTelemetry, TelemetryFrame, spectral_engine,
+};
 pub use params::{
     ATTACK_MS_RANGE, HARMONICS_RANGE, KNEE_DB_RANGE, LEARN_MS_RANGE, MAKEUP_DB_RANGE, MAX_LEARN_MS,
     MIX_RANGE, OUTPUT_GAIN_DB_RANGE, RATIO_RANGE, REDUCTION_DB_RANGE, RELEASE_MS_RANGE,
     SENSITIVITY_DB_RANGE, clamp_params, learn_samples,
+};
+pub use ui::{
+    DISPLAY_CEIL_DB, DISPLAY_FLOOR_DB, Meter, SPECTROGRAM_BINS, SPECTROGRAM_COLUMNS, Spectrogram,
+    db_to_intensity, downsample_log, format_db, format_latency_ms, latency_ms, magnitude_to_db,
 };
 
 // Re-export the DSP core so downstream callers only depend on one crate.
