@@ -30,6 +30,7 @@ members = [
     "rt-pitch-core",
     "rt-pitch",
     "rt-spectral-core",
+    "rt-spectral",
     "xtask",
 ]
 # `xtask` exists only for `cargo xtask …` (the bundler); keep it out of plain
@@ -46,6 +47,7 @@ default-members = [
     "rt-pitch-core",
     "rt-pitch",
     "rt-spectral-core",
+    "rt-spectral",
 ]
 
 [package.metadata.docs.rs]

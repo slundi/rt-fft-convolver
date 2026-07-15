@@ -204,15 +204,15 @@ Implemented as the `rt-spectral-core` workspace crate (framework-agnostic,
 no plugin-format dependency).  43 unit tests + integration tests; `cargo
 fmt`/`clippy` clean.
 
-- [x] **Workspace layout**:
+- **Workspace layout**:
   - `rt-spectral-core` — algorithms (this phase).
   - `rt-spectral` — plugin(s) (Phase 2).
-- [x] **STFT front-end** (`window.rs`, `stft.rs`):
+- **STFT front-end** (`window.rs`, `stft.rs`):
   - Windowed real FFT via `realfft` (reuses `FftHandler`).
   - COLA-verified Hann², 75 % overlap; numerically-measured OLA norm.
   - Streaming `Analyzer`/`Synthesizer` on `Ring<f32>`, primed so latency
     is one frame, block-size independent.
-- [x] **Operators** (concrete per-op structs, explicit ordered pipeline —
+- **Operators** (concrete per-op structs, explicit ordered pipeline —
   cleaner than a `&mut Bin` trait; each carries its own per-bin state):
   - `NoiseProfile { power: Vec<f32> }` — per-bin **power**, captured
     off-RT (denoiser works in the power domain).
@@ -224,42 +224,49 @@ fmt`/`clippy` clean.
   - `ClickRepair::process_block` — **time-domain** median despiker
     (Phase 0 revision; `click.rs`).
   - `TransientDetector::observe` — spectral-flux onset soft-bypass.
-- [x] **Noise-profile capture API** (off-RT, `profile.rs`):
+- **Noise-profile capture API** (off-RT, `profile.rs`):
   - `learn_profile(&[f32], fft_size, hop) -> NoiseProfile`.
   - Median magnitude across frames, per-bin → power.
-- [x] **Profile hot-swap**:
+- **Profile hot-swap**:
   - `triple_buffer` SPSC channel (`profile_channel` → `ProfileSender` /
     `ProfileReceiver`); wait-free, allocation-free read on the audio
     thread.  Chosen over `arc-swap` — already in the workspace lockfile
     and fits the one-writer/one-reader topology exactly.
 
-## Phase 2: `rt-spectral` plugin
+## Phase 2: `rt-spectral` plugin ✅
 
-- [ ] **I/O**:
-  - Stereo in → stereo out.
-  - Per-channel STFT (mid/side option — [decision]).
-- [ ] **Mode controls** (one enable-flag each):
-  - `Denoise` (bool).
-  - `Spectral Gate` (bool).
-  - `Spectral Compressor` (bool).
-  - `Hum Removal` (bool).
-  - `Click Removal` (bool).
-- [ ] **Denoise controls**:
-  - `Learn` (momentary button) — captures 500 – 2000 ms of noise
-    profile from the current input.
-  - `Reduction` (0–24 dB).
-  - `Sensitivity` (−30 … +30 dB above the profile).
-- [ ] **Gate controls**: `Threshold`, `Range`, `Attack`, `Release`.
-- [ ] **Compressor controls**: `Threshold`, `Ratio`, `Knee`,
-  `Makeup`.
-- [ ] **Hum controls**: `Fundamental` (50 / 60 Hz + custom),
+Implemented as the `rt-spectral` workspace crate: a framework-agnostic engine
+(`SpectralController` off-RT + `SpectralProcessor` on the audio thread, joined
+by two lock-free hand-offs) plus a thin `nih-plug` wrapper behind the `nih`
+feature.  16 unit + integration tests; `cargo fmt`/`clippy` clean (default and
+`nih`); no new dependency advisories.
+
+- **I/O**:
+  - Stereo in → stereo out (and mono → mono); one independent
+    [`SpectralEngine`] per channel.
+  - Per-channel STFT.  ⚠️ **Decision — mid/side dropped for Phase 2**: it would
+    couple the two channels' STFT state and the single learned noise profile is
+    already channel-agnostic; revisit as an advanced toggle post-1.0.
+- **Mode controls** (one enable-flag each): `Denoise`, `Spectral Gate`,
+  `Spectral Compressor`, `Hum Removal`, `Click Removal`.
+- **Denoise controls**:
+  - `Learn` — edge-triggered capture of `Learn Time` (500 – 2000 ms) of the
+    mono-summed input.  Capture is written **in place** into a pre-sized
+    triple-buffer slot on the audio thread (no allocation); the profile is
+    computed + published off-RT from the background-task executor.  ⚠️ The
+    momentary push-button affordance is a Phase-3 (editor) concern — the
+    audio-thread contract only needs the rising edge.
+  - `Reduction` (0–24 dB), `Sensitivity` (−30 … +30 dB above the profile).
+- **Gate controls**: `Threshold`, `Range`, `Attack`, `Release`.
+- **Compressor controls**: `Threshold`, `Ratio`, `Knee`, `Makeup`.
+- **Hum controls**: `Fundamental` (40–120 Hz, covers 50/60 + custom),
   `Harmonics` (1–10), `Notch Q`.
-- [ ] **Click controls**: `Sensitivity`, `Max Length` (samples).
-- [ ] **Global controls**:
-  - `Mix` (0–100 %).
-  - `Output Gain`.
-  - `Bypass`.
-- [ ] **Latency reporting** — one frame minus one hop.
+- **Click controls**: `Sensitivity`, `Max Length` (samples).
+- **Global controls**: `Mix` (0–100 %), `Output Gain`, `Bypass`.
+- **Latency reporting** — one full STFT frame + the click despiker's fixed
+  group delay (the Phase-1 revision of "one frame minus one hop"), reported once
+  in `initialize` since the FFT size is fixed at the Phase-0 "Studio" default
+  (2048).  Transient soft-bypass runs with its Phase-0 defaults (always on).
 
 ## Phase 3: UI
 
