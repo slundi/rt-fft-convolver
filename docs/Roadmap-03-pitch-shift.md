@@ -157,15 +157,36 @@ quality / formant) rebuild off-RT; everything else is applied in place.
 workspace; `cargo clippy` clean on default and `--features nih`; the CLAP /
 VST3 wrapper builds.  The `nih-plug-egui` editor is Phase 3.)*
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
-- [ ] **Preset rack**: 8 pads with the interval displayed as
-  semitones + cents.
-- [ ] **Pitch trajectory display**: real-time line showing the
-  current output pitch (useful for expression-pedal / whammy).
-- [ ] **Latency badge** showing current reported latency in ms.
-- [ ] **MIDI activity indicator**.
+-  **`nih-plug-egui`** — **decision: egui** (matches the sibling
+  `rt-drive` editor; behind the `gui` feature so `cargo test` / `clippy`
+  stay offline).
+-  **Preset rack**: 8 pads (2 × 4) with the interval displayed as
+  semitones + cents (`format_interval`); a pad click sets `Current
+  Preset`, and the pad colour reflects active / enabled / disabled via
+  the shared `pad_state`.
+-  **Pitch trajectory display**: real-time, display-smoothed line of
+  the current output pitch (`PitchTrajectory` ring, fed the selected
+  interval published from the audio thread) — useful for
+  expression-pedal / whammy automation.
+-  **Latency badge** showing current reported latency in ms
+  (`latency_ms` / `format_latency_ms`, from the audio-thread-published
+  sample count + host sample rate).
+-  **MIDI activity indicator**: header LED driven by the shared
+  `MidiActivity` LED state (green = recognised Program Change, red =
+  unrecognised), pulsed from the audio thread via a relaxed atomic.
+
+**Architecture** — the pure editor logic (interval labels, latency
+conversion, the trajectory ring) lives in a framework-agnostic
+`ui.rs` and is unit-tested without `egui`; the `nih-plug-egui` drawing
+is a thin `gui`-gated layer in `plugin.rs` fed by four relaxed atomics
+(current pitch, latency samples, sample rate, MIDI pulse) so the audio
+thread never blocks on the editor.
+
+*(All `rt-pitch` tests pass — engine/params + 5 new `ui` tests, full
+workspace green; `cargo clippy` clean on default, `--features nih`, and
+`--features gui`; the egui editor compiles against `nih-plug-egui`.)*
 
 ## Phase 4: Testing
 

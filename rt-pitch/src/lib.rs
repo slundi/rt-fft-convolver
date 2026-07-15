@@ -13,18 +13,23 @@
 //!   [`PitchProcessor`](engine::PitchProcessor) (audio thread, two-voice
 //!   equal-power crossfade), joined by the lock-free handoff from
 //!   `rt-ir-plugin-core`.
+//! - [`ui`] — pure, `egui`-free editor logic (interval labels, latency badge,
+//!   pitch-trajectory ring), unit-testable without the plugin framework.
 //! - `plugin` — the actual `nih-plug` `Plugin` implementation, compiled only
 //!   with the **`nih`** feature (`cargo build -p rt-pitch --features nih`).
+//!   The `nih-plug-egui` editor (Phase 3) is behind the **`gui`** feature.
 //!   Kept off the default build so `cargo test` / `clippy` stay fast and
 //!   offline.
 
 pub mod engine;
 pub mod params;
+pub mod ui;
 
 pub use engine::{PitchController, PitchProcessor, PreparedPitch};
 pub use params::{
     Algorithm, CROSSFADE_MS_RANGE, MAX_PITCH_HZ, MIN_PITCH_HZ, PitchParams, Quality, SEMITONE_RANGE,
 };
+pub use ui::{PitchTrajectory, format_interval, format_latency_ms, latency_ms};
 
 // Re-export the DSP core so downstream callers only depend on one crate.
 pub use rt_pitch_core as pitch_core;

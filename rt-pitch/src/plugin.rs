@@ -31,17 +31,31 @@
 //! - `lv2lint` / `clap-validator` / `pluginval` host validation — Phase 4.
 
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nih_plug::prelude::*;
+#[cfg(feature = "gui")]
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 use rt_ir_plugin_core::program_to_slot;
 use rt_pitch_core::{FormantMethod, NUM_PRESETS};
 
 use crate::engine::{PitchController, PitchProcessor};
 use crate::params::{Algorithm, CROSSFADE_MS_RANGE, PitchParams, Quality, SEMITONE_RANGE};
+#[cfg(feature = "gui")]
+use crate::ui::{
+    MidiActivity, MidiStatus, PadState, PitchTrajectory, format_interval, format_latency_ms,
+    latency_ms, pad_state,
+};
 
 /// Sentinel for "no MIDI Program Change override in effect".
 const NO_OVERRIDE: i32 = -1;
+
+/// MIDI-activity codes published from the audio thread to the editor LED:
+/// nothing new, a recognised event, or an unrecognised one.
+const MIDI_NONE: u32 = 0;
+const MIDI_RECOGNISED: u32 = 1;
+const MIDI_UNRECOGNISED: u32 = 2;
 
 /// Off-thread work dispatched to the background executor (control thread only).
 pub enum PitchTask {
@@ -168,6 +182,10 @@ struct PitchPluginParams {
     dry_delay_compensation: BoolParam,
     #[id = "byp"]
     bypass: BoolParam,
+
+    #[cfg(feature = "gui")]
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 impl Default for PitchPluginParams {
@@ -223,6 +241,8 @@ impl Default for PitchPluginParams {
             ),
             bypass: BoolParam::new("Bypass", false)
                 .with_value_to_string(formatters::v2s_bool_bypass()),
+            #[cfg(feature = "gui")]
+            editor_state: EguiState::from_size(560, 520),
         }
     }
 }
@@ -276,6 +296,16 @@ pub struct PitchPlugin {
     last_structural: PitchParams,
     /// Last latency reported to the host, to avoid redundant notifications.
     last_reported_latency: usize,
+
+    // ── Editor telemetry (audio thread → egui), `f32`/`u32` packed atomics. ──
+    /// Current output pitch in semitones (the selected interval) — trajectory.
+    pitch_semitones: Arc<AtomicU32>,
+    /// Reported latency in samples — the latency badge.
+    latency_samples: Arc<AtomicU32>,
+    /// Host sample rate (`f32` bits) — converts the latency badge to ms.
+    sample_rate_hz: Arc<AtomicU32>,
+    /// Last MIDI-activity code (see `MIDI_*`) — the header LED.
+    midi_code: Arc<AtomicU32>,
 }
 
 impl Default for PitchPlugin {
@@ -289,8 +319,106 @@ impl Default for PitchPlugin {
             last_current_preset: defaults.current_preset as i32,
             last_structural: defaults,
             last_reported_latency: usize::MAX,
+            pitch_semitones: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            latency_samples: Arc::new(AtomicU32::new(0)),
+            sample_rate_hz: Arc::new(AtomicU32::new(48_000.0f32.to_bits())),
+            midi_code: Arc::new(AtomicU32::new(MIDI_NONE)),
         }
     }
+}
+
+/// Per-frame editor state owned by the egui closure.
+#[cfg(feature = "gui")]
+struct PitchEditorState {
+    trajectory: PitchTrajectory,
+    midi: MidiActivity,
+}
+
+#[cfg(feature = "gui")]
+impl PitchEditorState {
+    fn new() -> Self {
+        Self {
+            // ~4 s of history at a typical editor frame rate; eased for a
+            // smooth whammy/crossfade line.
+            trajectory: PitchTrajectory::new(240, 0.2),
+            midi: MidiActivity::new(),
+        }
+    }
+}
+
+/// Set one `IntParam` with a complete begin/set/end automation gesture (pad
+/// clicks in the preset rack).
+#[cfg(feature = "gui")]
+fn set_int_param(setter: &ParamSetter, param: &IntParam, value: i32) {
+    setter.begin_set_parameter(param);
+    setter.set_parameter(param, value);
+    setter.end_set_parameter(param);
+}
+
+/// Draw the small MIDI-activity LED (green = recognised, red = unrecognised).
+#[cfg(feature = "gui")]
+fn draw_midi_led(ui: &mut egui::Ui, midi: &MidiActivity) {
+    use egui::Color32;
+    let base = match midi.status() {
+        MidiStatus::Recognised => Color32::from_rgb(0x40, 0xd0, 0x60),
+        MidiStatus::Unrecognised => Color32::from_rgb(0xd0, 0x50, 0x40),
+        MidiStatus::Idle => Color32::from_rgb(0x30, 0x30, 0x38),
+    };
+    let level = midi.level().clamp(0.0, 1.0);
+    // Blend toward the base colour by brightness.
+    let dim = Color32::from_rgb(0x22, 0x24, 0x2a);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * level) as u8;
+    let colour = Color32::from_rgb(
+        lerp(dim.r(), base.r()),
+        lerp(dim.g(), base.g()),
+        lerp(dim.b(), base.b()),
+    );
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.0, colour);
+    ui.label("MIDI");
+}
+
+/// Draw the rolling pitch-trajectory line into a panel.
+#[cfg(feature = "gui")]
+fn draw_trajectory(
+    ui: &mut egui::Ui,
+    trajectory: &PitchTrajectory,
+    panel: egui::Color32,
+    grid: egui::Color32,
+    accent: egui::Color32,
+) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 90.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 4.0, panel);
+
+    // Zero line (unison) across the vertical centre.
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left(), rect.center().y),
+            egui::pos2(rect.right(), rect.center().y),
+        ],
+        egui::Stroke::new(1.0, grid),
+    );
+
+    let history = trajectory.ordered();
+    if history.len() < 2 {
+        return;
+    }
+    // Map ±24 semitones to the panel height.
+    const SPAN: f32 = 24.0;
+    let last = (history.len() - 1) as f32;
+    let points: Vec<egui::Pos2> = history
+        .iter()
+        .enumerate()
+        .map(|(index, &semis)| {
+            let x = rect.left() + index as f32 / last * rect.width();
+            let norm = (semis / SPAN).clamp(-1.0, 1.0);
+            let y = rect.center().y - norm * (rect.height() * 0.45);
+            egui::pos2(x, y)
+        })
+        .collect();
+    ui.painter()
+        .add(egui::Shape::line(points, egui::Stroke::new(2.0, accent)));
 }
 
 impl Plugin for PitchPlugin {
@@ -322,6 +450,173 @@ impl Plugin for PitchPlugin {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    #[cfg(feature = "gui")]
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        use egui::Color32;
+
+        // Violet accent for a pitch/harmony plugin.
+        const ACCENT: Color32 = Color32::from_rgb(0xb0, 0x8c, 0xff);
+        const PANEL: Color32 = Color32::from_rgb(0x16, 0x18, 0x1c);
+        const GRID: Color32 = Color32::from_rgb(0x2a, 0x2e, 0x36);
+        const PAD_DISABLED: Color32 = Color32::from_rgb(0x30, 0x30, 0x38);
+        const PAD_FILLED: Color32 = Color32::from_rgb(0x3a, 0x40, 0x52);
+
+        let params = self.params.clone();
+        let pitch_semitones = self.pitch_semitones.clone();
+        let latency_samples = self.latency_samples.clone();
+        let sample_rate_hz = self.sample_rate_hz.clone();
+        let midi_code = self.midi_code.clone();
+
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            PitchEditorState::new(),
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                // Consume the latest MIDI pulse and decay the LED this frame.
+                let code = midi_code.swap(MIDI_NONE, Ordering::Relaxed);
+                if code != MIDI_NONE {
+                    state.midi.trigger(code == MIDI_RECOGNISED);
+                }
+                state.midi.decay(0.08);
+
+                // Feed the trajectory the current output pitch.
+                let target = f32::from_bits(pitch_semitones.load(Ordering::Relaxed));
+                state.trajectory.push(target);
+
+                let current = params.current_preset.value() as usize;
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Header: name + MIDI LED + bypass ──────────────────
+                    ui.horizontal(|ui| {
+                        ui.heading("RT Pitch");
+                        draw_midi_led(ui, &state.midi);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.bypass, setter));
+                        });
+                    });
+                    ui.separator();
+
+                    // ── Preset rack: 8 pads (2 rows × 4) ──────────────────
+                    egui::Grid::new("preset-rack")
+                        .num_columns(4)
+                        .spacing(egui::vec2(6.0, 6.0))
+                        .show(ui, |ui| {
+                            for index in 0..NUM_PRESETS {
+                                let preset = &params.presets[index];
+                                let state =
+                                    pad_state(true, preset.enabled.value(), index == current);
+                                let fill = match state {
+                                    PadState::Active => ACCENT,
+                                    PadState::Disabled => PAD_DISABLED,
+                                    _ => PAD_FILLED,
+                                };
+                                let label = format!(
+                                    "{}\n{}",
+                                    index + 1,
+                                    format_interval(preset.interval.value())
+                                );
+                                let button = egui::Button::new(
+                                    egui::RichText::new(label).color(Color32::WHITE),
+                                )
+                                .fill(fill)
+                                .min_size(egui::vec2(122.0, 40.0));
+                                if ui.add(button).clicked() {
+                                    set_int_param(setter, &params.current_preset, index as i32);
+                                }
+                                if index % 4 == 3 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+
+                    // ── Selected preset editor ────────────────────────────
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Preset {}", current + 1));
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.presets[current].interval,
+                            setter,
+                        ));
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.presets[current].enabled,
+                            setter,
+                        ));
+                    });
+
+                    // ── Pitch-trajectory plot ─────────────────────────────
+                    ui.separator();
+                    draw_trajectory(ui, &state.trajectory, PANEL, GRID, ACCENT);
+
+                    // ── Latency badge ─────────────────────────────────────
+                    let samples = latency_samples.load(Ordering::Relaxed) as usize;
+                    let rate = f32::from_bits(sample_rate_hz.load(Ordering::Relaxed));
+                    ui.horizontal(|ui| {
+                        ui.label("Latency");
+                        ui.label(
+                            egui::RichText::new(format_latency_ms(latency_ms(samples, rate)))
+                                .color(ACCENT),
+                        );
+                    });
+
+                    // ── Global controls ───────────────────────────────────
+                    ui.separator();
+                    egui::Grid::new("controls").num_columns(2).show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, label: &str, add: &dyn Fn(&mut egui::Ui)| {
+                            ui.label(label);
+                            add(ui);
+                            ui.end_row();
+                        };
+                        row(ui, "Algorithm", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.algorithm, setter));
+                        });
+                        row(ui, "Quality", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.quality, setter));
+                        });
+                        row(ui, "Mix", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.mix, setter));
+                        });
+                        row(ui, "Crossfade", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.crossfade_ms,
+                                setter,
+                            ));
+                        });
+                        row(ui, "Current Preset", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.current_preset,
+                                setter,
+                            ));
+                        });
+                        row(ui, "Voice 2 Preset", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.voice2_preset,
+                                setter,
+                            ));
+                        });
+                        row(ui, "Dual Voice", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.dual_voice, setter));
+                        });
+                        row(ui, "Formant", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.formant, setter));
+                        });
+                        row(ui, "Formant Method", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.formant_method,
+                                setter,
+                            ));
+                        });
+                        row(ui, "Dry Delay Comp.", &|ui| {
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.dry_delay_compensation,
+                                setter,
+                            ));
+                        });
+                    });
+                });
+            },
+        )
     }
 
     fn task_executor(&mut self) -> TaskExecutor<Self> {
@@ -356,10 +651,14 @@ impl Plugin for PitchPlugin {
         let (controller, processor) =
             PitchController::new(max_block, sample_rate, channels, &snapshot);
 
-        // Report the initial latency to the host.
+        // Report the initial latency to the host and prime the editor badges.
         let latency = controller.latency();
         context.set_latency_samples(latency as u32);
         self.last_reported_latency = latency;
+        self.latency_samples
+            .store(latency as u32, Ordering::Relaxed);
+        self.sample_rate_hz
+            .store(sample_rate.to_bits(), Ordering::Relaxed);
 
         *self.controller.lock().unwrap() = Some(controller);
         self.processor = Some(processor);
@@ -384,10 +683,14 @@ impl Plugin for PitchPlugin {
     ) -> ProcessStatus {
         // ── 1. MIDI: Program Change overrides the active preset. ──
         while let Some(event) = context.next_event() {
-            if let NoteEvent::MidiProgramChange { program, .. } = event
-                && let Some(index) = program_to_slot(program, NUM_PRESETS)
-            {
-                self.midi_preset = index as i32;
+            if let NoteEvent::MidiProgramChange { program, .. } = event {
+                match program_to_slot(program, NUM_PRESETS) {
+                    Some(index) => {
+                        self.midi_preset = index as i32;
+                        self.midi_code.store(MIDI_RECOGNISED, Ordering::Relaxed);
+                    }
+                    None => self.midi_code.store(MIDI_UNRECOGNISED, Ordering::Relaxed),
+                }
             }
         }
 
@@ -418,6 +721,17 @@ impl Plugin for PitchPlugin {
                 self.last_reported_latency = latency;
                 context.set_latency_samples(latency as u32);
             }
+
+            // Publish editor telemetry (cheap relaxed atomics).
+            let current = snapshot.current_preset.min(NUM_PRESETS - 1);
+            self.pitch_semitones.store(
+                snapshot.intervals[current].semitones.to_bits(),
+                Ordering::Relaxed,
+            );
+            self.latency_samples
+                .store(latency as u32, Ordering::Relaxed);
+            self.sample_rate_hz
+                .store(context.transport().sample_rate.to_bits(), Ordering::Relaxed);
         }
 
         ProcessStatus::Normal
