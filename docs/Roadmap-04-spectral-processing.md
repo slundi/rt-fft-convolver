@@ -78,20 +78,28 @@ Plugin format target: **LV2 + CLAP + VST3** via
 
 ### FFT size(s) — **settled: 1024 / 2048 / 4096, default 2048**
 
-- Reported latency = `N − hop = 3N/4` (75 % overlap), the true group
-  delay of the STFT OLA path:
+- Reported latency = **one full frame `N`** (Phase 1 implementation
+  decision, see below):
 
-  | N | frame @48 kHz | latency (`3N/4`) | use |
+  | N | frame @48 kHz | latency (`N`) | use |
   |---|---|---|---|
-  | 1024 | 21.3 ms | **16.0 ms** | "Live" |
-  | 2048 | 42.7 ms | **32.0 ms** | "Studio" (default) |
-  | 4096 | 85.3 ms | **64.0 ms** | "HiRes" (best freq. resolution) |
+  | 1024 | 21.3 ms | **21.3 ms** | "Live" |
+  | 2048 | 42.7 ms | **42.7 ms** | "Studio" (default) |
+  | 4096 | 85.3 ms | **85.3 ms** | "HiRes" (best freq. resolution) |
 
-  - ⚠️ Corrects the design-principle note (§Design principles): the
-    "21–85 ms" figures were the *full frame* `N`, not `N − hop`.  Report
-    `N − hop` to the host and recompute on size change / sample-rate
-    change (sizes are defined in samples, so latency in ms scales with
-    `fs`).
+  - ⚠️ **Revised during Phase 1** (was tentatively `N − hop = 3N/4`).
+    The `N − hop` group delay only holds when the host block size is
+    `>= hop`.  With a *streaming* overlap-add framer and per-block pull,
+    a block-size-**independent** latency provably requires a full frame:
+    prime the analyzer with `N − hop` zeros *and* the synthesis FIFO
+    with one `hop` (`N − hop + hop = N`).  Since DAWs use blocks as small
+    as 16–64 samples (well below a 512-sample hop), reporting `N` is the
+    only value that stays exact under automation and buffer-size
+    changes.  This matches the design-principle note's original
+    "21–85 ms" (= `N`) figures.  Recompute on size / sample-rate change
+    (sizes are in samples, so ms scales with `fs`).  The click despiker
+    adds a further fixed `(window−1)/2` (2 samples at the default
+    5-tap), always imposed so toggling it never shifts PDC.
 
 ### Window / overlap — **decision: Hann analysis+synthesis, 75 % overlap, fixed**
 
@@ -190,26 +198,40 @@ never size the RT path to it.
 6. **MCRA continuous noise tracking** — medium-high (minimum-statistics
    state machine); optional, can land after 1.0.
 
-## Phase 1: `rt-spectral-core` (engine crate)
+## Phase 1: `rt-spectral-core` (engine crate) ✅
 
-- [ ] **Workspace layout**:
-  - `rt-spectral-core` — algorithms.
-  - `rt-spectral` — plugin(s).
-- [ ] **STFT front-end**:
-  - Windowed real FFT via `realfft`.
-  - COLA-verified hop/window pair.
-- [ ] **Bin operators** (chain-of-responsibility style):
-  - `NoiseProfile { magnitudes: Vec<f32> }` — captured off-RT.
-  - `denoise(&mut Bin, &NoiseProfile, params)`.
-  - `spectral_gate(&mut Bin, threshold_db, ratio)`.
-  - `spectral_compress(&mut Bin, threshold_db, ratio, knee)`.
-  - `notch_hum(&mut Bin, fundamental_hz, harmonics)`.
-  - `click_repair(&mut Bin, prev: &Bin, threshold)`.
-- [ ] **Noise-profile capture API** (off-RT):
-  - `learn_profile(&[f32]) -> NoiseProfile`.
-  - Median magnitude across N frames, per-bin.
-- [ ] **Profile hot-swap**:
-  - `arc-swap` between capture thread and audio thread.
+Implemented as the `rt-spectral-core` workspace crate (framework-agnostic,
+no plugin-format dependency).  43 unit tests + integration tests; `cargo
+fmt`/`clippy` clean.
+
+- [x] **Workspace layout**:
+  - `rt-spectral-core` — algorithms (this phase).
+  - `rt-spectral` — plugin(s) (Phase 2).
+- [x] **STFT front-end** (`window.rs`, `stft.rs`):
+  - Windowed real FFT via `realfft` (reuses `FftHandler`).
+  - COLA-verified Hann², 75 % overlap; numerically-measured OLA norm.
+  - Streaming `Analyzer`/`Synthesizer` on `Ring<f32>`, primed so latency
+    is one frame, block-size independent.
+- [x] **Operators** (concrete per-op structs, explicit ordered pipeline —
+  cleaner than a `&mut Bin` trait; each carries its own per-bin state):
+  - `NoiseProfile { power: Vec<f32> }` — per-bin **power**, captured
+    off-RT (denoiser works in the power domain).
+  - `Denoiser::process` — Wiener + decision-directed SNR, transient depth.
+  - `SpectralGate::process` — per-bin expander, attack/release envelope.
+  - `SpectralCompressor::process` — per-bin static soft-knee curve.
+  - `HumNotchBank::process_block` — **time-domain** biquad notch bank
+    (Phase 0 revision; `biquad.rs`, `hum.rs`).
+  - `ClickRepair::process_block` — **time-domain** median despiker
+    (Phase 0 revision; `click.rs`).
+  - `TransientDetector::observe` — spectral-flux onset soft-bypass.
+- [x] **Noise-profile capture API** (off-RT, `profile.rs`):
+  - `learn_profile(&[f32], fft_size, hop) -> NoiseProfile`.
+  - Median magnitude across frames, per-bin → power.
+- [x] **Profile hot-swap**:
+  - `triple_buffer` SPSC channel (`profile_channel` → `ProfileSender` /
+    `ProfileReceiver`); wait-free, allocation-free read on the audio
+    thread.  Chosen over `arc-swap` — already in the workspace lockfile
+    and fits the one-writer/one-reader topology exactly.
 
 ## Phase 2: `rt-spectral` plugin
 
