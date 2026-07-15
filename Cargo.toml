@@ -28,6 +28,7 @@ members = [
     "rt-drive-core",
     "rt-drive",
     "rt-pitch-core",
+    "rt-pitch",
     "xtask",
 ]
 # `xtask` exists only for `cargo xtask …` (the bundler); keep it out of plain
@@ -42,6 +43,7 @@ default-members = [
     "rt-drive-core",
     "rt-drive",
     "rt-pitch-core",
+    "rt-pitch",
 ]
 
 [package.metadata.docs.rs]

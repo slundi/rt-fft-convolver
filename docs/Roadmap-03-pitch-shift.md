@@ -113,15 +113,16 @@ Plugin format target: **LV2 + CLAP + VST3** via
 clean; RT-safety: `DenormalGuard` on each `process_block`, buffers sized
 at construction, output FIFOs on the shared `Ring<T>`.)*
 
-## Phase 2: `rt-pitch` plugin
+## Phase 2: `rt-pitch` plugin ✅
 
-- [ ] **I/O**:
+- **I/O**:
   - Mono in → mono out or stereo in → stereo out.
-  - Dual voice mode: independent shift per channel (harmoniser use).
-- [ ] **Preset controls** (× 8):
-  - `Interval N` (−24 … +24 semitones + cents fine tune).
+  - Dual voice mode: independent shift per channel (harmoniser use) —
+    `dual_voice` routes `voice2_preset` to the right channel.
+- **Preset controls** (× 8):
+  - `Interval N` (−24 … +24 semitones + cents fine tune, `0.01 st` step).
   - `Preset Enabled N`.
-- [ ] **Global controls**:
+- **Global controls**:
   - `Current Preset` (int 0–7).
   - `Crossfade Time` (5–200 ms).
   - `Algorithm` (Smooth / Tight-Mono / Mono-Voice — selects the
@@ -134,12 +135,27 @@ at construction, output FIFOs on the shared `Ring<T>`.)*
   - `Dry Delay Compensation` (bool) — align dry with wet after
     reported latency.
   - `Bypass`.
-- [ ] **MIDI**:
-  - Program Change → preset index.
-  - CC on `Current Preset` and `Interval` (for whammy-pedal-style
-    continuous bends).
-  - Optional: MIDI note in → chase note as target pitch.
-- [ ] **Latency reporting** to the host per selected `Quality`.
+- **MIDI**:
+  - Program Change → preset index (with a host-knob-move override so
+    automation reclaims control after the user acts).
+  - CC on `Current Preset` and `Interval` — every continuous control is
+    an automatable parameter hosts bind to any CC (MIDI-learn).
+  - Optional: MIDI note in → chase note as target pitch — *deferred*
+    (post-Phase-3 leftover; the shared-ratio plumbing leaves room).
+- **Latency reporting** to the host per selected `Quality`.
+
+**Architecture** — mirrors the `rt-drive` split: a framework-agnostic
+`engine` (off-RT `PitchController` builds the `Box<dyn Shifter>` voices;
+audio-thread `PitchProcessor` polls the lock-free handoff and renders) plus a
+thin `nih` wrapper (`plugin.rs`, behind the `nih` feature).  Click-free preset
+changes use **two shifter voices per channel** blended by the core
+`PresetBank` equal-power crossfade — both voices always render so the incoming
+one is never faded in from its silent warm-up.  Structural changes (algorithm /
+quality / formant) rebuild off-RT; everything else is applied in place.
+
+*(All `rt-pitch` unit tests pass — 14 engine/params + the full 462-test
+workspace; `cargo clippy` clean on default and `--features nih`; the CLAP /
+VST3 wrapper builds.  The `nih-plug-egui` editor is Phase 3.)*
 
 ## Phase 3: UI
 
