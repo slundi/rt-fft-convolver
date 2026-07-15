@@ -296,22 +296,53 @@ under its mutex on the editor thread.  New engine telemetry (`EngineMeters`,
   built in CI / on a desktop, not in the headless dev shell — identical to the
   other plugins' editors.  Default / `nih` builds and all tests stay offline.
 
-## Phase 4: Testing
+## Phase 4: Testing ✅
 
-- [ ] **Unit tests** (`rt-spectral-core`):
-  - STFT round-trip is bit-identical (or within window overlap
-    error) when all operators are pass-through.
-  - Denoise on white noise + tone reduces noise floor without
-    affecting the tone's magnitude by more than 0.5 dB.
-  - Hum notch attenuates a pure 60 Hz sine by > 40 dB.
-  - Click repair detects and interpolates a single-sample impulse.
-- [ ] **Integration tests**:
-  - Reference frames captured from a NumPy STFT implementation.
-  - Profile hot-swap under load (no glitches).
-- [ ] **RT-safety audit**:
-  - Zero allocations in `process()`.
-  - Latency matches reported value exactly.
-- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval`.
+The named acceptance criteria land in `rt-spectral-core/tests/acceptance.rs`
+(the `rt-spectral-core` items + the integration items) and
+`rt-spectral/tests/rt_safety.rs` (the RT-safety audit), on top of the existing
+module unit tests and `tests/integration.rs` in both crates.  87 tests across
+the two crates; `cargo fmt` / `clippy -D warnings` clean.
+
+- [x] **Unit tests** (`rt-spectral-core`):
+  - STFT round-trip within the window-overlap error when all operators are
+    pass-through (`reported_latency_matches_measured_group_delay`, plus the
+    existing `analysis_synthesis_reconstructs` / `full_passthrough_*`).
+  - Denoise on noise + tone reduces the floor while the tone's magnitude
+    (measured by Goertzel projection, which rejects the noise) is preserved to
+    within 0.5 dB (`denoise_reduces_floor_and_preserves_tone_within_half_db`).
+  - Hum notch attenuates a pure 60 Hz sine by > 40 dB
+    (`hum_notch_attenuates_60hz_by_more_than_40db`).  ⚠️ **f32 finding**: the RBJ
+    notch's zeros are exactly on the unit circle, but at the tiny normalised
+    mains frequency the f32 rounding of `cos(ω₀)` displaces the zero *angle*, so
+    the achievable null depth scales as ≈ `(2Q/ω₀)·Δω` — a **very high** Q (the
+    Q=30 default) is precision-limited to ≈ −34 dB, while a moderate Q clears
+    40 dB.  A preset needing both a narrow notch and a deep null would cascade
+    stages or compute coefficients in f64.
+  - Click repair detects and interpolates a single-sample impulse
+    (`click_repair_interpolates_single_sample_impulse`).
+- [x] **Integration tests**:
+  - Reference frame validated against the **closed-form** Hann-windowed-cosine
+    DFT (`|X[k]| = 0.5·Σw[n]`), which is exactly `np.fft.rfft(hann·cos)` — an
+    in-repo, dependency-free stand-in for a captured NumPy reference
+    (`stft_matches_analytic_windowed_cosine_reference`).
+  - Profile hot-swap under load: publishing a fresh profile mid-stream produces
+    no NaN/inf and no discontinuity spike
+    (`profile_hot_swap_under_load_is_glitch_free`).
+- [x] **RT-safety audit**:
+  - Zero allocations in `process()` — a counting global allocator confirms the
+    steady-state render **and** the Learn-capture path allocate nothing on the
+    audio thread (`process_is_allocation_free_on_the_audio_thread`).  A single
+    sequential test owns the measurement window (the counting allocator is
+    process-wide across threads).
+  - Latency matches the reported value exactly — an off-by-one shift is
+    demonstrably worse than the exact alignment across all three FFT sizes
+    (`reported_latency_matches_measured_group_delay`).
+- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval` — deferred
+  to CI / desktop: these need the built plugin bundles (`cargo xtask bundle`)
+  and the external validator binaries, none of which are available in the
+  headless dev shell.  The `nih` cdylib itself builds offline (`cargo build -p
+  rt-spectral --features nih`).
 
 ## Phase 5: Packaging & release
 
