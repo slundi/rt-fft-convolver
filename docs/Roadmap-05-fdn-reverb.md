@@ -25,32 +25,87 @@ Plugin format target: **LV2 + CLAP + VST3** via
   zipper noise from automation.
 - **8 preset slots** — same UX as the other plugins in this suite.
 
-## Prerequisites in `rt-fft-convolver`
+## Prerequisites in `rt-fft-convolver` ✅
 
-- [ ] `DenormalGuard` — feedback loops with tails > 5 s reach the
-  denormal regime quickly.
-- [ ] Parameter-smoothing utility — [decision] whether to extract
-  from `mixer.rs` or keep local.
+- `DenormalGuard` — **satisfied**. Reuse
+  `src/utils/denormals.rs` verbatim: RAII FTZ+DAZ guard (x86/x86_64
+  MXCSR, AArch64 FPCR, no-op elsewhere), restores exact prior FPU
+  state on drop, RT-safe (one register read+write), fully tested.
+  Exactly the >5 s feedback-tail case it was designed for — wrap the
+  whole render callback.
+- Parameter-smoothing utility — **decision: build a new one,
+  local to `rt-fdn-core`**. There is nothing to extract: `mixer.rs`
+  computes equal-power gains *set-then-apply* (no per-sample ramp)
+  and `crossfade.rs` blends per-sample but only for IR hot-swap.
+  Neither is a reusable per-sample smoother. A small one-pole /
+  linear ramp (~40 lines) lives in the new engine crate, matching
+  the existing pattern where core crates own their DSP (the `nih`
+  plugin layer is feature-gated). Promote to shared `src/utils/`
+  only if a second plugin needs it. This is a **Phase 1 build item**,
+  not a Phase 0 blocker.
 
-## Phase 0: Algorithm decisions
+## Phase 0: Algorithm decisions ✅
 
-- [ ] **FDN size** — [decision]:
-  - 4×4 (cheap, "small room" character).
-  - 8×8 (standard, best diffusion / CPU tradeoff).
-  - 16×16 (dense, "lush" tail, higher CPU).
-- [ ] **Feedback matrix** — [decision]:
-  - Householder (fast, real).
-  - Hadamard (fast, requires size = power of two).
-  - Random orthogonal (higher diffusion, slower).
-- [ ] **Delay-line lengths**: mutually prime around a target mean
-  length; [decision] on exact values (typically 700 – 4500 samples
-  @ 48 kHz).
-- [ ] **Damping**: 1-pole low-pass inside each feedback path.
-- [ ] **Modulation source**: [decision] per-delay LFOs vs. a shared
-  random-walk driver.
-- [ ] **Early reflections**:
-  - [decision] whether to include a short pre-FDN tapped-delay
-    section for early reflections, or leave that to the FDN itself.
+### FDN size — **decision: 8×8**
+
+- The industry-standard sweet spot (Lexicon / Valhalla / FabFilter
+  Pro-R territory): dense enough for convincing hall / plate tails,
+  ~half the per-sample cost of 16×16, and a **power of two** — which
+  is what unlocks the fast Hadamard matrix below.
+- *Rejected*: **4×4** (sparse, flutters on long decays — kept only as
+  a possible "small room" variant later) and **16×16** (Blackhole-
+  style density, but the extra 8 delay lines + matrix cost isn't
+  justified for a guitar-oriented 1.0).
+
+### Feedback matrix — **decision: Hadamard (fast Walsh–Hadamard)**
+
+- With `N = 8` (power of two) the FWHT is `O(N log N)` using **only
+  adds and subtracts** — no per-sample multiplies — and is exactly
+  orthonormal, so it is maximally lossless and maximally diffusive.
+- Implemented as an in-place butterfly over the 8-element state
+  vector, then scaled by `1/√N` to preserve energy.
+- *Rejected*: **Householder** (real, any size, but slightly less
+  diffuse — retained as the fallback if a future size becomes
+  non-power-of-two) and **random orthogonal** (`O(N²)` dense matmul
+  per sample, more CPU for marginal audible gain).
+
+### Delay-line lengths — **decision: coprime prime set**
+
+- Eight **mutually prime** lengths around a target mean, scaled at
+  construction by `Size` and the actual sample rate:
+  `{743, 977, 1123, 1319, 1493, 1657, 1811, 1997}` samples @ 48 kHz
+  (≈ 15 – 42 ms).
+- Coprime lengths maximise modal density and push the delay-echo
+  pattern's common period out to their product, avoiding audible
+  flutter and metallic ringing.
+- Recompute (round to nearest prime / integer) when `Size` or `fs`
+  changes; sizes are in samples so ms scales with `fs`.
+
+### Damping — **decision: per-path 1-pole low-pass (given)**
+
+- One 1-pole low-pass inside **each** of the 8 feedback paths, giving
+  frequency-dependent decay (highs die faster than lows — the natural
+  air-absorption behaviour). Cutoff driven by the `Damping` control.
+- Not contentious; this is the standard FDN damping topology.
+
+### Modulation source — **decision: per-delay LFOs, decorrelated phases**
+
+- One sine LFO per delay line, each seeded with a **decorrelated
+  starting phase** (e.g. evenly spread over 2π), producing the classic
+  "lush" chorus-y tail motion of Strymon / Valhalla algorithmic verbs.
+- Cost is `N` phase increments + `N` fractional delay reads per sample
+  — cheap and RT-safe (delay buffers sized at construction, fractional
+  read via linear/all-pass interpolation).
+- *Rejected*: **shared random-walk driver** (cheaper and more organic,
+  but flatter motion and can sound diffuse-mushy on sustained chords).
+
+### Early reflections — **decision: FDN-only for 1.0**
+
+- The 8×8 Hadamard diffusion already produces credible early energy;
+  a dedicated pre-FDN tapped-delay ER section would roughly double the
+  delay-line accounting for modest audible gain.
+- Deferred, not cancelled: a short ER tap bank is a natural refinement
+  for the "room" / "plate" spaces in a later revision.
 
 ## Phase 1: `rt-fdn-core` (engine crate)
 
