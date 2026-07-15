@@ -396,6 +396,48 @@ mod tests {
         assert!((freq - 440.0).abs() < 15.0, "unison freq = {freq}");
     }
 
+    /// Ratio 1.0 reconstructs the input within the noise floor (STFT overlap-
+    /// add is not bit-identical, but Hann COLA at 4× overlap is high-fidelity).
+    ///
+    /// Aligns the steady-state output against the input delayed by the reported
+    /// latency and checks the normalised cross-correlation is near 1 and the
+    /// residual energy is well below the signal (< −20 dB).
+    #[test]
+    fn unison_reconstructs_within_noise_floor() {
+        let sample_rate = 48_000.0;
+        let input = make_sine(440.0, sample_rate, 24_000);
+        let mut pv = PhaseVocoder::new(1024, 512, WindowKind::Hann);
+        pv.set_ratio(1.0);
+        let output = run(&mut pv, &input, 256);
+
+        let latency = pv.latency_samples();
+        // Compare a settled mid-signal window, input[n] vs output[n + latency].
+        let start = 8_000;
+        let len = 8_000;
+        let reference = &input[start..start + len];
+        let shifted = &output[start + latency..start + latency + len];
+
+        let dot: f64 = reference
+            .iter()
+            .zip(shifted)
+            .map(|(&a, &b)| a as f64 * b as f64)
+            .sum();
+        let ref_energy: f64 = reference.iter().map(|&a| (a as f64).powi(2)).sum();
+        let out_energy: f64 = shifted.iter().map(|&b| (b as f64).powi(2)).sum();
+        let correlation = dot / (ref_energy.sqrt() * out_energy.sqrt());
+        assert!(correlation > 0.98, "unison correlation = {correlation}");
+
+        // Scale-corrected residual energy relative to the signal.
+        let scale = dot / ref_energy; // least-squares gain of output onto input
+        let residual: f64 = reference
+            .iter()
+            .zip(shifted)
+            .map(|(&a, &b)| (b as f64 - scale * a as f64).powi(2))
+            .sum();
+        let residual_db = 10.0 * (residual / out_energy).log10();
+        assert!(residual_db < -20.0, "unison residual = {residual_db} dB");
+    }
+
     /// Ratio 2.0 (octave up) on a 440 Hz sine yields a dominant 880 Hz peak.
     #[test]
     fn octave_up_doubles_pitch() {

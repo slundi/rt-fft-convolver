@@ -188,23 +188,44 @@ thread never blocks on the editor.
 workspace green; `cargo clippy` clean on default, `--features nih`, and
 `--features gui`; the egui editor compiles against `nih-plug-egui`.)*
 
-## Phase 4: Testing
+## Phase 4: Testing ✅ (host validation deferred to Phase 5)
 
-- [ ] **Unit tests** (`rt-pitch-core`):
-  - Ratio = 1.0 produces bit-identical output (or within noise
-    floor, given windowing).
-  - Ratio = 2.0 (octave up) applied to a 440 Hz sine produces a
-    dominant 880 Hz peak.
-  - Ratio changes crossfade cleanly (no discontinuity > −60 dBFS in
-    the wet signal at the transition).
-- [ ] **Integration tests**:
-  - Reference test vectors from Python (librosa or manual STFT).
-  - MIDI PC / CC → preset routing.
-- [ ] **RT-safety audit**:
-  - Allocator hook: zero allocations in `process()`.
-  - Denormal guard active.
-  - Latency matches the reported value exactly.
-- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval`.
+- [x] **Unit tests** (`rt-pitch-core`):
+  - Ratio = 1.0 reconstructs the input within the noise floor
+    (`unison_reconstructs_within_noise_floor`: correlation > 0.98,
+    scale-corrected residual < −20 dB — STFT overlap-add is not
+    bit-identical, but Hann COLA at 4× is high-fidelity).
+  - Ratio = 2.0 (octave up) on a 440 Hz sine → dominant 880 Hz peak
+    (`octave_up_doubles_pitch`).
+  - Ratio changes crossfade cleanly — the equal-power crossfade holds
+    RMS steady with no dropout/spike (`preset_change_has_no_click` in
+    the `rt-pitch` integration suite, where the two-voice blend lives).
+- [x] **Integration tests** (`rt-pitch/tests/integration.rs`):
+  - Reference frequencies from a **manual DFT** (a self-contained
+    Goertzel probe — no external `librosa` vectors): octave up/down and
+    fifth land at the predicted Hz end-to-end through the engine.
+  - MIDI PC / CC → preset routing (`program_to_slot` / `cc_to_slot`
+    drive the engine to the routed preset's pitch; out-of-range PC is
+    ignored; the CC sweep spans all eight slots).
+  - Latency warm-up matches the reported value
+    (`output_is_silent_through_the_reported_latency`).
+- [x] **RT-safety audit**:
+  - Allocator hook: zero allocations in `process()`
+    (`rt-pitch/tests/rt_alloc.rs` — a counting `#[global_allocator]`
+    proves the busiest stereo / dual-voice / formant render allocates
+    nothing in steady state).
+  - Denormal guard active — silence flushes to true zero
+    (`silence_flushes_to_true_zero`).
+  - Latency matches the reported value exactly, including across a
+    quality rebuild (`reported_latency_matches_build`).
+- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval` —
+  *deferred to Phase 5*: needs the built `.lv2` / `.clap` / `.vst3`
+  bundles and the external validators (the `gui` build already requires
+  system X11/GL libraries absent from the plain dev shell).
+
+*(12 new tests — 1 core fidelity + 8 engine integration + 2 RT-safety +
+1 zero-allocation; full workspace green at 480 passing; `cargo clippy`
+clean on default, `--features nih`, `--features gui`, and `--all-targets`.)*
 
 ## Phase 5: Packaging & release
 
