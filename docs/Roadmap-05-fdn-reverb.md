@@ -107,24 +107,37 @@ Plugin format target: **LV2 + CLAP + VST3** via
 - Deferred, not cancelled: a short ER tap bank is a natural refinement
   for the "room" / "plate" spaces in a later revision.
 
-## Phase 1: `rt-fdn-core` (engine crate)
+## Phase 1: `rt-fdn-core` (engine crate) ✅
 
-- [ ] **Workspace layout**:
-  - `rt-fdn-core` — reverb engine.
-  - `rt-fdn-reverb` — plugin.
-- [ ] **Delay-line primitives**:
-  - `ModulatedDelay { buf: Vec<f32>, mod_lfo, mod_depth }`.
-  - All-pass diffuser (Schroeder-style) chain.
-  - Cache-aligned buffers.
-- [ ] **FDN engine**:
-  - Compile-time-parameterised size (`FDN<N: usize>`).
-  - Feedback matrix as a `const fn` or generated at construction.
-  - `process_sample_stereo(&mut self, in_l: f32, in_r: f32) ->
-    (f32, f32)`.
-- [ ] **Tone controls inside the loop**:
-  - Low-cut and high-cut per feedback path.
-- [ ] **Preset bank**:
-  - 8 preset structs (delay lengths, matrix, damping, mod depth).
+- **Workspace layout**:
+  - `rt-fdn-core` — reverb engine (this phase).
+  - `rt-fdn-reverb` — plugin (deferred to Phase 2).
+  - Framework-agnostic; depends only on the root crate for
+    `flush_to_zero` / `DenormalGuard` (mirrors `rt-spectral-core`).
+- **Parameter-smoothing utility** (the prerequisite): one-pole
+  exponential [`smoother.rs`] with a stall-snap so `f32` glides
+  terminate cleanly.  Used by the engine for size and mod-depth.
+- **Delay-line primitives**:
+  - `ModulatedDelay` [`delay.rs`] — fractional, linear-interpolated,
+    per-line LFO ([`lfo.rs`]), power-of-two circular buffer sized at
+    construction (the "cache-aligned buffers" item), explicit
+    read()/write() split for the matrix feedback step.
+  - Schroeder all-pass diffuser + chain [`allpass.rs`].
+- **FDN engine** [`fdn.rs`]:
+  - Compile-time size `Fdn<const N: usize>` (presets use `N = 8`).
+  - Lossless fast Walsh–Hadamard mixing matrix [`matrix.rs`].
+  - Per-branch feedback gains derived from T60 (uniform decay).
+  - `process_sample_stereo(&mut self, f32, f32) -> (f32, f32)` with
+    decorrelated stereo tap / injection sign patterns.
+- **Tone controls inside the loop** [`filter.rs`]:
+  - Per-branch one-pole high-cut (damping) + low-cut (high-pass).
+- **Preset bank** [`preset.rs`]:
+  - 8 `Space` presets (room, hall, plate, spring, chamber, cave,
+    shimmer, non-linear) over the Phase 0 coprime delay set.
+- **Tests**: 48 passing (per-module unit + engine integration:
+  stability over 60 s at max decay, decay ordering, stereo
+  decorrelation, silent-in/silent-out, reset, all presets finite,
+  live size sweep, 96 kHz).  `cargo clippy -D warnings` clean.
 
 ## Phase 2: `rt-fdn-reverb` plugin
 
