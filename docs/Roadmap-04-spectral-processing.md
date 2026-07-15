@@ -28,35 +28,167 @@ Plugin format target: **LV2 + CLAP + VST3** via
   denoise → gate → compress → click-remove.  User can enable /
   bypass each independently.
 
-## Prerequisites in `rt-fft-convolver`
+## Prerequisites in `rt-fft-convolver` ✅
 
-- [ ] Reuse `dsp/fft_handler.rs` (`realfft`) — same real-to-complex
+- Reuse `dsp/fft_handler.rs` (`realfft`) — same real-to-complex
   wrapper.
-- [ ] `DenormalGuard` — spectral magnitudes below the noise floor
+- `DenormalGuard` — spectral magnitudes below the noise floor
   are exactly the case denormals appear in.
-- [ ] Ring-buffer utilities (see [Roadmap-03-pitch-shift.md]) —
+- Ring-buffer utilities (see [Roadmap-03-pitch-shift.md]) —
   shared code candidate.
 
-## Phase 0: Algorithm decisions
+## Phase 0: Algorithm decisions ✅
 
-- [ ] **Denoise algorithm** — [decision]:
-  - Spectral subtraction (classic, artefact-prone).
-  - Wiener filtering (better SNR floor).
-  - Minima-Controlled Recursive Averaging (MCRA) noise estimation
-    + Wiener.
-  - Deep-learning based (small on-device model) — see also
-    `rt-neural-amp` inference stack.
-- [ ] **Transient handling** — [decision]:
-  - Onset-detected bypass of denoise/compress on transients.
-  - No special handling (simplest).
-- [ ] **FFT size(s)**:
-  - 2048 @ 48 kHz (~43 ms) default.
-  - 4096 optional (~85 ms, better frequency resolution).
-- [ ] **Window / overlap**:
-  - Hann + 75 % overlap default.  [decision] whether to expose.
-- [ ] **Click / hum detection**:
-  - Median-filter-based click detection.
-  - Notch-filter bank for hum (50/60 Hz + harmonics).
+### Denoise algorithm — **decision: Wiener with decision-directed SNR, learn-seeded; MCRA optional**
+
+- **Core**: per-bin **Wiener gain** driven by the **decision-directed
+  (Ephraim–Malah) a-priori SNR** estimate.  The DD estimator is what
+  keeps Wiener free of *musical noise* — it smooths the a-priori SNR
+  across frames, so isolated random bin spikes don't turn into
+  warbling tones.
+  - Gain: `G(k) = ξ(k) / (1 + ξ(k))`, with a-priori SNR
+    `ξ(k) = α·(|Y_{prev}|²·G_prev²)/N(k) + (1−α)·max(γ(k)−1, 0)`,
+    a-posteriori SNR `γ(k) = |Y(k)|² / N(k)`, smoothing `α ≈ 0.98`.
+  - `N(k)` is the per-bin noise power from the learned profile.
+- **Noise floor / oversubtraction control** exposed as `Sensitivity`
+  and `Reduction`: gain is floored at `10^(−Reduction/20)` so residual
+  is a controllable bed of attenuated noise, not a hole.
+- **Learn-seeded** (RX / Waves W43 workflow): the `Learn` button
+  captures a static per-bin profile off-RT (median magnitude across
+  frames → power).  The RT thread only reads it via `arc-swap`.
+- **MCRA** (Minima-Controlled Recursive Averaging) is kept as an
+  **optional continuous-tracking mode** for the no-learn / "set and
+  forget" path (NS1 / Cedar DNS style).  It adds per-bin minimum
+  tracking state but no new RT allocations.
+- *Rejected*: plain **spectral subtraction** (musical-noise prone — it
+  survives only as the degenerate `α=0`, oversubtraction>1 case) and
+  **deep-learning** denoise (defer to `rt-neural-amp` stack; out of
+  scope, see §Out of scope).
+
+### Transient handling — **decision: onset-detected soft bypass**
+
+- Compute **spectral flux** `SF = Σ_k max(|Y(k)|−|Y_{prev}(k)|, 0)`
+  once per frame (essentially free — magnitudes already computed).
+- On an onset (flux exceeds an adaptive median threshold), **crossfade
+  the denoise/compress depth toward unity** for that frame so pick
+  attacks and drum transients aren't smeared.  Gate/hum/click are
+  unaffected.
+- High value for a guitar-oriented suite (pick attack preservation);
+  the cost is one scalar reduction per frame.
+
+### FFT size(s) — **settled: 1024 / 2048 / 4096, default 2048**
+
+- Reported latency = `N − hop = 3N/4` (75 % overlap), the true group
+  delay of the STFT OLA path:
+
+  | N | frame @48 kHz | latency (`3N/4`) | use |
+  |---|---|---|---|
+  | 1024 | 21.3 ms | **16.0 ms** | "Live" |
+  | 2048 | 42.7 ms | **32.0 ms** | "Studio" (default) |
+  | 4096 | 85.3 ms | **64.0 ms** | "HiRes" (best freq. resolution) |
+
+  - ⚠️ Corrects the design-principle note (§Design principles): the
+    "21–85 ms" figures were the *full frame* `N`, not `N − hop`.  Report
+    `N − hop` to the host and recompute on size change / sample-rate
+    change (sizes are defined in samples, so latency in ms scales with
+    `fs`).
+
+### Window / overlap — **decision: Hann analysis+synthesis, 75 % overlap, fixed**
+
+- Both analysis and synthesis windowed with **Hann** (effective `Hann²`
+  weighting), **hop = N/4**.  `Hann²` at 75 % overlap satisfies COLA;
+  normalise by the constant OLA gain so an all-pass chain is unity.
+- **Not exposed** (like the pitch plugin's fixed 4× overlap): keeps
+  reported latency and buffer sizes deterministic for host
+  compensation and the RT-safety audit.  A 50 % "low-CPU" advanced
+  option is a post-1.0 candidate.
+- Reuse the existing Hann/COLA helper (shared crate, see prerequisites).
+
+### Click / hum removal — **decision: time-domain stages, not per-bin operators**
+
+This revises the Phase 1 operator list.  A click is a *broadband,
+flat-spectrum* event and hum is a *few pure lines* — both are clumsy
+and lossy to treat per-STFT-bin.  Handle them in the time domain,
+flanking the STFT core:
+
+- **Hum**: cascaded **biquad notch bank** at the fundamental (50 / 60 Hz
+  or custom) + up to N harmonics, `RBJ` notch with adjustable `Q`.
+  Surgical, sample-accurate, no added latency.  Reuse the existing
+  `biquad.rs`.
+- **Click**: **median-filter detector** (order 5–9) on the time-domain
+  signal; flag samples whose deviation from the median exceeds
+  `Sensitivity`, then **interpolate** the flagged run (cubic / short AR
+  model) up to `Max Length` samples.  A pre-STFT stage operating on the
+  input ring.
+- ⚠️ **Phase 1 impact**: drop `notch_hum` / `click_repair` from the
+  per-bin `Bin` operator chain; add a `TimeDomainPre` (click) and
+  `TimeDomainPost` (hum) stage instead.  The per-bin chain remains
+  denoise → gate → compress.
+
+## Cost model (CPU / memory / complexity)
+
+Baseline: **48 kHz, stereo, N = 2048, hop = 512**, `K = N/2+1 = 1025`
+bins, frame rate `fs/hop = 93.75 frames/s` per channel.
+
+### Per-operator complexity (per frame, per channel)
+
+| Stage | Complexity | Notes |
+|---|---|---|
+| STFT fwd + inv | `O(N log N)` | ~110 k flops/frame @ N=2048 |
+| Window + OLA | `O(N)` | 2 mul-add passes |
+| Denoise (Wiener + DD SNR) | `O(K)` | ~20 flops/bin + 1 `arc-swap` load/frame |
+| Spectral gate | `O(K)` | ~8 flops/bin |
+| Spectral compress | `O(K)` | ~15 flops/bin (log/knee) |
+| Transient (spectral flux) | `O(K)` | 1 scalar/frame |
+| Hum notch (time domain) | `O(M · hop)` | M biquads, M = harmonics |
+| Click (time domain) | `O(w · hop)` | median window `w` |
+
+### CPU estimate
+
+FFT dominates and is cheap: fwd+inv ≈ 110 k flops/frame → `×93.75 ×2 ch
+≈ 21 Mflops/s`.  All bin operators worst-case (~60 flops/bin) add
+`≈ 12 Mflops/s`.  Time-domain notch/click add a few Mflops/s.  Total
+arithmetic is **well under 100 Mflops/s** against multi-Gflop cores.
+
+Realistic wall-clock (including windowing memory traffic, `arc-swap`
+loads, denormal handling — hence `DenormalGuard`) per **stereo
+instance**:
+
+| N | est. CPU (1 core, modern x86-64) |
+|---|---|
+| 1024 | ~1.5 – 3 % (2× frame rate, higher overhead/sample) |
+| 2048 | **~1 – 2 %** |
+| 4096 | ~0.8 – 1.5 % (half the frame rate) |
+
+Larger N is *cheaper per second* (fewer frames) but costs latency and
+frequency smearing — the trade-off, not CPU, drives the size choice.
+
+### Memory (RT-resident, per stereo instance @ N=2048)
+
+| Buffer | Size |
+|---|---|
+| Input ring + OLA accumulator (×2 ch) | 4 × 2048 f32 = 32 KB |
+| Spectrum + scratch (`FftHandler`) | ~24 KB |
+| Hann window (shared) | 8 KB |
+| Noise profile, double-buffered (`arc-swap`) | 2 × 1025 f32 = 8 KB |
+| Biquad notch state, click median window | < 1 KB |
+| **Total RT footprint** | **~70 – 80 KB** |
+
+Off-RT / UI only (not on the audio thread): the Phase 3 spectrogram
+history is the memory hog — 5 s × 93.75 frames/s × 1025 bins × 4 B ≈
+**1.9 MB per channel**.  Down-sample bins/time for the display buffer;
+never size the RT path to it.
+
+### Implementation complexity ranking (effort, not runtime)
+
+1. **STFT front-end + COLA** — low (reuse `FftHandler` + window helper).
+2. **Gate / compress** — low (per-bin static curves).
+3. **Hum notch** — low (reuse `biquad.rs`).
+4. **Wiener + DD SNR denoise** — medium (per-bin SNR state, tuning).
+5. **Click detect + interpolate** — medium (false-positive tuning vs.
+   guitar transients — coordinate with the transient detector).
+6. **MCRA continuous noise tracking** — medium-high (minimum-statistics
+   state machine); optional, can land after 1.0.
 
 ## Phase 1: `rt-spectral-core` (engine crate)
 
