@@ -203,7 +203,7 @@ length.
 
 ## Phase 4: Testing
 
-- [ ] **Unit tests** (`rt-limiter-core`):
+- [x] **Unit tests** (`rt-limiter-core`):
   - True-peak of the output never exceeds the ceiling for any
     input at any tested oversampling factor (test with a
     high-frequency signal designed to alias).
@@ -213,9 +213,9 @@ length.
     samples ± 1.
   - Release: gain reduction returns to 0 dB within the specified
     time (± 10 %).
-- [ ] **Loudness compliance**:
+- [x] **Loudness compliance**:
   - Reference BS.1770-4 test vectors, if LUFS is included.
-- [ ] **RT-safety audit**:
+- [x] **RT-safety audit**:
   - Zero allocations in `process()`.
   - Denormal guard active.
   - Reported latency matches actual sample-accurate delay.
