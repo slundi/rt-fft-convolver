@@ -71,6 +71,11 @@ pub struct PhysicalParams {
     pub num_modes: usize,
     /// Higher modes decay faster (`> 1`) or slower (`< 1`) than the fundamental.
     pub decay_slope: f32,
+
+    /// Global tuning multiplier applied to every triggered note's frequency
+    /// (`1.0` = concert pitch).  Drives the plugin's Detune control:
+    /// `tune_mult = 2^(cents / 1200)`.
+    pub tune_mult: f32,
 }
 
 impl Default for PhysicalParams {
@@ -84,6 +89,7 @@ impl Default for PhysicalParams {
             preset: ModePreset::Metal,
             num_modes: 5,
             decay_slope: 1.0,
+            tune_mult: 1.0,
         }
     }
 }
@@ -161,7 +167,7 @@ impl Voice {
         self.held = true;
         self.env = 0.0;
         self.fade = 0.0;
-        let freq = midi_to_freq(note);
+        let freq = midi_to_freq(note) * params.tune_mult.max(f32::MIN_POSITIVE);
 
         match &mut self.kernel {
             Kernel::Plucked { string, exc } => {
@@ -379,5 +385,40 @@ mod tests {
         for _ in 0..96_000 {
             assert!(voice.process().is_finite());
         }
+    }
+
+    #[test]
+    fn tune_mult_shifts_pitch_up_an_octave() {
+        // A single modal mode is near-sinusoidal, so counting positive-going
+        // zero crossings is a faithful pitch proxy. Doubling `tune_mult` should
+        // roughly double the crossing rate.
+        let crossings = |tune_mult: f32| {
+            let mut voice = Voice::new(SR, Model::Modal, max_loop_len(SR));
+            let params = PhysicalParams {
+                model: Model::Modal,
+                num_modes: 1,
+                t60: 2.0,
+                tune_mult,
+                ..PhysicalParams::default()
+            };
+            voice.trigger(57, 1.0, 1, &params, SR); // A3
+            let mut prev = 0.0;
+            let mut count = 0u32;
+            for _ in 0..SR as usize / 4 {
+                let sample = voice.process();
+                if prev <= 0.0 && sample > 0.0 {
+                    count += 1;
+                }
+                prev = sample;
+            }
+            count
+        };
+        let base = crossings(1.0);
+        let octave = crossings(2.0);
+        let ratio = octave as f32 / base as f32;
+        assert!(
+            (ratio - 2.0).abs() < 0.1,
+            "octave detune should ~double pitch, got ratio {ratio}"
+        );
     }
 }

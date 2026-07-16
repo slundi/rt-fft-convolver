@@ -1,0 +1,27 @@
+[package]
+name = "rt-physical"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Physical-modelling instrument plugin (LV2 / CLAP / VST3) built on rt-physical-core.  Polyphonic extended Karplus-Strong plucked strings and a modal resonator bank, MIDI-driven or audio-excited, with body stereoisation.  See docs/Roadmap-06-physical-modeling.md."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+publish = false
+
+[lib]
+# `cdylib` is what the CLAP/VST3 bundles load; `lib` keeps unit tests working.
+crate-type = ["lib", "cdylib"]
+
+[features]
+# The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
+# Build the actual plugin with `cargo build -p rt-physical --features nih`.
+# The nih-plug-egui editor lands in Phase 3 behind a `gui` feature.
+default = []
+nih = ["dep:nih_plug"]
+
+[dependencies]
+# The physical-modelling engine (polyphonic voice manager + model kernels).
+rt-physical-core = { path = "../rt-physical-core" }
+
+# nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

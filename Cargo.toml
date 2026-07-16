@@ -34,6 +34,7 @@ members = [
     "rt-fdn-core",
     "rt-fdn-reverb",
     "rt-physical-core",
+    "rt-physical",
     "xtask",
 ]
 # `xtask` exists only for `cargo xtask …` (the bundler); keep it out of plain
@@ -54,6 +55,7 @@ default-members = [
     "rt-fdn-core",
     "rt-fdn-reverb",
     "rt-physical-core",
+    "rt-physical",
 ]
 
 [package.metadata.docs.rs]

@@ -197,37 +197,44 @@ burst for MIDI/synth use; the plugin feeds audio in for effect use.
 no state leak across reused voices, quietest-first stealing, finite
 output on sustained tails); `cargo fmt` + `clippy` clean.
 
-## Phase 2: `rt-physical` plugin
+## Phase 2: `rt-physical` plugin ✅
 
-- [ ] **I/O**:
-  - Audio in → audio out (effect use).
-  - MIDI in → audio out (synth use).
-  - Stereo out via body / bridge stereoisation.
-- [ ] **Model selector**:
-  - Dropdown: plucked, bowed, struck, tube-stage, modal.
-- [ ] **Plucked-string controls**:
-  - `Pluck Position` (0–100 %).
-  - `Pick Hardness` (0–100 %).
-  - `Damping` (0–100 %).
-  - `Body Type` (dropdown: none, small, dreadnought, cello, custom
-    IR).
-  - `Detune` (cents).
-- [ ] **Bowed-string controls**:
-  - `Bow Force`, `Bow Velocity`, `Bow Position`.
-- [ ] **Modal controls**:
-  - `Modes` (1–32).
-  - `Frequency Ratios` preset (metal, wood, glass, custom).
-  - `Decay Slope` (bright modes decay faster / slower).
-- [ ] **Global controls**:
-  - `Gain`.
-  - `Mix` (effect mode only).
-  - `Polyphony` (voice limit).
-  - `Bypass`.
-- [ ] **MIDI**:
-  - Full note routing with velocity → excitation energy mapping.
-  - Aftertouch → damping (optional).
-  - CC on the model's most-used parameter.
-- [ ] **CPU meter** (per-voice cost × active voices).
+Framework-agnostic DSP (`params.rs`, `engine.rs`) with the `nih-plug`
+wrapper (`plugin.rs`) behind the opt-in **`nih`** feature — the same
+split as `rt-fdn-reverb`, so `cargo test` / `clippy` stay offline.
+
+- [x] **I/O**:
+  - MIDI in → audio out (synth use) — sample-accurate note routing.
+  - Audio in → audio out (effect use) via the `Mix` dry/wet blend;
+    the plugin declares both a stereo-input and a no-input layout.
+    *(Per-voice audio-signal excitation — audio driving the string
+    loop directly — is a future enhancement; Phase 2 blends the input
+    at the bus.)*
+  - Stereo out via body stereoisation (two body filters spread ±3 %).
+- [x] **Model selector** — dropdown over the two v1 families
+  (`Plucked`, `Modal`).  Bowed / struck / tube stay deferred per the
+  Phase 0 scope.
+- [x] **Plucked-string controls**: `Pluck Position`, `Pick Hardness`,
+  `Damping`, `Body Type` (none / small / dreadnought / cello — custom
+  IR deferred), `Detune` (± one semitone in cents).
+- [ ] **Bowed-string controls** — *deferred* with the bowed family.
+- [x] **Modal controls**: `Modes` (1–32), `Frequency Ratios` preset
+  (metal / wood / glass), `Decay Slope`.
+- [x] **Global controls**: `Gain`, `Mix`, `Polyphony`, `Bypass`, plus
+  a shared `Decay` (sustain / T60) needed by both families.
+- [x] **MIDI**:
+  - Full note on/off routing with velocity → excitation energy.
+  - Aftertouch (channel pressure) → `Damping`.
+  - CC 74 (Brightness) → `Damping` (the model's most-used control),
+    with host-move arbitration.
+- [x] **CPU meter** — render-time / block-budget proxy stored for the
+  Phase 3 editor, plus `active_voice_count()` on the engine.
+
+18 plugin unit tests (per-family note-on, bypass, mix, gain scaling,
+body stereo decorrelation, model-switch silencing, polyphony cap,
+reset, detune, finite output under load) + 1 new core detune test;
+`nih` feature compiles for CLAP/VST3; `cargo fmt` + `clippy` clean on
+both the default and `nih` builds.
 
 ## Phase 3: UI
 
