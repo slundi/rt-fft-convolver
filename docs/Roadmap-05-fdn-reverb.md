@@ -186,15 +186,29 @@ fast and offline, mirroring `rt-spectral` / `rt-ir-reverb`.
   `ms_to_samples`, `db_to_gain` and the `program_to_slot` MIDI policy are reused
   from `rt-ir-plugin-core`.
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
-- [ ] **Preset rack**: 8 pads with space name.
-- [ ] **Impulse-response visualiser**: run a virtual impulse through
-  the current settings and display the resulting decay envelope.
-  Updated on parameter change.
-- [ ] **Freeze indicator** with an obvious LED.
-- [ ] **MIDI activity indicator**.
+- **`nih-plug-egui`** — **decision**: egui, matching the whole plugin
+  suite (`rt-spectral`, `rt-ir-reverb`); no reason to introduce iced for one
+  plugin. Built with the `gui` feature (`cargo build -p rt-fdn-reverb
+  --features gui`); the git `nih_plug_egui` + `baseview` + system GL/X11 libs
+  keep it off the default/CI build, so `cargo test` / `clippy` stay offline.
+- **Preset rack**: 8 pads, each labelled with its slot's space name;
+  clicking selects `Current Preset`; the active pad is highlighted and disabled
+  slots are dimmed. The active slot's `Space` + `Preset Enabled` sit below.
+- **Impulse-response visualiser**: [`ui::decay_envelope_db`] runs a virtual
+  impulse through a throwaway engine built from the current settings and reduces
+  it to a normalised dB decay envelope, recomputed only when the parameters
+  change. Framework-agnostic and unit-tested (longer decay → higher tail).
+  - **Note**: the preview renders at the *host* sample rate, not a reduced one —
+    the in-loop damping filter loses energy per feedback pass, and passes-per-
+    second scale with the rate, so a decimated preview would understate the
+    tail. `Freeze` is ignored by the preview (it mutes the FDN input → silence);
+    the decay *shape* is what is shown, with freeze surfaced via its LED.
+- **Freeze indicator**: a cyan LED in the header, lit while `Freeze` is on.
+- **MIDI activity indicator**: a header LED driven by an atomic event
+  counter (reusing `rt_ir_plugin_core::MidiActivity` / `MidiStatus`), green on a
+  recognised PC/CC. The CPU meter (render-time ÷ budget) reads out beside it.
 
 ## Phase 4: Testing
 

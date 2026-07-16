@@ -25,13 +25,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use nih_plug::prelude::*;
+#[cfg(feature = "gui")]
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 use rt_fdn_core::PRESETS;
 use rt_ir_plugin_core::program_to_slot;
+#[cfg(feature = "gui")]
+use rt_ir_plugin_core::{MidiActivity, MidiStatus};
 
 use crate::engine::ReverbEngine;
 use crate::params::{
     CROSSFADE_MS_RANGE, DECAY_S_RANGE, FADER_DB_RANGE, HIGH_CUT_RANGE, LOW_CUT_RANGE,
     MOD_RATE_HZ_RANGE, NUM_PRESETS, NUM_SPACES, PREDELAY_MS_RANGE, ReverbParams,
+};
+#[cfg(feature = "gui")]
+use crate::ui::{
+    DISPLAY_CEIL_DB, DISPLAY_FLOOR_DB, ENVELOPE_BUCKETS, db_to_intensity, decay_envelope_db,
+    envelope_seconds,
 };
 
 /// CC number that live-controls `Decay`.
@@ -111,6 +120,10 @@ struct FdnReverbParams {
     freeze: BoolParam,
     #[id = "byp"]
     bypass: BoolParam,
+
+    #[cfg(feature = "gui")]
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 /// Build a linear `FloatParam` over an inclusive `(min, max)` range.
@@ -195,6 +208,8 @@ impl Default for FdnReverbParams {
             freeze: BoolParam::new("Freeze", defaults.freeze),
             bypass: BoolParam::new("Bypass", false)
                 .with_value_to_string(formatters::v2s_bool_bypass()),
+            #[cfg(feature = "gui")]
+            editor_state: EguiState::from_size(640, 560),
         }
     }
 }
@@ -246,8 +261,15 @@ pub struct FdnReverbPlugin {
     params: Arc<FdnReverbParams>,
     engine: Option<ReverbEngine>,
     midi: MidiOverrides,
-    /// CPU load = render time / block budget (`f32` bits), for the Phase-3 meter.
+    /// CPU load = render time / block budget (`f32` bits), for the editor meter.
     cpu_meter: Arc<AtomicU32>,
+    /// Bumped on each recognised MIDI event so the editor LED can blink.
+    #[cfg(feature = "gui")]
+    midi_counter: Arc<AtomicU32>,
+    /// Host sample rate (`f32` bits) — the editor renders its decay preview
+    /// at the host rate (filter loss per second is rate-dependent).
+    #[cfg(feature = "gui")]
+    sample_rate_hz: Arc<AtomicU32>,
 }
 
 impl Default for FdnReverbPlugin {
@@ -257,6 +279,10 @@ impl Default for FdnReverbPlugin {
             engine: None,
             midi: MidiOverrides::default(),
             cpu_meter: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "gui")]
+            midi_counter: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "gui")]
+            sample_rate_hz: Arc::new(AtomicU32::new(48_000.0f32.to_bits())),
         }
     }
 }
@@ -304,26 +330,106 @@ impl FdnReverbPlugin {
         snapshot
     }
 
-    /// Decode one MIDI event into an override.
-    fn handle_midi(&mut self, event: &NoteEvent<()>) {
+    /// Decode one MIDI event into an override.  Returns `true` if the event was
+    /// recognised (drives the editor's MIDI-activity LED).
+    fn handle_midi(&mut self, event: &NoteEvent<()>) -> bool {
         match *event {
             NoteEvent::MidiProgramChange { program, .. } => {
-                if let Some(slot) = program_to_slot(program, NUM_PRESETS) {
-                    self.midi.preset = Some(slot);
+                match program_to_slot(program, NUM_PRESETS) {
+                    Some(slot) => {
+                        self.midi.preset = Some(slot);
+                        true
+                    }
+                    None => false,
                 }
             }
             NoteEvent::MidiCC { cc, value, .. } => match cc {
                 CC_DECAY => {
                     self.midi.decay_s =
                         Some(DECAY_S_RANGE.0 + value * (DECAY_S_RANGE.1 - DECAY_S_RANGE.0));
+                    true
                 }
-                CC_SIZE => self.midi.size = Some(value.clamp(0.0, 1.0)),
-                CC_FREEZE => self.midi.freeze = Some(value >= 0.5),
-                _ => {}
+                CC_SIZE => {
+                    self.midi.size = Some(value.clamp(0.0, 1.0));
+                    true
+                }
+                CC_FREEZE => {
+                    self.midi.freeze = Some(value >= 0.5);
+                    true
+                }
+                _ => false,
             },
-            _ => {}
+            _ => false,
         }
     }
+}
+
+// ─── egui editor (Phase 3, `gui` feature) ──────────────────────────────────
+
+/// Per-open editor state owned by the egui closure.
+#[cfg(feature = "gui")]
+#[derive(Default)]
+struct FdnEditorState {
+    midi: MidiActivity,
+    last_midi: u32,
+    /// Cached decay-envelope plot (dB per bucket), recomputed on param change.
+    envelope: Vec<f32>,
+    /// Parameter snapshot the cached envelope was computed from.
+    last_params: Option<ReverbParams>,
+}
+
+/// Draw the decay-envelope visualiser: a filled curve, newest energy at the
+/// left, log-amplitude (dB) on the vertical axis.
+#[cfg(feature = "gui")]
+fn draw_envelope(
+    ui: &mut egui::Ui,
+    envelope: &[f32],
+    panel: egui::Color32,
+    grid: egui::Color32,
+    accent: egui::Color32,
+) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 120.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 4.0, panel);
+
+    // Horizontal grid at −20 / −40 dB.
+    for &db in &[-20.0f32, -40.0] {
+        let intensity = db_to_intensity(db, DISPLAY_FLOOR_DB, DISPLAY_CEIL_DB);
+        let y = rect.bottom() - intensity * rect.height();
+        ui.painter().line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(1.0, grid),
+        );
+    }
+
+    if envelope.len() < 2 {
+        return;
+    }
+    let last = (envelope.len() - 1) as f32;
+    let point = |index: usize, db: f32| -> egui::Pos2 {
+        let x = rect.left() + index as f32 / last * rect.width();
+        let intensity = db_to_intensity(db, DISPLAY_FLOOR_DB, DISPLAY_CEIL_DB);
+        egui::pos2(x, rect.bottom() - intensity * rect.height())
+    };
+
+    // Vertical drop-lines under the curve for a solid "tail" look, then the
+    // envelope line on top.
+    for (index, &db) in envelope.iter().enumerate() {
+        let top = point(index, db);
+        ui.painter().line_segment(
+            [top, egui::pos2(top.x, rect.bottom())],
+            egui::Stroke::new(1.0, accent.gamma_multiply(0.25)),
+        );
+    }
+    let line: Vec<egui::Pos2> = envelope
+        .iter()
+        .enumerate()
+        .map(|(index, &db)| point(index, db))
+        .collect();
+    ui.painter()
+        .add(egui::Shape::line(line, egui::Stroke::new(2.0, accent)));
 }
 
 impl Plugin for FdnReverbPlugin {
@@ -350,6 +456,177 @@ impl Plugin for FdnReverbPlugin {
         self.params.clone()
     }
 
+    #[cfg(feature = "gui")]
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        use egui::Color32;
+
+        // Violet accent — distinct from the teal restoration / IR plugins.
+        const ACCENT: Color32 = Color32::from_rgb(0x9a, 0x7c, 0xf0);
+        const PANEL: Color32 = Color32::from_rgb(0x16, 0x14, 0x1e);
+        const GRID: Color32 = Color32::from_rgb(0x2c, 0x2a, 0x38);
+        const FROZEN: Color32 = Color32::from_rgb(0x5a, 0xc8, 0xff);
+        const DIM: Color32 = Color32::from_rgb(0x24, 0x22, 0x2e);
+
+        let params = self.params.clone();
+        let cpu_meter = self.cpu_meter.clone();
+        let midi_counter = self.midi_counter.clone();
+        let sample_rate_hz = self.sample_rate_hz.clone();
+
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            FdnEditorState::default(),
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                // Drive the MIDI LED from the shared counter.
+                let count = midi_counter.load(Ordering::Relaxed);
+                if count != state.last_midi {
+                    state.last_midi = count;
+                    state.midi.trigger(true);
+                }
+                state.midi.decay(0.08);
+
+                // Recompute the decay preview only when the parameters change.
+                let snapshot = params.snapshot();
+                if state.last_params != Some(snapshot) {
+                    let sample_rate =
+                        f32::from_bits(sample_rate_hz.load(Ordering::Relaxed)).max(1.0) as u32;
+                    state.envelope = decay_envelope_db(
+                        &snapshot,
+                        sample_rate,
+                        envelope_seconds(snapshot.decay_s),
+                        ENVELOPE_BUCKETS,
+                    );
+                    state.last_params = Some(snapshot);
+                }
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Header: title · freeze LED · MIDI LED · bypass ──────
+                    ui.horizontal(|ui| {
+                        ui.heading("RT FDN Reverb");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.bypass, setter));
+                            ui.label("Bypass");
+
+                            // MIDI activity LED.
+                            let (led, _) = ui
+                                .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            let base = match state.midi.status() {
+                                MidiStatus::Recognised => Color32::from_rgb(0x4e, 0xc3, 0x6a),
+                                MidiStatus::Unrecognised => Color32::from_rgb(0xd9, 0x4a, 0x4a),
+                                MidiStatus::Idle => Color32::from_gray(0x30),
+                            };
+                            let level = state.midi.level();
+                            let col = Color32::from_rgb(
+                                (0x30 as f32 + (base.r() as f32 - 0x30 as f32) * level) as u8,
+                                (0x30 as f32 + (base.g() as f32 - 0x30 as f32) * level) as u8,
+                                (0x30 as f32 + (base.b() as f32 - 0x30 as f32) * level) as u8,
+                            );
+                            ui.painter().circle_filled(led.center(), 5.0, col);
+                            ui.label("MIDI");
+
+                            // Freeze LED.
+                            let frozen = params.freeze.value();
+                            let (fled, _) = ui
+                                .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                fled.center(),
+                                5.0,
+                                if frozen {
+                                    FROZEN
+                                } else {
+                                    Color32::from_gray(0x30)
+                                },
+                            );
+                            ui.label("Freeze");
+                        });
+                    });
+                    ui.separator();
+
+                    // ── Preset rack: 8 pads labelled with each slot's space ──
+                    let current = params.current_preset.value();
+                    ui.horizontal(|ui| {
+                        for slot in 0..NUM_PRESETS {
+                            let space = params.slots[slot].space.value() as usize;
+                            let name = PRESETS.get(space).map(|p| p.name).unwrap_or("—");
+                            let enabled = params.slots[slot].enabled.value();
+                            let active = slot as i32 == current;
+                            let fill = if active {
+                                ACCENT
+                            } else if enabled {
+                                DIM
+                            } else {
+                                PANEL
+                            };
+                            let resp = ui.add_sized(
+                                egui::vec2(70.0, 40.0),
+                                egui::Button::new(format!("{}\n{name}", slot + 1)).fill(fill),
+                            );
+                            if resp.clicked() {
+                                setter.begin_set_parameter(&params.current_preset);
+                                setter.set_parameter(&params.current_preset, slot as i32);
+                                setter.end_set_parameter(&params.current_preset);
+                            }
+                        }
+                    });
+
+                    // ── Active slot: space + enabled ─────────────────────────
+                    let active_slot = (current as usize).min(NUM_PRESETS - 1);
+                    ui.horizontal(|ui| {
+                        ui.label("Space");
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.slots[active_slot].space,
+                            setter,
+                        ));
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.slots[active_slot].enabled,
+                            setter,
+                        ));
+                    });
+
+                    // ── Decay-envelope visualiser ────────────────────────────
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Impulse decay").weak());
+                    draw_envelope(ui, &state.envelope, PANEL, GRID, ACCENT);
+
+                    // ── CPU meter ────────────────────────────────────────────
+                    let cpu = f32::from_bits(cpu_meter.load(Ordering::Relaxed));
+                    ui.label(format!("CPU {:.1} %", (cpu * 100.0).clamp(0.0, 999.0)));
+                    ui.separator();
+
+                    // ── Global controls ──────────────────────────────────────
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::Grid::new("fdn-controls")
+                            .num_columns(2)
+                            .spacing(egui::vec2(8.0, 4.0))
+                            .show(ui, |ui| {
+                                let row = |ui: &mut egui::Ui, label: &str, param: &FloatParam| {
+                                    ui.label(label);
+                                    ui.add(widgets::ParamSlider::for_param(param, setter));
+                                    ui.end_row();
+                                };
+                                row(ui, "Decay", &params.decay_s);
+                                row(ui, "Size", &params.size);
+                                row(ui, "Damping", &params.damping);
+                                row(ui, "Diffusion", &params.diffusion);
+                                row(ui, "Mod Depth", &params.mod_depth);
+                                row(ui, "Mod Rate", &params.mod_rate);
+                                row(ui, "Pre-Delay", &params.predelay_ms);
+                                row(ui, "Crossfade", &params.crossfade_ms);
+                                row(ui, "Low Cut", &params.low_cut);
+                                row(ui, "High Cut", &params.high_cut);
+                                row(ui, "Width", &params.width);
+                                row(ui, "Dry", &params.dry_db);
+                                row(ui, "Wet", &params.wet_db);
+                                ui.label("Freeze");
+                                ui.add(widgets::ParamSlider::for_param(&params.freeze, setter));
+                                ui.end_row();
+                            });
+                    });
+                });
+            },
+        )
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
@@ -362,6 +639,10 @@ impl Plugin for FdnReverbPlugin {
 
         // Zero-latency dry path.
         context.set_latency_samples(0);
+
+        #[cfg(feature = "gui")]
+        self.sample_rate_hz
+            .store((sample_rate as f32).to_bits(), Ordering::Relaxed);
 
         self.midi.last_preset = self.params.current_preset.value();
         self.midi.last_decay = self.params.decay_s.value();
@@ -384,7 +665,13 @@ impl Plugin for FdnReverbPlugin {
     ) -> ProcessStatus {
         // Collect MIDI up front (preset / knob switches are not sample-accurate).
         while let Some(event) = context.next_event() {
-            self.handle_midi(&event);
+            let recognised = self.handle_midi(&event);
+            #[cfg(feature = "gui")]
+            if recognised {
+                self.midi_counter.fetch_add(1, Ordering::Relaxed);
+            }
+            #[cfg(not(feature = "gui"))]
+            let _ = recognised;
         }
 
         let base = self.params.snapshot();

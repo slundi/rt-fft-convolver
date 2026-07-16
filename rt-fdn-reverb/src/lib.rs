@@ -19,15 +19,20 @@
 //! - [`engine`] — [`ReverbEngine`](engine::ReverbEngine): the pre-built FDN
 //!   voice bank, the equal-power preset crossfade, and the wet bus, all
 //!   allocation-free on the audio thread.
+//! - [`ui`] — framework-agnostic editor helpers: the impulse-response
+//!   decay-envelope visualiser plus dB / intensity conversions, unit-testable
+//!   without `egui`.
 //! - `plugin` — the actual `nih-plug` `Plugin`, compiled only with the **`nih`**
 //!   feature (`cargo build -p rt-fdn-reverb --features nih`).  Kept off the
 //!   default build so `cargo test` / `clippy` stay fast and offline.  The
 //!   `nih-plug-egui` editor (preset rack, IR-decay visualiser, freeze/MIDI
-//!   LEDs) lands in Phase 3.
+//!   LEDs) is built with the **`gui`** feature
+//!   (`cargo build -p rt-fdn-reverb --features gui`).
 
 pub mod dsp;
 pub mod engine;
 pub mod params;
+pub mod ui;
 
 pub use dsp::{PreDelay, fader_gain, width_sample};
 pub use engine::ReverbEngine;
@@ -35,6 +40,10 @@ pub use params::{
     CROSSFADE_MS_RANGE, DECAY_S_RANGE, FADER_DB_RANGE, HIGH_CUT_RANGE, LOW_CUT_RANGE,
     MOD_RATE_HZ_RANGE, NUM_PRESETS, NUM_SPACES, PREDELAY_MS_RANGE, ReverbParams, WIDTH_RANGE,
     damping_cutoff_hz, diffusion_gain, mod_depth_samples,
+};
+pub use ui::{
+    DISPLAY_CEIL_DB, DISPLAY_FLOOR_DB, ENVELOPE_BUCKETS, db_to_intensity, decay_envelope_db,
+    envelope_seconds, magnitude_to_db,
 };
 
 // Re-export the DSP core so downstream callers only depend on one crate.
