@@ -155,29 +155,47 @@ envelope followers, find index `k` with `min(rms)`; if two are within
 samples (2 ms @ 44.1 kHz), reset its delay line / resonator state,
 then start the new note — no allocation, no lock, no click.
 
-## Phase 1: `rt-physical-core` (engine crate)
+## Phase 1: `rt-physical-core` (engine crate) ✅
 
-- [ ] **Workspace layout**:
-  - `rt-physical-core` — model primitives + voice manager.
-  - `rt-physical` — plugin.
-- [ ] **Delay-line primitives**:
-  - Fractional-delay (Lagrange or all-pass) for pitch-continuous
-    waveguides.
-  - Ring-buffer implementation, all-in-place.
-- [ ] **Filters**:
-  - Bridge / loop filter (1-pole low-pass).
-  - Body filter (small biquad bank or IR-based — [decision] IR
-    would reuse `rt-fft-convolver`).
+- [x] **Workspace layout**:
+  - `rt-physical-core` — model primitives + voice manager. **Done**
+    (added to the workspace `members` / `default-members`).
+  - `rt-physical` — plugin. *Deferred to Phase 2* (this phase is the
+    framework-agnostic core only, mirroring `rt-fdn-core`).
+- [x] **Delay-line primitives**:
+  - Fractional delay via a first-order all-pass tuning filter
+    (`allpass.rs`, `TuningAllpass`) — chosen over Lagrange for exact
+    unity magnitude, as in the Phase 0 example.
+  - Integer ring buffer, power-of-two, all-in-place, denormal-flushed
+    (`delay.rs`, `DelayLine`).
+- [x] **Filters**:
+  - Bridge / loop filter (`filter.rs`, `LoopFilter`) — a one-zero
+    damping filter with a broadband decay gain and a closed-form
+    phase delay folded into the tuning budget.
+  - Body filter as a peaking biquad (`biquad.rs`, `Biquad::peaking`).
+    IR-based body via `rt-fft-convolver` remains the optional upgrade
+    noted in the prerequisites.
 - [ ] **Nonlinear stages** (for the tube family):
-  - Reuse the shaper primitives from `rt-drive-core`
-    ([Roadmap-02-oversampled-drive.md]) — potentially extract into
-    a shared `rt-nonlinear-core` crate.
-- [ ] **Voice manager**:
-  - Fixed-capacity `[Voice; MAX_VOICES]` allocated at construction.
-  - Note-on / note-off / voice-steal without allocations.
-- [ ] **Modal bank**:
-  - Array of biquads (resonator per mode).
-  - Excitation impulse → sum of decaying sinusoids.
+  - *Deferred* — the tube family is out of the Phase 0 v1 scope; the
+    shared `rt-nonlinear-core` extraction happens when it lands.
+- [x] **Voice manager**:
+  - Fixed-capacity `[Voice; N]` allocated at construction
+    (`manager.rs`, `VoiceManager<N>`; `MAX_VOICES = 16`,
+    `PhysicalVoices` alias).
+  - Note-on / note-off / quietest-then-oldest voice-steal, all
+    allocation-free, with a ~2 ms anti-click fade on (re)trigger.
+- [x] **Modal bank**:
+  - Array of biquad resonators (`modal.rs`, `ModalBank`, up to
+    `MAX_MODES = 32`) with metal / wood / glass `ModePreset`s.
+  - Excitation impulse → sum of decaying sinusoids, with a
+    `decay_slope` making bright modes decay faster.
+
+Excitation (`excitation.rs`, `Excitation`) covers the Phase 0 "both
+sources" decision: a velocity/hardness-shaped, pluck-positioned noise
+burst for MIDI/synth use; the plugin feeds audio in for effect use.
+53 unit tests (pitch within ±5 cents, single-mode decaying sinusoid,
+no state leak across reused voices, quietest-first stealing, finite
+output on sustained tails); `cargo fmt` + `clippy` clean.
 
 ## Phase 2: `rt-physical` plugin
 

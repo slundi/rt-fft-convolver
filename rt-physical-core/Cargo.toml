@@ -1,0 +1,17 @@
+[package]
+name = "rt-physical-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time physical-modelling engine: extended Karplus-Strong plucked strings and a modal (biquad resonator) bank, with a fixed-capacity polyphonic voice manager.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "physical-modelling", "karplus-strong", "modal", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Shared RT-safe primitives from the root crate.  We use `flush_to_zero` to
+# keep decaying string loops and modal resonators out of the subnormal slow
+# path even when no hardware `DenormalGuard` wraps the callback, and re-export
+# `DenormalGuard` for the plugin layer (Phase 2).  Mirrors `rt-fdn-core`.
+rt-fft-convolver = { path = ".." }
