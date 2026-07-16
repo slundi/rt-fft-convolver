@@ -26,32 +26,122 @@ Plugin format target: **LV2 + CLAP + VST3** via
   integrated LUFS meter and auto-gain feature.  (Overlaps with
   `rt-loudness-meter` from [Roadmap-10-loudness-metering.md].)
 
-## Prerequisites in `rt-fft-convolver`
+## Prerequisites in `rt-fft-convolver` ✅
 
-- [ ] `DenormalGuard`.
-- [ ] Polyphase resampler primitives from `rt-drive-core`
-  ([Roadmap-02-oversampled-drive.md]) — reuse rather than duplicate.
-  [decision] whether to promote these into a shared
-  `rt-nonlinear-core` / `rt-oversample-core` crate.
+- `DenormalGuard` — **satisfied**. Fully implemented in
+  `src/utils/denormals.rs` and re-exported from the crate root
+  (`src/lib.rs:34`, `rt_fft_convolver::{DenormalGuard, flush_to_zero}`):
+  RAII FTZ+DAZ guard (x86/x86_64 MXCSR, AArch64 FPCR, no-op
+  elsewhere), restores the prior FPU state on drop, RT-safe (one
+  register read+write), test-covered. Load-bearing here because the
+  gain-reduction envelope and dry-signal delay line ring *down toward
+  zero* on quiet passages; without FTZ the release tail would spike
+  CPU on "silence".
+- Polyphase resampler — **satisfied**. `rt-drive-core`'s
+  `Oversampler` (`rt-drive-core/src/lib.rs:58`) is a Kaiser-windowed
+  half-band polyphase up/down-sampler for factors {1, 2, 4, 8, 16},
+  ≥96 dB default stop-band attenuation, RT-safe `upsample`/`downsample`
+  with all scratch pre-sized at construction. This is exactly the
+  true-peak oversampling primitive the limiter needs — reused, not
+  duplicated.
+- **Shared-crate promotion — decision: do NOT promote; depend on
+  `rt-drive-core` directly.** `rt-limiter-core` takes a path
+  dependency on `rt-drive-core` and uses its `Oversampler`. A
+  dedicated `rt-oversample-core` extraction was considered and
+  *rejected for now*: it buys nothing at runtime and the cost of
+  pulling the (small, leaf) drive engine transitively is acceptable.
+  Revisit only if a third consumer needs oversampling without the
+  drive engine, or if `rt-drive-core`'s dependency surface grows.
 
-## Phase 0: Algorithm decisions
+## Phase 0: Algorithm decisions ✅
 
-- [ ] **Look-ahead length** — [decision]:
-  - Fixed (typically 5 ms).
-  - User-configurable (0.1 – 20 ms).
-- [ ] **Gain-computer topology** — [decision]:
-  - Envelope follower + feed-forward gain reduction.
-  - Feedback (Waves L1-style, chainable).
-  - Hybrid with adaptive attack.
-- [ ] **Release curve set** — [decision]:
-  - Linear, exponential, "auto" (program-dependent), "punchy",
-    "smooth".
-- [ ] **Channel linkage**:
-  - Stereo-linked (default).
-  - M/S optional.
-  - Fully independent (4-channel mode) — [decision].
-- [ ] **Dithering** — [decision] whether to include a bit-depth
-  reducer + noise shaper at output (mastering feature).
+### Look-ahead length — **decision: user-configurable, 0.1 – 20 ms**
+
+Follows FabFilter Pro-L 2. The dry-signal delay line and the
+peak-hold look-ahead ring are both sized for the **20 ms maximum** at
+construction (RT-safe: no reallocation), and the runtime control only
+selects a shorter read offset. Reported host latency = current
+look-ahead + oversampler group delay. Short settings (0.1–1 ms) read
+as punchy/aggressive; long settings (10–20 ms) are transparent on
+dense material.
+
+**Example — 20 ms max at 96 kHz.** Delay-line capacity =
+`ceil(0.020 · 96000)` = 1920 samples per channel, allocated once. A
+5 ms runtime setting reads the tap at `round(0.005 · 96000)` = 480
+samples back. Changing the control never touches the allocation.
+
+- *Rejected*: **fixed 5 ms** — simpler, but the runtime cost of the
+  configurable version is zero once the buffer is sized for the max,
+  so there is no reason to give up the flexibility.
+
+### Gain-computer topology — **decision: feed-forward envelope follower**
+
+The detector reads the oversampled true-peak over the look-ahead
+window, the gain computer derives the required reduction, and that
+gain is applied to the delayed dry signal. This is the only topology
+that lets Phase 4's hard guarantee hold cleanly — *output true-peak
+never exceeds the ceiling* — because the reduction is computed from a
+peak the audio has **not yet reached**.
+
+**Example — instantaneous target gain.** For a detected true-peak
+`p` (linear) and ceiling `c` (linear), the target gain is
+`g_target = min(1, c / p)`. With `c = 10^(−1/20) ≈ 0.8913` (−1 dBTP)
+and a detected peak `p = 1.5` (+3.52 dBFS true-peak),
+`g_target ≈ 0.594` (−4.52 dB reduction). The look-ahead lets that
+gain be reached *by the sample the peak arrives*, so the peak is
+caught rather than clipped. Attack is therefore implicit: it equals
+the look-ahead length.
+
+- *Rejected*: **feedback (Waves L1-style)** — derives reduction from
+  the output, cannot use look-ahead, and makes a hard true-peak
+  ceiling difficult to guarantee.
+- *Rejected*: **hybrid adaptive-attack** — deferred; the
+  program-dependent behaviour we want is delivered through the
+  release curve ("auto") instead, without a second topology.
+
+### Release curve set — **decision: linear + exponential + "auto" as engine curves; "punchy"/"smooth" as layered styles**
+
+Three curves live in the engine; the two voiced presets are *styles*
+that parameterise them (avoids duplicating curve code, per the Phase 2
+`Style` control):
+
+- **Linear** — constant dB/s recovery; predictable, can pump.
+- **Exponential** — one-pole RC recovery; the natural default.
+- **Auto (program-dependent)** — dual time-constant (fast + slow)
+  blended by transient density; the "transparent" mode.
+- **Punchy** = exponential with a faster initial release;
+  **Smooth** = exponential/auto with a longer time constant.
+
+**Example — exponential release coefficient.** For a release time
+`t_r` (seconds to ~63 % recovery) at sample rate `fs`, the one-pole
+coefficient is `α = exp(−1 / (t_r · fs))`. At `t_r = 100 ms`,
+`fs = 48 kHz`: `α = exp(−1 / 4800) ≈ 0.999792`. Gain recovers as
+`g[n] = α · g[n−1] + (1 − α) · g_target`.
+
+### Channel linkage — **decision: stereo-linked (default) + M/S; defer fully-independent 4-channel**
+
+Stereo-linked drives both channels from a single (max-of-channels)
+gain-reduction value, preserving the stereo image — the mastering
+default. M/S applies the same linked computer to a mid/side matrix
+for width control. Fully-independent per-channel reduction is
+*deferred*: it risks audible image shift on stereo material and
+complicates plugin I/O (revisit with the out-of-scope surround work).
+
+- *Rejected for v1*: **fully independent (4-channel)** — see the
+  I/O `[decision]` in Phase 2; not shipped in v1.
+
+### Dithering — **decision: include a bit-depth reducer + noise shaper, feature-gated**
+
+A true-peak limiter is typically the *last* stage before export, so
+dither belongs here. `rt-limiter-core` ships a bit-depth reducer
+(16/20/24-bit) plus a selectable noise shaper, behind a Cargo
+**feature flag** so the crate stays lean for callers that don't need
+it. Applied strictly *after* the ceiling stage, at the output word
+length.
+
+- *Rejected*: **exclude entirely** — would force a downstream tool
+  for the final export step the plugin is otherwise positioned to
+  own.
 
 ## Phase 1: `rt-limiter-core` (engine crate)
 
