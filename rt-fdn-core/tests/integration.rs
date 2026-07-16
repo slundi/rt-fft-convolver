@@ -172,6 +172,56 @@ fn live_size_sweep_stays_finite() {
     }
 }
 
+/// Freezing pins the tail: after building up energy and engaging freeze (with
+/// no further input), the tail sustains instead of decaying — late RMS stays
+/// close to the RMS at the freeze point, unlike the un-frozen reference which
+/// dies away.
+#[test]
+fn freeze_sustains_the_tail() {
+    // Build up a tail from an impulse over ~0.5 s, then run 5 s more.
+    let build = SR as usize / 2;
+    let hold = 5 * SR as usize;
+
+    let mut frozen = Fdn::<8>::new(SR, PRESETS[1].params);
+    frozen.process_sample_stereo(1.0, 1.0);
+    for _ in 0..build {
+        frozen.process_sample_stereo(0.0, 0.0);
+    }
+    frozen.set_freeze(true);
+    assert!(frozen.is_frozen());
+    let mut tail = Vec::with_capacity(hold);
+    for _ in 0..hold {
+        // No new input while frozen (as the plugin mutes the FDN input).
+        let (out_l, _) = frozen.process_sample_stereo(0.0, 0.0);
+        assert!(out_l.is_finite(), "frozen tail diverged");
+        tail.push(out_l);
+    }
+
+    let early = windowed_rms(&tail, SR as usize / 2, 4096);
+    let late = windowed_rms(&tail, (4.5 * SR) as usize, 4096);
+    assert!(early > 1e-4, "frozen tail was silent");
+    // Energy is retained: late is within a factor of two of early (a decaying
+    // tail would be orders of magnitude lower).
+    assert!(
+        late > early * 0.5,
+        "frozen tail decayed: early {early}, late {late}"
+    );
+
+    // Thawing restores decay: after thaw, a silent input lets the tail die.
+    frozen.set_freeze(false);
+    assert!(!frozen.is_frozen());
+    let mut thawed = Vec::with_capacity(hold);
+    for _ in 0..hold {
+        let (out_l, _) = frozen.process_sample_stereo(0.0, 0.0);
+        thawed.push(out_l);
+    }
+    let thawed_late = windowed_rms(&thawed, (4.5 * SR) as usize, 4096);
+    assert!(
+        thawed_late < late * 0.5,
+        "thawed tail did not decay: {thawed_late} vs frozen {late}"
+    );
+}
+
 /// The engine works at a non-reference sample rate (delay lengths rescale).
 #[test]
 fn works_at_96k() {

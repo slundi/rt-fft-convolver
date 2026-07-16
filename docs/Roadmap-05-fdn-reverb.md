@@ -139,35 +139,52 @@ Plugin format target: **LV2 + CLAP + VST3** via
   decorrelation, silent-in/silent-out, reset, all presets finite,
   live size sweep, 96 kHz).  `cargo clippy -D warnings` clean.
 
-## Phase 2: `rt-fdn-reverb` plugin
+## Phase 2: `rt-fdn-reverb` plugin ✅
 
-- [ ] **I/O**:
+The `nih-plug` wrapper is feature-gated (`--features nih`, git-only dep) over a
+framework-agnostic, fully unit-tested `ReverbEngine`; the default build stays
+fast and offline, mirroring `rt-spectral` / `rt-ir-reverb`.
+
+- **I/O**:
   - Stereo in → stereo out.
-- [ ] **Preset controls** (× 8):
+- **Preset controls** (× 8):
   - `Space N` (dropdown: room, hall, plate, spring, chamber, cave,
-    shimmer, non-linear).
+    shimmer, non-linear — one `IntParam` per slot, formatted to the space name).
   - `Preset Enabled N`.
-- [ ] **Global controls**:
-  - `Current Preset` (int 0–7).
-  - `Crossfade Time` (5–500 ms — [note] tails need long fades).
-  - `Pre-Delay` (0–500 ms).
-  - `Decay` (0.1 – 20 s, T60).
-  - `Size` (0–100 %, scales all delay lengths).
-  - `Damping` (0–100 %, low-pass strength).
-  - `Diffusion` (0–100 %, all-pass feedback amount).
-  - `Modulation Depth` (0–100 %).
-  - `Modulation Rate` (0.1 – 5 Hz).
-  - `Low Cut` (20–500 Hz, wet only).
-  - `High Cut` (2–20 kHz, wet only).
-  - `Stereo Width` (0–200 %).
-  - `Dry` (−∞ … +6 dB).
-  - `Wet` (−∞ … +6 dB).
-  - `Freeze` (bool — feedback → 1.0, no new input into FDN).
-  - `Bypass`.
-- [ ] **MIDI**:
-  - PC → preset.
-  - CC on `Decay`, `Size`, `Freeze` (great for live use).
-- [ ] **CPU meter** as read-only property.
+- **Global controls**: all present (`Current Preset`, `Crossfade Time`,
+  `Pre-Delay`, `Decay`, `Size`, `Damping`, `Diffusion`, `Modulation Depth`,
+  `Modulation Rate`, `Low Cut`, `High Cut`, `Stereo Width`, `Dry`, `Wet`,
+  `Freeze`, `Bypass`).
+- **MIDI**: PC → preset; CC 20/21/22 → `Decay` / `Size` / `Freeze`,
+  applied as an override the host reclaims the moment it moves that parameter.
+  (Assignable MIDI-learn binding UI is a Phase-3 item.)
+- **CPU meter**: render-time ÷ block-budget, published to an atomic for the
+  Phase-3 editor.
+
+### Phase 2 decisions
+
+- **Engine architecture — pre-built voice bank + equal-power crossfade.** One
+  `Fdn<8>` is built per built-in space at init (eight voices); a preset slot
+  only *references* a space index, so switching the active slot or re-assigning
+  a slot's space never allocates and needs **no worker thread**. Switching the
+  active space crossfades the outgoing tail into the re-primed incoming voice
+  via a per-sample rotation recurrence (no `sin`/`cos` in the loop). Chosen over
+  the `rt-ir-reverb` control→audio hand-off because the FDN is a live stateful
+  generator, not a hand-off-able prebuilt convolver.
+- **Presets vs. knobs.** A slot selects a space (delay character + baked
+  starting values); the global knobs drive the active voice live and override
+  the space's baked decay/damping/mod/diffusion/size. Per-space *knob recall*
+  (writing knob positions on preset select via `ParamSetter`) is deferred to the
+  Phase-3 editor.
+- **`Freeze` added to `rt-fdn-core`** (`Fdn::set_freeze`): pins every branch's
+  feedback to `1.0` **and bypasses the in-loop damping / low-cut** (which would
+  otherwise bleed energy each pass), so the orthonormal matrix circulates the
+  already-coloured tail losslessly. Input injection is muted while frozen.
+  Tested: RMS sustains for 5 s frozen, then decays cleanly on thaw.
+- **Wet bus is framework-agnostic and local**: `PreDelay`, mid/side width and a
+  `−∞`-floored fader gain live in `rt-fdn-reverb::dsp`; the `Biquad` EQ,
+  `ms_to_samples`, `db_to_gain` and the `program_to_slot` MIDI policy are reused
+  from `rt-ir-plugin-core`.
 
 ## Phase 3: UI
 

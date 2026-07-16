@@ -128,6 +128,11 @@ pub struct Fdn<const N: usize> {
     size: Smoother,
     /// Smoothed modulation depth (samples).
     depth: Smoother,
+    /// When `true` the per-branch feedback gains are pinned to `1.0` (infinite
+    /// sustain).  Because the mixing matrix is lossless, unity feedback holds
+    /// the tail energy constant — the "freeze" control.  Setters that would
+    /// recompute the decay-derived gains are inert while frozen.
+    frozen: bool,
 }
 
 impl<const N: usize> Fdn<N> {
@@ -192,6 +197,7 @@ impl<const N: usize> Fdn<N> {
             mod_depth_max,
             size,
             depth,
+            frozen: false,
         };
         fdn.recompute_feedback();
         fdn
@@ -201,6 +207,11 @@ impl<const N: usize> Fdn<N> {
     /// the *target* `size` (called only from setters, never per sample — it
     /// runs `N` `powf`s).
     fn recompute_feedback(&mut self) {
+        // While frozen the gains are pinned to unity; do not let a decay/size
+        // change clobber the sustain.
+        if self.frozen {
+            return;
+        }
         let size = self.size.target().clamp(0.0, 1.0);
         let sample_rate = self.sample_rate;
         let decay_s = self.decay_s;
@@ -270,6 +281,34 @@ impl<const N: usize> Fdn<N> {
         self.diffuser_r.set_gain(gain);
     }
 
+    /// Freeze (or thaw) the tail.
+    ///
+    /// Freezing pins every branch's feedback gain to `1.0`; the lossless
+    /// mixing matrix then holds the circulating energy constant, so whatever is
+    /// in the delay lines sustains indefinitely.  Thawing restores the
+    /// decay-derived gains for the current `decay_s` / `size`.  The caller
+    /// should stop injecting new input while frozen (the plugin mutes the FDN
+    /// input) so the frozen tail is not overwritten.
+    ///
+    /// **Real-time safe** — sets `N` gains, no allocation.
+    pub fn set_freeze(&mut self, freeze: bool) {
+        if freeze == self.frozen {
+            return;
+        }
+        self.frozen = freeze;
+        if freeze {
+            self.feedback = [1.0; N];
+        } else {
+            self.recompute_feedback();
+        }
+    }
+
+    /// Whether the tail is currently frozen.
+    #[inline]
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
     /// Clear all delay lines, filters and diffusers to silence and rewind the
     /// LFOs so the next sample starts from a clean, decorrelated state.
     pub fn reset(&mut self) {
@@ -322,12 +361,21 @@ impl<const N: usize> Fdn<N> {
         let diffused_l = self.diffuser_l.process(in_l);
         let diffused_r = self.diffuser_r.process(in_r);
 
-        // 2. Read every branch and apply the in-loop tone filters.
+        // 2. Read every branch and apply the in-loop tone filters.  While
+        //    frozen the branch circulates *unfiltered*: the damping / low-cut
+        //    would bleed energy on every pass, so at unity feedback the tail
+        //    would still decay.  Bypassing them makes the orthonormal matrix
+        //    preserve energy exactly, sustaining the (already-coloured) tail.
+        let frozen = self.frozen;
         let mut branch = [0.0f32; N];
         for (i, slot) in branch.iter_mut().enumerate() {
             let raw = self.delays[i].read();
-            let damped = self.dampers[i].process(raw);
-            *slot = self.lowcuts[i].process(damped);
+            *slot = if frozen {
+                raw
+            } else {
+                let damped = self.dampers[i].process(raw);
+                self.lowcuts[i].process(damped)
+            };
         }
 
         // 3. Output taps (decorrelated ± patterns), normalised by 1/√N.
@@ -345,7 +393,12 @@ impl<const N: usize> Fdn<N> {
         let mut mixed = branch;
         hadamard_in_place(&mut mixed);
         for (i, delay) in self.delays.iter_mut().enumerate() {
-            let injected = diffused_l * Self::sign_l(i) + diffused_r * Self::sign_r(i);
+            // Frozen: inject nothing so the sustained tail is not overwritten.
+            let injected = if frozen {
+                0.0
+            } else {
+                diffused_l * Self::sign_l(i) + diffused_r * Self::sign_r(i)
+            };
             let feedback = mixed[i] * self.feedback[i];
             delay.write(injected + feedback);
         }
