@@ -153,6 +153,25 @@ impl ModulatedDelay {
         sample0 + (sample1 - sample0) * frac
     }
 
+    /// Read the sample exactly at the **nearest integer** delay, without
+    /// interpolating and without advancing the LFO.
+    ///
+    /// This is the *frozen* read: linear interpolation (used by
+    /// [`read`](Self::read)) is a mild low-pass that bleeds a little energy on
+    /// every pass, so at unity feedback a fractional tail would still slowly
+    /// decay.  Reading an exact stored sample makes the circulation lossless, so
+    /// a frozen tail sustains indefinitely.  Rounding the delay causes at most a
+    /// sub-sample phase shift at the instant freeze engages.
+    ///
+    /// **Real-time safe.**
+    #[inline]
+    pub fn read_frozen(&self) -> f32 {
+        let len = self.buf.len();
+        let delay = self.base_delay.round().clamp(1.0, self.max_delay()) as usize;
+        let index = (self.write_idx + len - delay) % len;
+        self.buf[index]
+    }
+
     /// Store `input` at the write cursor and advance it.  Call **once per
     /// sample, after** [`read`](ModulatedDelay::read).
     ///
@@ -255,6 +274,33 @@ mod tests {
             assert!(value.abs() < 1e-6, "history leaked past reset: {value}");
             delay.write(0.0);
         }
+    }
+
+    /// `read_frozen` returns the exact stored sample at the nearest integer
+    /// delay — no interpolation — so unity-feedback circulation is lossless.
+    #[test]
+    fn frozen_read_is_exact_integer_tap() {
+        let lfo = SineLfo::new(0.0, SR, 0.0);
+        let mut delay = ModulatedDelay::new(64, 10.0, 0.0, lfo);
+
+        // Write a ramp 0, 1, …, 29 (read() first each step, per the contract).
+        for n in 0..30 {
+            delay.read();
+            delay.write(n as f32);
+        }
+        // 10 taps back from the write cursor is the value written at n = 20.
+        assert_eq!(delay.read_frozen(), 20.0);
+
+        // A fractional base rounds to an integer tap, so the result is still a
+        // verbatim stored sample (an exact integer here), never interpolated.
+        let lfo = SineLfo::new(4.0, SR, 0.0);
+        let mut fractional = ModulatedDelay::new(64, 10.5, 3.0, lfo);
+        for n in 0..30 {
+            fractional.read();
+            fractional.write(n as f32);
+        }
+        let frozen = fractional.read_frozen();
+        assert_eq!(frozen.fract(), 0.0, "frozen read interpolated: {frozen}");
     }
 
     /// Capacity is rounded up to a power of two.

@@ -210,18 +210,41 @@ fast and offline, mirroring `rt-spectral` / `rt-ir-reverb`.
   counter (reusing `rt_ir_plugin_core::MidiActivity` / `MidiStatus`), green on a
   recognised PC/CC. The CPU meter (render-time ÷ budget) reads out beside it.
 
-## Phase 4: Testing
+## Phase 4: Testing ✅
 
-- [ ] **Unit tests** (`rt-fdn-core`):
-  - Stability: no divergence over 60 s at maximum decay.
-  - T60 measurement matches the requested decay within ±10 %.
-  - Freeze mode: RMS is constant to within 0.1 dB over 10 s after
-    engaging.
-  - Modulation reset does not click.
-- [ ] **RT-safety audit**:
-  - Zero allocations in `process()`.
-  - Denormal guard active in every callback.
-- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval`.
+- [x] **Unit tests** (`rt-fdn-core`, `tests/acceptance.rs` + `integration.rs`):
+  - Stability: no divergence over 60 s at maximum decay (`integration.rs`).
+  - **T60 within ±10 %** of the requested decay — measured via a backward
+    Schroeder energy-decay curve, slope-fit between −15 and −45 dB, across
+    1 / 2.5 / 5 s.
+  - **Freeze RMS constant within 0.1 dB over 10 s** after engaging.
+  - **Modulation reset does not click** — a heavily-modulated engine, once
+    reset, yields exact silence for a silent input (no residual / discontinuity).
+- [x] **RT-safety audit** (`rt-fdn-reverb/tests/rt_safety.rs`):
+  - Zero allocations in `process` — a counting global allocator confirms
+    steady state, a live preset crossfade and a freeze toggle all allocate zero.
+  - Denormal guard: the plugin opens a `DenormalGuard` at the top of every
+    callback, and `write` flushes feedback to zero — a tail reaches *exact* zero
+    (`tail_flushes_to_exact_zero`).
+- [ ] **Host validation** (`lv2lint`, `clap-validator`, `pluginval`) — deferred
+  to Phase 5, where the `.lv2` / `.clap` / `.vst3` bundles are built in CI (the
+  validators run against the bundle, and the GUI/packaging toolchain is not part
+  of the default offline dev shell).
+
+### Phase 4 decisions / fixes
+
+- **T60 is specified at the undamped reference.** The decay gain assumes a
+  lossless loop, but the in-loop damping (low-pass) and low-cut (high-pass) both
+  bleed energy per pass — heavy damping legitimately shortens the broadband
+  tail (that *is* damping). So the ±10 % test runs with the tone controls
+  neutral (damping cutoff near Nyquist, low-cut near DC), which is the standard
+  convention for stating an FDN's T60. The residual error there is ≈ −6 %.
+- **Freeze is now truly lossless** — [`ModulatedDelay::read_frozen`]: the normal
+  linear-interpolated read is a mild low-pass that, at the unity feedback of a
+  freeze, still bled ≈ 4.6 dB over 10 s. The frozen read takes the exact
+  nearest-integer tap (no interpolation, LFO paused); with the orthonormal
+  matrix the tail now circulates losslessly (< 0.07 dB over 10 s). One-time
+  sub-sample phase shift at the instant freeze engages, which is inaudible.
 
 ## Phase 5: Packaging & release
 

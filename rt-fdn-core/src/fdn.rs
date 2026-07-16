@@ -369,10 +369,12 @@ impl<const N: usize> Fdn<N> {
         let frozen = self.frozen;
         let mut branch = [0.0f32; N];
         for (i, slot) in branch.iter_mut().enumerate() {
-            let raw = self.delays[i].read();
             *slot = if frozen {
-                raw
+                // Lossless integer-tap read so the sustained tail neither decays
+                // (interpolation loss) nor is coloured (in-loop filters).
+                self.delays[i].read_frozen()
             } else {
+                let raw = self.delays[i].read();
                 let damped = self.dampers[i].process(raw);
                 self.lowcuts[i].process(damped)
             };
