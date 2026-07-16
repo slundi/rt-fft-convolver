@@ -268,19 +268,36 @@ finite/in-range amplitudes, dB endpoints); `cargo fmt` + `clippy` clean on
 the default and `nih` builds (the `gui` build links X11/OpenGL and is
 exercised in CI, as with the other egui plugins).
 
-## Phase 4: Testing
+## Phase 4: Testing ✅
 
-- [ ] **Unit tests** (`rt-physical-core`):
-  - Karplus-Strong: pitch of a note-on matches the requested
-    frequency within ±5 cents.
-  - Modal bank: single-mode response is a decaying sinusoid at the
-    correct frequency.
-  - Voice stealing: no state leak between reused voices.
-  - Nonlinear tube stage: DC-blocker cancels DC step > 60 dB.
-- [ ] **RT-safety audit**:
-  - Zero allocations in `process()` including on note-on.
-  - Denormal guard active.
-- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval`.
+The Phase-1/2 in-module unit tests exercise each DSP primitive; Phase 4
+adds the **acceptance suite** (`rt-physical-core/tests/acceptance.rs`,
+end-to-end through the public `PhysicalVoices` manager) and the
+**RT-safety audit** (`rt-physical/tests/rt_safety.rs`, a counting global
+allocator), matching the `rt-fdn` layout.
+
+- [x] **Unit tests** (`rt-physical-core`, `tests/acceptance.rs`):
+  - [x] Karplus-Strong: a `note_on` sounds within ±5 cents of the
+    requested frequency across A2 … A5, measured through the full voiced
+    path (excitation + fade-in + loop) by near-target autocorrelation.
+  - [x] Modal bank: a single-mode voice is a decaying sinusoid at the
+    note's frequency (±5 cents) that loses energy over time.
+  - [x] Voice stealing / reuse: retriggering a *still-ringing* voice
+    (polyphony 1, deterministic modal kernel) yields a **bit-for-bit
+    identical** signal to a fresh voice — no state leak.
+  - [ ] Nonlinear tube stage DC-blocker — *N/A*: the tube family is out of
+    the Phase-0 v1 scope, so there is no stage to test yet.
+- [x] **RT-safety audit**:
+  - [x] Zero allocations in `process()` — verified across steady state,
+    a note-on flurry that **forces voice stealing**, and a model switch,
+    with a `#[global_allocator]` allocation counter.
+  - [x] Denormal guard active — the plugin `process` opens a
+    `DenormalGuard`; the observable consequence (a decaying tail reaching
+    *exact* zero, so the loop never enters the subnormal slow path) is
+    checked by `decaying_tail_flushes_to_exact_zero`.
+- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval` —
+  external tooling run against the bundled `gui` build; deferred to the
+  Phase-5 packaging/CI work (not a `cargo test` unit).
 
 ## Phase 5: Packaging & release
 
