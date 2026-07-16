@@ -15,9 +15,10 @@ crate-type = ["lib", "cdylib"]
 [features]
 # The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
 # Build the actual plugin with `cargo build -p rt-physical --features nih`.
-# The nih-plug-egui editor lands in Phase 3 behind a `gui` feature.
+# `gui` adds the Phase-3 nih-plug-egui editor.
 default = []
 nih = ["dep:nih_plug"]
+gui = ["nih", "dep:nih_plug_egui"]
 
 [dependencies]
 # The physical-modelling engine (polyphonic voice manager + model kernels).
@@ -25,3 +26,4 @@ rt-physical-core = { path = "../rt-physical-core" }
 
 # nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

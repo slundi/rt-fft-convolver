@@ -29,13 +29,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use nih_plug::prelude::*;
+#[cfg(feature = "gui")]
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
 use crate::engine::PhysicalEngine;
+#[cfg(feature = "gui")]
+use crate::params::model_to_index;
 use crate::params::{
     BODY_TYPES, BodyType, DECAY_S_RANGE, DECAY_SLOPE_RANGE, DETUNE_CENTS_RANGE, GAIN_DB_RANGE,
     InstrumentParams, MODELS, MODES_RANGE, POLYPHONY_RANGE, PRESETS, model_from_index, model_label,
     preset_from_index, preset_label,
 };
+#[cfg(feature = "gui")]
+use crate::ui::{DISPLAY_CEIL_DB, DISPLAY_FLOOR_DB, Partial, db_to_intensity, partial_spectrum};
+#[cfg(feature = "gui")]
+use rt_physical_core::Model;
 
 /// CC that live-controls `Damping` (Sound Controller 5 / "Brightness").
 const CC_DAMPING: u8 = 74;
@@ -79,6 +87,10 @@ struct PhysicalPluginParams {
     polyphony: IntParam,
     #[id = "byp"]
     bypass: BoolParam,
+
+    #[cfg(feature = "gui")]
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 /// Build a `0..=1` percent `FloatParam`.
@@ -184,6 +196,8 @@ impl Default for PhysicalPluginParams {
             ),
             bypass: BoolParam::new("Bypass", false)
                 .with_value_to_string(formatters::v2s_bool_bypass()),
+            #[cfg(feature = "gui")]
+            editor_state: EguiState::from_size(560, 620),
         }
     }
 }
@@ -225,6 +239,12 @@ pub struct PhysicalPlugin {
     midi: MidiOverrides,
     /// CPU load = render time / block budget (`f32` bits), for the Phase 3 meter.
     cpu_meter: Arc<AtomicU32>,
+    /// Voices sounding in the active bank last block, for the activity meter.
+    #[cfg(feature = "gui")]
+    voice_meter: Arc<AtomicU32>,
+    /// Bumped on each note-on so the editor's note-activity LED can blink.
+    #[cfg(feature = "gui")]
+    note_counter: Arc<AtomicU32>,
 }
 
 impl Default for PhysicalPlugin {
@@ -234,6 +254,10 @@ impl Default for PhysicalPlugin {
             engine: None,
             midi: MidiOverrides::default(),
             cpu_meter: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "gui")]
+            voice_meter: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "gui")]
+            note_counter: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -272,6 +296,87 @@ fn apply_event(engine: &mut PhysicalEngine, midi: &mut MidiOverrides, event: &No
     }
 }
 
+// ─── egui editor (Phase 3, `gui` feature) ──────────────────────────────────
+
+/// Per-open editor state owned by the egui closure.
+#[cfg(feature = "gui")]
+#[derive(Default)]
+struct PhysicalEditorState {
+    /// Cached partial spectrum, recomputed only when the parameters change.
+    spectrum: Vec<Partial>,
+    /// Parameter snapshot the cached spectrum was computed from.
+    last_params: Option<InstrumentParams>,
+    /// Last observed note counter, to fire the note-activity LED.
+    last_note: u32,
+    /// Note-activity LED level, `0..=1`, decaying each frame.
+    note_level: f32,
+}
+
+/// Draw the partial-spectrum bar chart: one bar per partial, tallest =
+/// loudest, spaced by frequency ratio so inharmonic modal partials fan out.
+#[cfg(feature = "gui")]
+fn draw_spectrum(
+    ui: &mut egui::Ui,
+    spectrum: &[Partial],
+    panel: egui::Color32,
+    grid: egui::Color32,
+    accent: egui::Color32,
+) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 120.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 4.0, panel);
+
+    // Horizontal grid at −12 / −24 dB.
+    for &db in &[-12.0f32, -24.0] {
+        let intensity = db_to_intensity(db, DISPLAY_FLOOR_DB, DISPLAY_CEIL_DB);
+        let y = rect.bottom() - intensity * rect.height();
+        ui.painter().line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(1.0, grid),
+        );
+    }
+
+    if spectrum.is_empty() {
+        return;
+    }
+    // Lay the bars out along the frequency axis (ratio), so the modal presets'
+    // inharmonic spacing is visible rather than evenly spaced harmonics.
+    let max_ratio = spectrum
+        .iter()
+        .map(|partial| partial.ratio)
+        .fold(1.0f32, f32::max);
+    let bar_width = (rect.width() / spectrum.len() as f32 * 0.5).clamp(2.0, 14.0);
+    for partial in spectrum {
+        let intensity = db_to_intensity(partial.amplitude_db(), DISPLAY_FLOOR_DB, DISPLAY_CEIL_DB);
+        let x = rect.left() + (partial.ratio / max_ratio) * (rect.width() - bar_width);
+        let top = rect.bottom() - intensity * rect.height();
+        let bar =
+            egui::Rect::from_min_max(egui::pos2(x, top), egui::pos2(x + bar_width, rect.bottom()));
+        ui.painter().rect_filled(bar, 1.0, accent);
+    }
+}
+
+/// Draw the voice-activity meter: `maximum` pips, the first `active` lit.
+#[cfg(feature = "gui")]
+fn draw_voice_meter(
+    ui: &mut egui::Ui,
+    active: usize,
+    maximum: usize,
+    lit: egui::Color32,
+    dim: egui::Color32,
+) {
+    ui.horizontal(|ui| {
+        ui.label(format!("Voices {active}/{maximum}"));
+        for index in 0..maximum.max(1) {
+            let (pip, _) = ui.allocate_exact_size(egui::vec2(9.0, 12.0), egui::Sense::hover());
+            let colour = if index < active { lit } else { dim };
+            ui.painter().rect_filled(pip.shrink(1.0), 1.0, colour);
+        }
+    });
+}
+
 impl Plugin for PhysicalPlugin {
     const NAME: &'static str = "RT Physical";
     const VENDOR: &'static str = "Sébastien Lundi";
@@ -301,6 +406,140 @@ impl Plugin for PhysicalPlugin {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    #[cfg(feature = "gui")]
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        use egui::Color32;
+
+        // Amber accent — a warm "acoustic instrument" tone, distinct from the
+        // violet reverb and the teal restoration / IR plugins.
+        const ACCENT: Color32 = Color32::from_rgb(0xe0, 0xa8, 0x54);
+        const PANEL: Color32 = Color32::from_rgb(0x1a, 0x16, 0x10);
+        const GRID: Color32 = Color32::from_rgb(0x32, 0x2c, 0x22);
+        const DIM: Color32 = Color32::from_rgb(0x2a, 0x24, 0x1c);
+        const LIT: Color32 = Color32::from_rgb(0x6a, 0xd0, 0x8a);
+
+        let params = self.params.clone();
+        let cpu_meter = self.cpu_meter.clone();
+        let voice_meter = self.voice_meter.clone();
+        let note_counter = self.note_counter.clone();
+
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            PhysicalEditorState::default(),
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                // Drive the note-activity LED from the shared counter.
+                let count = note_counter.load(Ordering::Relaxed);
+                if count != state.last_note {
+                    state.last_note = count;
+                    state.note_level = 1.0;
+                }
+                state.note_level = (state.note_level - 0.08).max(0.0);
+
+                // Recompute the spectrum preview only when parameters change.
+                let snapshot = params.snapshot();
+                if state.last_params != Some(snapshot) {
+                    state.spectrum = partial_spectrum(&snapshot);
+                    state.last_params = Some(snapshot);
+                }
+
+                let model = model_from_index(params.model.value() as usize);
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Header: title · note LED · bypass ───────────────────
+                    ui.horizontal(|ui| {
+                        ui.heading("RT Physical");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.bypass, setter));
+                            ui.label("Bypass");
+                            let (led, _) = ui
+                                .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            let level = state.note_level;
+                            let col = Color32::from_rgb(
+                                (0x30 as f32 + (LIT.r() as f32 - 0x30 as f32) * level) as u8,
+                                (0x30 as f32 + (LIT.g() as f32 - 0x30 as f32) * level) as u8,
+                                (0x30 as f32 + (LIT.b() as f32 - 0x30 as f32) * level) as u8,
+                            );
+                            ui.painter().circle_filled(led.center(), 5.0, col);
+                            ui.label("Note");
+                        });
+                    });
+                    ui.separator();
+
+                    // ── Model selector (dropdown switches the visible controls) ──
+                    ui.horizontal(|ui| {
+                        ui.label("Model");
+                        for (index, &family) in MODELS.iter().enumerate() {
+                            let active = model_to_index(model) == index;
+                            let fill = if active { ACCENT } else { DIM };
+                            if ui
+                                .add(egui::Button::new(model_label(family)).fill(fill))
+                                .clicked()
+                            {
+                                setter.begin_set_parameter(&params.model);
+                                setter.set_parameter(&params.model, index as i32);
+                                setter.end_set_parameter(&params.model);
+                            }
+                        }
+                    });
+
+                    // ── Partial-spectrum visualiser ─────────────────────────
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Partial spectrum").weak());
+                    draw_spectrum(ui, &state.spectrum, PANEL, GRID, ACCENT);
+
+                    // ── Voice-activity meter + CPU ──────────────────────────
+                    let active = voice_meter.load(Ordering::Relaxed) as usize;
+                    draw_voice_meter(ui, active, params.polyphony.value() as usize, LIT, DIM);
+                    let cpu = f32::from_bits(cpu_meter.load(Ordering::Relaxed));
+                    ui.label(format!("CPU {:.1} %", (cpu * 100.0).clamp(0.0, 999.0)));
+                    ui.separator();
+
+                    // ── Model-specific + shared/global controls ─────────────
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::Grid::new("physical-controls")
+                            .num_columns(2)
+                            .spacing(egui::vec2(8.0, 4.0))
+                            .show(ui, |ui| {
+                                let row = |ui: &mut egui::Ui, label: &str, param: &FloatParam| {
+                                    ui.label(label);
+                                    ui.add(widgets::ParamSlider::for_param(param, setter));
+                                    ui.end_row();
+                                };
+                                let int_row = |ui: &mut egui::Ui, label: &str, param: &IntParam| {
+                                    ui.label(label);
+                                    ui.add(widgets::ParamSlider::for_param(param, setter));
+                                    ui.end_row();
+                                };
+
+                                match model {
+                                    Model::Plucked => {
+                                        row(ui, "Pluck Position", &params.pluck_position);
+                                        row(ui, "Pick Hardness", &params.pick_hardness);
+                                        row(ui, "Damping", &params.damping);
+                                        int_row(ui, "Body Type", &params.body);
+                                        row(ui, "Detune", &params.detune);
+                                    }
+                                    Model::Modal => {
+                                        int_row(ui, "Modes", &params.num_modes);
+                                        int_row(ui, "Frequency Ratios", &params.preset);
+                                        row(ui, "Decay Slope", &params.decay_slope);
+                                        row(ui, "Damping", &params.damping);
+                                    }
+                                }
+
+                                // Shared + global.
+                                row(ui, "Decay", &params.decay_s);
+                                row(ui, "Gain", &params.gain_db);
+                                row(ui, "Mix", &params.mix);
+                                int_row(ui, "Polyphony", &params.polyphony);
+                            });
+                    });
+                });
+            },
+        )
     }
 
     fn initialize(
@@ -350,6 +589,10 @@ impl Plugin for PhysicalPlugin {
                         break;
                     }
                     apply_event(engine, midi, &event);
+                    #[cfg(feature = "gui")]
+                    if matches!(event, NoteEvent::NoteOn { .. }) {
+                        self.note_counter.fetch_add(1, Ordering::Relaxed);
+                    }
                     next_event = context.next_event();
                 }
 
@@ -376,6 +619,11 @@ impl Plugin for PhysicalPlugin {
                 }
             }
             let elapsed = start.elapsed().as_secs_f32();
+
+            // Voices sounding this block → editor activity meter.
+            #[cfg(feature = "gui")]
+            self.voice_meter
+                .store(engine.active_voice_count() as u32, Ordering::Relaxed);
 
             // Read-only CPU-load proxy (render time / block wall-clock budget).
             let sample_rate = context.transport().sample_rate;

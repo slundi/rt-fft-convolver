@@ -236,13 +236,37 @@ reset, detune, finite output under load) + 1 new core detune test;
 `nih` feature compiles for CLAP/VST3; `cargo fmt` + `clippy` clean on
 both the default and `nih` builds.
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
-- [ ] **Model-specific parameter layout** — dropdown switches the
-  visible controls.
-- [ ] **Voice-activity meter**: active vs. maximum polyphony.
-- [ ] **String / mode animation** for visual feedback (optional).
+Behind the opt-in **`gui`** feature (`gui = ["nih", "dep:nih_plug_egui"]`),
+so the default and `nih` builds stay offline / X11-free — the same split
+`rt-fdn-reverb` uses.  The framework-agnostic display maths live in
+`src/ui.rs` (unit-testable without the plugin runtime); the editor closure
+in `src/plugin.rs` only turns those numbers into widgets.
+
+- [x] **`nih-plug-egui`** — **decision: egui** (over `nih-plug-iced`).
+  Every other plugin editor in the workspace (IR cab / reverb, drive,
+  spectral, FDN reverb) is egui; matching keeps one immediate-mode idiom,
+  one set of X11/OpenGL CI deps, and lets the shared LED / meter drawing
+  style carry over.  `iced`'s retained model buys nothing here.
+- [x] **Model-specific parameter layout** — a `Plucked` / `Modal` selector
+  (buttons bound to the `model` param) switches which control block the
+  grid shows; shared `Decay` and the global `Gain` / `Mix` / `Polyphony`
+  are always visible.
+- [x] **Voice-activity meter** — a row of pips, `active / polyphony` lit,
+  fed by `active_voice_count()` stored per block into an atomic; the cap is
+  the live `Polyphony` value.
+- [x] **String / mode animation** — realised as a **partial-spectrum**
+  visualiser: bars laid out along the frequency-ratio axis show the comb-
+  filtered harmonics of a pluck (`|sin(n·π·pluck_position)|` with a
+  damping/brightness tilt) or the preset's inharmonic modal partials.  Plus
+  a note-activity LED in the header.
+
+`ui.rs` carries 6 unit tests (centre-pluck nulls even harmonics, damping
+darkens the highs, modal spectrum follows the preset ratios, mode-count cap,
+finite/in-range amplitudes, dB endpoints); `cargo fmt` + `clippy` clean on
+the default and `nih` builds (the `gui` build links X11/OpenGL and is
+exercised in CI, as with the other egui plugins).
 
 ## Phase 4: Testing
 

@@ -18,13 +18,17 @@
 //! - [`engine`] — [`PhysicalEngine`](engine::PhysicalEngine): the two pre-built
 //!   voice banks, the body stereoiser and the global gain / mix / bypass bus,
 //!   all allocation-free on the audio thread.
+//! - [`ui`] — framework-agnostic display maths for the editor (the partial /
+//!   mode spectrum), unit-testable without the framework.
 //! - `plugin` — the actual `nih-plug` `Plugin`, compiled only with the **`nih`**
 //!   feature (`cargo build -p rt-physical --features nih`).  Kept off the
 //!   default build so `cargo test` / `clippy` stay fast and offline.  The
-//!   `nih-plug-egui` editor lands in Phase 3.
+//!   Phase-3 `nih-plug-egui` editor is behind the additional **`gui`** feature
+//!   (`--features gui`), which links X11/OpenGL.
 
 pub mod engine;
 pub mod params;
+pub mod ui;
 
 pub use engine::PhysicalEngine;
 pub use params::{
