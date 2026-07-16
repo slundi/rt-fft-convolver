@@ -1,0 +1,25 @@
+[package]
+name = "rt-limiter-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time true-peak look-ahead brickwall-limiter DSP primitives: oversampled true-peak detection, feed-forward gain computer, dry-signal delay line, output ceiling clipper and an optional dither / noise-shaper.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "limiter", "true-peak", "mastering", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Shared dB↔linear gain helpers and the `DenormalGuard` convention (the
+# helpers live in the root crate so every plugin core reuses one copy).
+rt-fft-convolver = { path = ".." }
+# The Kaiser half-band polyphase `Oversampler` powers true-peak detection.
+# Phase 0 decision (Roadmap-07): depend on `rt-drive-core` directly rather
+# than extracting a shared `rt-oversample-core` crate.
+rt-drive-core = { path = "../rt-drive-core" }
+
+[features]
+default = []
+# Bit-depth reducer + noise shaper at the output (mastering feature).  Gated
+# so the crate stays lean for callers that do not export a final word length.
+dither = []

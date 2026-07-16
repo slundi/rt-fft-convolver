@@ -143,26 +143,26 @@ length.
   for the final export step the plugin is otherwise positioned to
   own.
 
-## Phase 1: `rt-limiter-core` (engine crate)
+## Phase 1: `rt-limiter-core` (engine crate) ✅
 
-- [ ] **Workspace layout**:
+- **Workspace layout**:
   - `rt-limiter-core` — engine.
   - `rt-limiter` — plugin.
-- [ ] **Oversampler**:
+- **Oversampler**:
   - Reuse `rt-drive-core`'s polyphase FIR chain.
-- [ ] **True-peak detector**:
+- **True-peak detector**:
   - Oversampled peak-hold over a rolling look-ahead window.
   - Ring-buffer implementation.
-- [ ] **Gain-computer**:
+- **Gain-computer**:
   - Threshold, ceiling, attack (implicit = look-ahead length),
     release.
   - Smoothed gain reduction curve to avoid distortion at the
     knee.
-- [ ] **Delay line** for the dry signal (matches look-ahead
+- **Delay line** for the dry signal (matches look-ahead
   length).
-- [ ] **Output ceiling clipper** as a safety net (should never
+- **Output ceiling clipper** as a safety net (should never
   engage if the limiter is doing its job).
-- [ ] **Dither / noise-shaper** (if included in scope).
+- **Dither / noise-shaper** (if included in scope).
 
 ## Phase 2: `rt-limiter` plugin
 
