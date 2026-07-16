@@ -17,6 +17,8 @@ crate-type = ["lib", "cdylib"]
 # Build the actual plugin with `cargo build -p rt-limiter --features nih`.
 default = []
 nih = ["dep:nih_plug"]
+# `gui` adds the Phase-3 nih-plug-egui editor (meters, GR history graph).
+gui = ["nih", "dep:nih_plug_egui"]
 # Output dither / noise-shaper (forwards to rt-limiter-core's `dither`).
 dither = ["rt-limiter-core/dither"]
 
@@ -30,3 +32,4 @@ rt-fft-convolver = { path = ".." }
 
 # nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

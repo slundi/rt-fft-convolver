@@ -190,15 +190,15 @@ length.
     optional.
 - **CPU meter** as read-only property.
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
-- [ ] **Gain-reduction meter** with peak-hold.
-- [ ] **True-peak in / out meters** (dBTP-calibrated).
-- [ ] **LUFS meter** (short-term + integrated) — if included in
+- **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
+- **Gain-reduction meter** with peak-hold.
+- **True-peak in / out meters** (dBTP-calibrated).
+- **LUFS meter** (short-term + integrated) — if included in
   scope.
-- [ ] **Threshold / ceiling knobs with numeric readout**.
-- [ ] **History display**: last N seconds of gain reduction as a
+- **Threshold / ceiling knobs with numeric readout**.
+- **History display**: last N seconds of gain reduction as a
   scrolling graph.
 
 ## Phase 4: Testing
