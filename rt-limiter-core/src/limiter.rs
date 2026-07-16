@@ -105,6 +105,10 @@ pub struct Limiter {
     /// Per-block true-peak scratch, one slot per input sample.
     peaks_left: Vec<f32>,
     peaks_right: Vec<f32>,
+
+    /// Smallest gain applied during the most recent [`process_block`] — the
+    /// peak gain reduction, for a host GR meter.  `1.0` = no reduction.
+    min_gain: f32,
 }
 
 impl Limiter {
@@ -193,7 +197,16 @@ impl Limiter {
             max_lookahead,
             peaks_left: vec![0.0; max_block],
             peaks_right: vec![0.0; max_block],
+            min_gain: 1.0,
         }
+    }
+
+    /// The peak gain reduction applied during the most recent
+    /// [`process_block`](Self::process_block), as a linear gain in `(0, 1]`
+    /// (`1.0` = no reduction).  For a host gain-reduction meter.
+    #[inline]
+    pub fn min_gain(&self) -> f32 {
+        self.min_gain
     }
 
     /// Reported latency for host delay compensation, in samples (`A + Lᴅ`).
@@ -314,6 +327,7 @@ impl Limiter {
         self.detector_right
             .detect_block(&right[..block], &mut self.peaks_right[..block]);
 
+        let mut block_min_gain = 1.0f32;
         for index in 0..block {
             // Delay the dry signal; the returned samples are `A + Lᴅ` old.
             let dry_left = self.delay_left.process(left[index]);
@@ -323,6 +337,7 @@ impl Limiter {
             let linked_peak = self.peaks_left[index].max(self.peaks_right[index]);
             let windowed_peak = self.window.push(linked_peak);
             let gain = self.gain.process(windowed_peak);
+            block_min_gain = block_min_gain.min(gain);
 
             // Apply the single gain, then the ceiling safety net.
             let out_left = self.clip_left.process(dry_left * gain);
@@ -354,6 +369,12 @@ impl Limiter {
                 right[index] = mid - side;
             }
         }
+
+        // Publish the block's peak reduction for the GR meter (an empty block
+        // leaves the previous reading untouched).
+        if block > 0 {
+            self.min_gain = block_min_gain;
+        }
     }
 
     /// Clear all internal state (detectors, delays, window, gain envelope,
@@ -365,6 +386,7 @@ impl Limiter {
         self.delay_right.reset();
         self.window.reset();
         self.gain.reset();
+        self.min_gain = 1.0;
         #[cfg(feature = "dither")]
         {
             if let Some(dither) = self.dither_left.as_mut() {
@@ -611,6 +633,30 @@ mod tests {
                 assert!(l.abs() <= 1.05, "output not bounded: {l}");
             }
         }
+    }
+
+    /// `min_gain` reports the block's peak reduction: unity for a quiet block,
+    /// below unity once limiting engages.
+    #[test]
+    fn min_gain_tracks_reduction() {
+        let max_block = 256;
+        let mut limiter = light_limiter(4, max_block, -6.0, 0.0, ChannelLink::Linked);
+
+        // Quiet block, well under threshold → no reduction.
+        let mut left = vec![0.05f32; max_block];
+        let mut right = vec![0.05f32; max_block];
+        limiter.process_block(&mut left, &mut right);
+        assert!((limiter.min_gain() - 1.0).abs() < 1e-6);
+
+        // Hot block → the meter shows real reduction (gain < 1).
+        let mut left = vec![2.0f32; max_block];
+        let mut right = vec![2.0f32; max_block];
+        limiter.process_block(&mut left, &mut right);
+        assert!(
+            limiter.min_gain() < 0.9,
+            "GR meter should show reduction, got gain {}",
+            limiter.min_gain()
+        );
     }
 
     /// `set_lookahead_ms` changes the reported latency and clamps to the range.

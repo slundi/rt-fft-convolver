@@ -164,31 +164,31 @@ length.
   engage if the limiter is doing its job).
 - **Dither / noise-shaper** (if included in scope).
 
-## Phase 2: `rt-limiter` plugin
+## Phase 2: `rt-limiter` plugin ✅
 
-- [ ] **I/O**:
+- **I/O**:
   - Stereo in → stereo out.
   - Optional 4-channel mode — [decision].
-- [ ] **Core controls**:
+- **Core controls**:
   - `Threshold` (−60 … 0 dB).  Signal above this is limited down.
   - `Ceiling` (−12 … 0 dB).  Output true-peak limit.
   - `Release` (1 – 2000 ms + "auto").
   - `Style` (dropdown: transparent / punch / smooth /
     aggressive).
   - `Look-ahead` (0.1 – 20 ms, if user-configurable).
-- [ ] **Advanced controls**:
+- **Advanced controls**:
   - `Oversampling` (1× / 2× / 4× / 8× / 16×).
   - `Channel Link` (stereo linked / M/S / independent).
   - `Auto Release` (bool).
   - `Dither` (off / 16-bit / 20-bit / 24-bit, with shaper choice).
   - `Bypass`.
-- [ ] **Loudness display** — [decision]:
+- **Loudness display** — [decision]:
   - True-peak (dBTP), integrated LUFS, short-term LUFS, gain
     reduction max.
-- [ ] **MIDI**:
+- **MIDI**:
   - Not strictly needed for a mastering plugin; CC on `Threshold`
     optional.
-- [ ] **CPU meter** as read-only property.
+- **CPU meter** as read-only property.
 
 ## Phase 3: UI
 
