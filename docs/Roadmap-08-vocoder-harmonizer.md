@@ -135,27 +135,37 @@ allocation-free, no second tracker to maintain" design principles.
     "third above") → E4; **MIDI** holding E4 + G4 → two voices tracking
     E4 and G4. Each resolves to a ratio via `semitones_to_ratio`.
 
-## Phase 1: `rt-vox-core` (engine crate)
+## Phase 1: `rt-vox-core` (engine crate) ✅
 
-- [ ] **Workspace layout**:
-  - `rt-vox-core` — engine.
-  - `rt-vox` — plugin.
-- [ ] **Pitch tracker** (YIN or chosen):
-  - Frame size, hop size, confidence output.
-  - Off-RT-safe: uses only fixed-size scratch buffers.
-- [ ] **Formant analyser**:
-  - LPC coefficients per frame (chosen order, typically 12–18).
-  - Envelope reconstruction from coefficients.
-- [ ] **Vocoder engine**:
-  - Channel bank of state-variable band-pass filters (or FFT bins).
-  - Envelope follower per band on the modulator.
-  - Amplitude modulation of the carrier by the modulator envelope.
-- [ ] **Harmoniser engine**:
-  - N voices × pitch-shifter.
-  - Voice manager with MIDI-driven interval assignment.
-- [ ] **Formant shifter**:
-  - Independent path from pitch shift; user can shift formants
-    without shifting pitch, and vice versa.
+- **Workspace layout**:
+  - `rt-vox-core` — engine (created; added to the workspace members).
+  - `rt-vox` — plugin (deferred to Phase 2).
+- **Pitch tracker** (reused `rt_pitch_core::PitchTracker`):
+  - [`VoicePitchTracker`](../rt-vox-core/src/pitch.rs) streams host blocks
+    through an STFT `Analyzer`, emitting a `PitchEstimate`
+    (frequency / period / confidence) every hop.
+  - Off-RT-safe: the analyzer ring and per-lag score buffer are sized up
+    front; `process_block` allocates nothing.
+- **Formant analyser** (reused `rt_pitch_core::FormantEstimator`, `Lpc`):
+  - Voice-tuned LPC order (`sample_rate / 1000 + 2`) per frame, driving the
+    formant shifter; re-exported at the crate root.
+- **Vocoder engine** ([`Vocoder`](../rt-vox-core/src/vocoder.rs)):
+  - FFT-bin channel bank grouped into log-spaced
+    [`LogBands`](../rt-vox-core/src/bands.rs) (Phase 0 topology decision).
+  - Per-band attack/release [`EnvelopeFollower`](../rt-vox-core/src/envelope.rs)
+    on the modulator.
+  - Carrier bins scaled by the smoothed modulator envelope per band.
+- **Harmoniser engine** ([`Harmoniser`](../rt-vox-core/src/harmoniser.rs)):
+  - Up to `MAX_VOICES` (4) [`Voice`](../rt-vox-core/src/voice.rs)s, each a
+    swappable `Shifter` (default `PhaseVocoder`).
+  - Voice manager with `Free` / `Scale` / `Midi`
+    [`SnapMode`](../rt-vox-core/src/voicing.rs) interval sourcing; RT-safe
+    `note_on` / `note_off`.
+- **Formant shifter** ([`FormantShifter`](../rt-vox-core/src/formant_shift.rs)):
+  - Independent path — reshapes the LPC envelope (warped by the shift factor)
+    while leaving harmonic phases intact, so pitch is preserved.  Pitch-only
+    shifting (formants held) is the complementary `rt-pitch-core`
+    formant-preserving vocoder.
 
 ## Phase 2: `rt-vox` plugin
 
