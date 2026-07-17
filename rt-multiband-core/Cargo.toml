@@ -1,0 +1,18 @@
+[package]
+name = "rt-multiband-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time multi-band dynamics DSP primitives: Linkwitz-Riley 4th-order crossover with all-pass reconstruction, per-band peak/RMS-blend detector, analog-modelled envelope follower, soft-knee compressor / expander / gate gain computer and an internal sidechain filter.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "compressor", "multiband", "dynamics", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Shared dB↔linear gain helpers and the `DenormalGuard` convention (the
+# helpers live in the root crate so every plugin core reuses one copy).
+rt-fft-convolver = { path = ".." }
+
+[features]
+default = []

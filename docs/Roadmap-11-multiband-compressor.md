@@ -213,25 +213,49 @@ means the host's processing block (≤ 512 samples assumed for sizing).
     | Linked only | shared detector | 1 `max`/sample | Low, but no independent option |
     | M/S per-band selectable | + M/S matrix state | + encode/decode/sample | Med — deferred to v2 |
 
-## Phase 1: `rt-multiband-core` (engine crate)
+## Phase 1: `rt-multiband-core` (engine crate) ✅
 
-- [ ] **Workspace layout**:
-  - `rt-multiband-core` — engine.
-  - `rt-multiband` — plugin.
-- [ ] **Crossover primitives**:
-  - Linkwitz-Riley 4th-order biquad pairs.
-  - Optional linear-phase FIR via `rt-fft-convolver`.
-- [ ] **Per-band processor**:
-  - `BandProcessor { detector, gain_computer, envelope_follower,
-    makeup_gain }`.
-  - `process_sample(&mut self, in: f32) -> f32` — RT-safe.
-- [ ] **Sidechain routing**:
-  - Internal (band content).
-  - External (aux input) — if in scope.
-  - Sidechain filter (HPF + shelf).
-- [ ] **Band-sum reconstruction**:
-  - Linkwitz-Riley sums to unity when bands are bypassed
-    (verified with a bypass test).
+- [x] **Workspace layout**:
+  - `rt-multiband-core` — engine
+    ([Cargo.toml](../rt-multiband-core/Cargo.toml), wired into the root
+    `members` **and** `default-members`).
+  - `rt-multiband` — plugin (Phase 2, not yet scaffolded).
+- [x] **Crossover primitives**
+  ([crossover.rs](../rt-multiband-core/src/crossover.rs)):
+  - Linkwitz-Riley 4th-order biquad pairs (two cascaded Butterworth
+    sections per split) built on a local RBJ
+    [`Biquad`](../rt-multiband-core/src/biquad.rs) (LP/HP/allpass/shelf).
+  - Linear-phase FIR via `rt-fft-convolver` — deferred to v2 (Phase 0).
+- [x] **Per-band processor**
+  ([band.rs](../rt-multiband-core/src/band.rs)):
+  - `BandProcessor` = [`SidechainFilter`](../rt-multiband-core/src/sidechain.rs)
+    → [`Detector`](../rt-multiband-core/src/detector.rs) (peak/RMS blend)
+    → [`EnvelopeFollower`](../rt-multiband-core/src/envelope.rs)
+    (analog attack/release)
+    → [`GainComputer`](../rt-multiband-core/src/gain_computer.rs)
+    (soft-knee compressor/expander/gate) → makeup gain.
+  - `process(&mut self, left, right) -> (f32, f32)` — RT-safe, stereo with
+    `StereoLink` linked / independent (the sample-domain equivalent of the
+    roadmap's `process_sample`, done stereo so detector linking is real).
+- [x] **Sidechain routing**
+  ([sidechain.rs](../rt-multiband-core/src/sidechain.rs)):
+  - Internal (band content) — the detector-path signal.
+  - External (aux input) — deferred to v2 (Phase 0).
+  - Sidechain filter (HPF + high shelf), per band, per channel.
+- [x] **Band-sum reconstruction**
+  ([engine.rs](../rt-multiband-core/src/engine.rs)):
+  - Linkwitz-Riley bands sum to a magnitude-flat (all-pass) copy of the
+    input when bypassed — verified by
+    `all_bands_bypassed_reconstruct_the_input` (< 0.1 dB error) plus a
+    per-probe-tone flatness test in `crossover.rs`.
+  - Parameter smoothing is the local
+    [`ParamSmoother`](../rt-multiband-core/src/smoother.rs) (Phase 0
+    prerequisite decision).
+
+**Tests.** 46 unit tests across the nine modules (crossover reconstruction,
+compressor −10 dB @ 2:1 hard-knee acceptance, expander downward-expansion,
+attack/release ±10 % τ, detector blend, solo/mute isolation, silence→silence).
+Plugin `tests/` triad lands with the Phase 2 `rt-multiband` wrapper.
 
 ## Phase 2: `rt-multiband` plugin
 
