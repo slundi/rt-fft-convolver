@@ -1,0 +1,28 @@
+[package]
+name = "rt-multiband"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Multi-band compressor / limiter / expander plugin (LV2 / CLAP / VST3) built on rt-multiband-core.  Four-band Linkwitz-Riley crossover, per-band compressor/expander/gate.  See docs/Roadmap-11-multiband-compressor.md."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+publish = false
+
+[lib]
+# `cdylib` is what the CLAP/VST3 bundles load; `lib` keeps unit tests working.
+crate-type = ["lib", "cdylib"]
+
+[features]
+# The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
+# Build the actual plugin with `cargo build -p rt-multiband --features nih`.
+default = []
+nih = ["dep:nih_plug"]
+
+[dependencies]
+# The multi-band dynamics engine.
+rt-multiband-core = { path = "../rt-multiband-core" }
+# DenormalGuard on the audio thread + dB↔linear helpers.
+rt-fft-convolver = { path = ".." }
+
+# nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

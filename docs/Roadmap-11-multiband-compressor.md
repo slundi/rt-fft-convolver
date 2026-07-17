@@ -215,18 +215,18 @@ means the host's processing block (≤ 512 samples assumed for sizing).
 
 ## Phase 1: `rt-multiband-core` (engine crate) ✅
 
-- [x] **Workspace layout**:
+- **Workspace layout**:
   - `rt-multiband-core` — engine
     ([Cargo.toml](../rt-multiband-core/Cargo.toml), wired into the root
     `members` **and** `default-members`).
   - `rt-multiband` — plugin (Phase 2, not yet scaffolded).
-- [x] **Crossover primitives**
+- **Crossover primitives**
   ([crossover.rs](../rt-multiband-core/src/crossover.rs)):
   - Linkwitz-Riley 4th-order biquad pairs (two cascaded Butterworth
     sections per split) built on a local RBJ
     [`Biquad`](../rt-multiband-core/src/biquad.rs) (LP/HP/allpass/shelf).
   - Linear-phase FIR via `rt-fft-convolver` — deferred to v2 (Phase 0).
-- [x] **Per-band processor**
+- **Per-band processor**
   ([band.rs](../rt-multiband-core/src/band.rs)):
   - `BandProcessor` = [`SidechainFilter`](../rt-multiband-core/src/sidechain.rs)
     → [`Detector`](../rt-multiband-core/src/detector.rs) (peak/RMS blend)
@@ -237,12 +237,12 @@ means the host's processing block (≤ 512 samples assumed for sizing).
   - `process(&mut self, left, right) -> (f32, f32)` — RT-safe, stereo with
     `StereoLink` linked / independent (the sample-domain equivalent of the
     roadmap's `process_sample`, done stereo so detector linking is real).
-- [x] **Sidechain routing**
+- **Sidechain routing**
   ([sidechain.rs](../rt-multiband-core/src/sidechain.rs)):
   - Internal (band content) — the detector-path signal.
   - External (aux input) — deferred to v2 (Phase 0).
   - Sidechain filter (HPF + high shelf), per band, per channel.
-- [x] **Band-sum reconstruction**
+- **Band-sum reconstruction**
   ([engine.rs](../rt-multiband-core/src/engine.rs)):
   - Linkwitz-Riley bands sum to a magnitude-flat (all-pass) copy of the
     input when bypassed — verified by
@@ -257,37 +257,52 @@ compressor −10 dB @ 2:1 hard-knee acceptance, expander downward-expansion,
 attack/release ±10 % τ, detector blend, solo/mute isolation, silence→silence).
 Plugin `tests/` triad lands with the Phase 2 `rt-multiband` wrapper.
 
-## Phase 2: `rt-multiband` plugin
+## Phase 2: `rt-multiband` plugin ✅
 
-- [ ] **I/O**:
-  - Stereo in → stereo out.
-  - Sidechain in (if scope).
-- [ ] **Global controls**:
-  - `Band Count` (2–6, if configurable).
-  - `Crossover Type` (IIR / linear-phase).
-  - `Input Gain`.
-  - `Output Gain`.
-  - `Mix` (parallel / dry-wet).
-  - `Bypass`.
-- [ ] **Per-band controls** (× N):
-  - `Crossover Frequency N` (Hz) — sets the upper edge of band N.
-  - `Mode` (compressor / expander / gate / bypass).
-  - `Threshold`.
-  - `Ratio`.
-  - `Attack`.
-  - `Release`.
-  - `Knee`.
-  - `Makeup Gain`.
-  - `Solo` (audition only this band).
-  - `Mute` (silence this band).
-- [ ] **Sidechain controls** (per band):
-  - `SC Source` (self / external).
-  - `SC HPF` (Hz).
-  - `SC Listen` (solo the sidechain signal).
-- [ ] **MIDI**:
-  - CC on `Threshold` and `Makeup` per band (bank-switching may be
-    needed for LV2 CC limits).
-- [ ] **Latency reporting** for the linear-phase mode.
+The plugin ([Cargo.toml](../rt-multiband/Cargo.toml)) follows the family shape
+minus the controller: because [`MultibandEngine`](../rt-multiband-core/src/engine.rs)
+allocates **nothing** after construction and every control is an in-place
+setter, the engine lives resident in the audio-thread
+[`MultibandProcessor`](../rt-multiband/src/engine.rs) (no `ir_handoff` seam in
+v1). [`params.rs`](../rt-multiband/src/params.rs) is the framework-agnostic
+`Copy` model; [`plugin.rs`](../rt-multiband/src/plugin.rs) is the `nih` wrapper
+(nested per-band param groups + a `snapshot()` converter);
+[`ui.rs`](../rt-multiband/src/ui.rs) holds egui-free meter helpers for Phase 3.
+
+- **I/O** — stereo → stereo and mono → mono
+  ([plugin.rs](../rt-multiband/src/plugin.rs) `AUDIO_IO_LAYOUTS`). External
+  (aux) sidechain in deferred to v2 (Phase 0), so no aux buses.
+- **Global controls**
+  ([params.rs](../rt-multiband/src/params.rs)):
+  - `Band Count` — fixed 4 in v1 (Phase 0), so not a control.
+  - `Crossover Type` — IIR only in v1 (Phase 0), so not a control.
+  - `Input Gain`, `Output Gain`, `Mix`, `Bypass` — plus `Link`
+    (linked/independent) and three `Crossover N` edges.
+- **Per-band controls** (× 4) — `Crossover Frequency` (global edges),
+  `Mode`, `Threshold`, `Ratio`, `Attack`, `Release`, `Knee`, `Makeup`,
+  `Solo`, `Mute`, plus `Detector Blend` (peak/RMS). Declared as four nested
+  `#[nested(array, group = "Bands")]` param groups.
+- **Sidechain controls** (per band)
+  ([sidechain](../rt-multiband-core/src/sidechain.rs)):
+  - `SC Source` — self only in v1 (external deferred, Phase 0).
+  - `SC HPF` (Hz) — per band.
+  - `SC Listen` — deferred to the Phase 3 editor.
+- **MIDI** — per-band `Threshold` (CC 20–23) and `Makeup` (CC 24–27) via
+  `MidiConfig::MidiCCs`; a CC override is reclaimed when the host moves the
+  knob ([`decode_cc`](../rt-multiband/src/params.rs), `apply_midi` in
+  [plugin.rs](../rt-multiband/src/plugin.rs)).
+- **Latency reporting** — v1 is zero-latency (IIR crossover);
+  `set_latency_samples(0)`. The v2 linear-phase mode will report its FIR delay
+  through the same [`latency_samples`](../rt-multiband/src/engine.rs) hook.
+
+**Tests.** The plugin `tests/` triad —
+[`integration.rs`](../rt-multiband/tests/integration.rs) (bypass transparency,
+bypassed-band reconstruction, per-band compression, solo/mute, independent
+linking, live crossover retune), [`rt_safety.rs`](../rt-multiband/tests/rt_safety.rs)
+(zero latency, finite/bounded, silent-tail decay, edge-case blocks) and
+[`rt_alloc.rs`](../rt-multiband/tests/rt_alloc.rs) (allocation-free steady
+state + per-block parameter changes + mono) — plus params/engine/ui unit
+tests: **33 tests** across the crate.
 
 ## Phase 3: UI
 
