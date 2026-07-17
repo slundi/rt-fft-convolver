@@ -40,6 +40,7 @@ members = [
     "rt-vox-core",
     "rt-vox",
     "rt-adaptive-core",
+    "rt-adaptive",
     "xtask",
 ]
 # `xtask` exists only for `cargo xtask …` (the bundler); keep it out of plain
@@ -66,6 +67,7 @@ default-members = [
     "rt-vox-core",
     "rt-vox",
     "rt-adaptive-core",
+    "rt-adaptive",
 ]
 
 [package.metadata.docs.rs]

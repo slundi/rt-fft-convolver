@@ -204,36 +204,48 @@ dropped per the Phase 0 decision.
   decision (the FFT long-filter AEC path adds latency); the time-domain NLMS
   core above covers v1.
 
-## Phase 2: `rt-adaptive` plugin
+## Phase 2: `rt-adaptive` plugin ✅
 
-- [ ] **I/O**:
-  - Stereo in → stereo out.
-  - Sidechain in for AEC (reference / far-end signal), if scope.
-- [ ] **Mode selector**:
-  - `Feedback Suppressor` / `Hum Remover` / `Echo Canceller`.
-- [ ] **Feedback controls**:
-  - `Sensitivity` (0–100 %).
-  - `Max Notches` (1–24).
-  - `Notch Q` (0.5 – 50).
-  - `Notch Depth` (−48 … 0 dB).
-  - `Auto / Manual` (in Manual, user places notches).
-  - `Freeze` — stop new notch allocation, keep existing.
-  - `Reset` — clear all notches.
-- [ ] **Hum controls**:
-  - `Fundamental` (50 / 60 Hz + custom).
-  - `Harmonics` (1–10).
-  - `Adaptive` (bool) — track mains drift.
-  - `Depth` (dB).
-- [ ] **AEC controls** (if scope):
-  - `Filter Length` (samples / ms).
-  - `Convergence Speed` (μ for NLMS).
-  - `Double-Talk Detector Threshold`.
-- [ ] **Global controls**:
-  - `Output Gain`.
-  - `Bypass`.
-- [ ] **MIDI**:
-  - CC on `Freeze` and `Reset` (footswitch-friendly).
-- [ ] **CPU meter** as read-only property.
+Plugin crate built on the framework-agnostic
+[`params`](../rt-adaptive/src/params.rs) +
+[`engine`](../rt-adaptive/src/engine.rs) split, with the `nih-plug` wrapper
+([`plugin`](../rt-adaptive/src/plugin.rs)) behind the `nih` feature.  Controls
+map to `AdaptiveParams` (Copy) with `clamped()` + `structural_changed()`; the
+[`AdaptiveController`](../rt-adaptive/src/engine.rs) rebuilds the echo bank off
+the audio thread on a filter-length change, everything else applied in place.
+The Phase-3 egui editor is deferred (no `gui` feature yet).
+
+- **I/O**:
+  - Stereo in → stereo out, and mono → mono, each with a **mono sidechain**
+    (the AEC far-end reference), per the Phase 0 "AEC in scope" decision.
+- **Mode selector**: `Feedback Suppressor` / `Hum Remover` / `Echo Canceller`
+  (one plugin, three resident engines — a mode switch never drops notches or a
+  converged echo path).
+- **Feedback controls**: `Sensitivity` (0–100 %), `Max Notches` (1–24),
+  `Notch Q` (0.5–50), `Auto`, `Freeze`, `Reset` (rising-edge clears the bank).
+  - *`Notch Depth` deferred* — the reused `rt_spectral_core::Biquad` is a
+    full-depth RBJ notch, which already meets the > 20 dB Phase 4 bar; a
+    variable-depth notch biquad is a v1.1 refinement.  *Manual* placement UI is
+    Phase 3 (Auto off currently just disables auto-allocation).
+- **Hum controls**: `Fundamental` (40–70 Hz, covers 50 / 60 + custom),
+  `Harmonics` (1–10), `Adaptive` (track mains drift), `Hum Q` (the narrowness
+  the reused `HumNotchBank` exposes, in place of a dB `Depth`).
+- **AEC controls**: `Filter Length` (256 / 512 / 1024 / 2048 taps — the
+  structural control), `Convergence Speed` (μ for NLMS), `Double-Talk
+  Threshold` (dB; per-channel block-energy detector freezes adaptation when the
+  near-end dominates).
+- **Global controls**: `Output Gain` (−24…24 dB), `Bypass` (bit-transparent).
+- **MIDI**: `Freeze` / `Reset` are automatable `BoolParam`s bound to a
+  footswitch CC via host MIDI learn (the idiomatic `nih-plug` path; no plugin
+  MIDI handling needed).
+- **CPU meter** — the processor exposes read-only telemetry getters
+  (`active_notches`, `tracked_hum_hz`, `feedback_events`) for the Phase 3 editor;
+  a true CPU-percentage meter is deferred to that phase.
+- **Tests**: the mandatory triad ships —
+  [`integration.rs`](../rt-adaptive/tests/integration.rs) (incl. the feedback
+  loopback / anti-divergence test), [`rt_safety.rs`](../rt-adaptive/tests/rt_safety.rs),
+  [`rt_alloc.rs`](../rt-adaptive/tests/rt_alloc.rs) (zero-alloc including on notch
+  placement).
 
 ## Phase 3: UI
 
