@@ -18,39 +18,151 @@ Plugin format target: **LV2 + CLAP + VST3** via
 - **RT-safe** — no allocations, no locks on the audio thread.
   Coefficient updates happen in-place.
 - **Modes are independent** — feedback suppression, hum removal,
-  and AEC share the LMS / RLS core but have very different UX.
-  [decision] whether to ship as one plugin with modes or three
-  separate plugins.
+  and AEC share the NLMS / notch core but have very different UX.
+  **Decision (Phase 0): one plugin, three modes** over a shared
+  `rt-adaptive-core` crate — see Phase 0 below.
 - **Automatic and manual detection** — auto for typical live use,
   manual notch-programming as a fallback for stubborn feedback.
 - **No latency in the direct signal path** — adaptive filters here
   are notches / cancellers, not lookahead processors.
 
-## Prerequisites in `rt-fft-convolver`
+## Prerequisites in `rt-fft-convolver` ✅
 
-- [ ] `DenormalGuard`.
-- [ ] Optional reuse of `dsp/fft_handler.rs` for frequency-domain
-  adaptive filters (block-LMS).
+- `DenormalGuard` — present and tested
+  ([src/utils/denormals.rs](../src/utils/denormals.rs)); RAII FTZ/DAZ
+  guard, re-exported at the crate root. Wraps the near-silent NLMS /
+  notch tails so a quiet room never drives coefficients into denormal
+  arithmetic.
+- `FftHandler` — present and tested
+  ([src/dsp/fft_handler.rs](../src/dsp/fft_handler.rs)); allocation-free
+  real→complex / complex→real FFT, reused for the feedback detector's
+  rolling analysis FFT and (later) the optional frequency-domain
+  block-LMS AEC path.
+- `Ring` and dB helpers (`db_to_linear` / `linear_to_db`) — present and
+  exported; used for the detector's sliding analysis window and for the
+  notch-depth / sensitivity controls.
+- **Bonus prerequisites met in sibling `*-core` crates** — the two
+  hardest DSP pieces already exist, tested and RT-safe, so this plugin
+  reuses rather than re-implements (see Phase 0):
+  - [`rt_spectral_core::Biquad`](../rt-spectral-core/src/biquad.rs) — an
+    RBJ notch in transposed direct-form II with a state-preserving
+    `set_notch`; its own unit test proves > 20 dB rejection at centre,
+    exactly this roadmap's Phase 4 bar.
+  - [`rt_spectral_core::HumNotchBank`](../rt-spectral-core/src/hum.rs) —
+    a fundamental-plus-harmonics comb of those notches.
+  - [`rt_pitch_core::PitchTracker`](../rt-pitch-core/src/pitch.rs) —
+    normalised-autocorrelation fundamental estimation with a confidence
+    score, the natural drift tracker for adaptive hum.
+  - Core→core path dependencies are already the workspace norm
+    (`rt-vox-core` depends on both `rt-fft-convolver` and
+    `rt-pitch-core`), so `rt-adaptive-core` may depend on
+    `rt-fft-convolver`, `rt-pitch-core`, and `rt-spectral-core` without
+    any plugin-framework leak.
 
-## Phase 0: Algorithm decisions
+## Phase 0: Algorithm decisions ✅
 
-- [ ] **Adaptive-filter algorithm** — [decision] per mode:
-  - Time-domain LMS (simplest, cheapest).
-  - Normalised LMS (NLMS, more stable across gain).
-  - Recursive Least Squares (RLS, faster convergence, higher CPU).
-  - Frequency-domain block LMS (partitioned FFT — reuses
-    `rt-fft-convolver`).
-- [ ] **Feedback detector** — [decision]:
-  - Continuous FFT peak-tracker + Q-narrow notch placement.
-  - Autocorrelation-based howlback detection.
-- [ ] **Hum removal** — [decision]:
-  - Static comb-notch (fundamental + harmonics).
-  - Adaptive: track the fundamental frequency drift (mains
-    frequency can drift ± 0.5 Hz).
-- [ ] **AEC reference input**:
-  - Required if the plugin is used in an AEC scenario (broadcast,
-    conferencing).  [decision] whether v1 supports AEC or only
-    feedback/hum.
+The dominant Phase 0 finding mirrors Roadmap-08: the two hardest pieces
+of DSP this plugin needs — a state-preserving RBJ **notch** and an
+autocorrelation **fundamental tracker** — already ship, tested and
+RT-safe, in sibling `*-core` crates. Every decision below therefore
+favours *reuse* over a second parallel implementation, keeping the
+plugin inside its "well under 1 % CPU, allocation-free, no latency in the
+direct path" design principles. **v1 ships all three modes**, with a
+time-domain **NLMS** echo canceller (the frequency-domain block-LMS path
+is deferred to a later version).
+
+- **Plugin packaging** — **decision: one plugin, three modes**
+  (`Feedback Suppressor` / `Hum Remover` / `Echo Canceller`) over a
+  shared `rt-adaptive-core` crate, matching every other `*-core` +
+  plugin pair in the workspace.
+  - *Options considered.* (a) One plugin with a mode selector — the
+    modes share the notch primitive, the rolling analysis FFT, and the
+    global `Output Gain` / `Bypass` / MIDI `Freeze`+`Reset` controls
+    Phase 2 already lists. (b) Three separate plugins over a shared core
+    — triples bundling, CI, installers, and preset banks for no user
+    benefit. Waves X-FDBK, Sabine FBX, and Shure DFR are each single
+    boxes with switchable behaviour, i.e. the (a) model.
+
+- **Adaptive-filter algorithm** — **decision: per mode, the cheapest
+  approach that meets the mode's job** — the modes do *not* all run a
+  per-sample adaptive filter:
+  - *Feedback suppression* — **detection-driven notch placement**, no
+    per-sample adaptive filter. The rolling FFT detector (below) locates
+    howling partials and programmes `rt_spectral_core::Biquad` notches;
+    the direct path is a static notch cascade, so it adds zero latency
+    and near-zero CPU between detections.
+  - *Hum removal* — **adaptive comb of biquad notches** (below); again
+    no LMS, just periodic coefficient retuning from a tracked
+    fundamental.
+  - *AEC* — **normalised LMS (NLMS)**, time-domain, a fixed-length tap
+    vector `AdaptiveFilter<const N: usize>` with a per-sample
+    `update(input, error)`.
+  - *Options considered (AEC core).* Plain **LMS** is the simplest but
+    its step size must be retuned whenever the far-end gain changes;
+    **NLMS** normalises by input energy and stays stable across levels
+    for one extra divide per block — the right default for a live tool.
+    **RLS** converges fastest but is `O(N²)` per sample, which blows the
+    < 1 % CPU budget for any useful tap count. **Frequency-domain block
+    LMS** (partitioned FFT, reusing `rt-fft-convolver`) is the best fit
+    for long echo tails but adds block latency to the path — **deferred**
+    to v1.1 as an optional long-filter mode.
+  - *Example.* At 48 kHz an `N = 512`-tap NLMS covers ≈ 10.7 ms of echo
+    delay; per sample `y = wᵀx`, `e = d − y`,
+    `w += μ · e · x / (‖x‖² + ε)`, with `μ` exposed as
+    `Convergence Speed` and adaptation frozen by the double-talk
+    detector.
+
+- **Feedback detector** — **decision: continuous rolling FFT
+  peak-tracker + peak-hold / threshold logic + Q-narrow notch
+  placement**, reusing `rt_fft_convolver::FftHandler` over a 512-point
+  sliding window.
+  - *Options considered.* (a) FFT peak-tracker — a howling partial shows
+    as a spectral peak that *keeps growing and holds* frame-to-frame,
+    which the peak-hold logic distinguishes from a loud-but-decaying
+    musical tone; this is the classic Sabine FBX / Shure DFR approach and
+    reuses the FFT infra the prerequisite already calls out.
+    (b) Autocorrelation howlback detection — cheaper but conflates a
+    sustained musical note with feedback and gives no direct frequency to
+    place the notch at. Chose (a).
+  - *Example.* A 3.2 kHz partial that rises for ≥ N consecutive frames
+    and exceeds the `Sensitivity` threshold → allocate the next free
+    `Biquad` notch at 3.2 kHz, `Q` and depth from the controls; the
+    feedback-detection LED flashes (Phase 3). `Freeze` stops new
+    allocation; `Reset` clears the bank.
+
+- **Hum removal** — **decision: adaptive comb-notch** — reuse
+  `rt_spectral_core::HumNotchBank` (fundamental + harmonics) as the
+  static comb, and when `Adaptive` is on **retune it from a tracked
+  fundamental** via `rt_pitch_core::PitchTracker`; `Adaptive` off leaves
+  the comb pinned at the selected 50 / 60 Hz.
+  - *Options considered.* (a) Static comb only — simplest, but mains
+    frequency drifts ± 0.5 Hz and a fixed notch then leaks the
+    fundamental. (b) Adaptive — the autocorrelation tracker already
+    emits a confidence-scored fundamental, so a slow drift of the comb's
+    base frequency (rate-limited to avoid chasing music) tracks mains
+    wander while keeping notches narrow. (a) is the `Adaptive = false`
+    sub-case of (b), so both ship from one path.
+  - *Example.* Selected 60 Hz, `Harmonics = 5` → notches at 60/120/180/
+    240/300 Hz; with `Adaptive` on and a measured 59.94 Hz fundamental,
+    the whole comb slides to 59.94/119.88/… so the third harmonic stays
+    inside its narrow notch.
+
+- **AEC reference input / scope** — **decision: AEC is in scope for
+  v1** (per the user's Phase 0 call). The plugin takes a **sidechain
+  reference (far-end) input**; the NLMS filter models the echo path from
+  reference to the near-end mic and subtracts it. A **double-talk
+  detector** freezes adaptation while the near-end talker is active so
+  the canceller does not train on local speech and diverge.
+  - *Options considered.* Ship only feedback/hum (smaller v1) vs. include
+    NLMS AEC vs. include FFT block-LMS AEC. Chose NLMS: it covers
+    broadcast / conferencing / lecture-mic echo at low CPU and no path
+    latency; the heavier block-LMS long-filter path stays deferred (see
+    the algorithm decision above).
+  - *Example.* Far-end program on the sidechain, near-end lavalier on the
+    main input: with no near-end speech the detector lets NLMS converge
+    and the leaked far-end echo drops into the noise floor; when the
+    near-end talker starts, the detector freezes `w` and the direct path
+    passes their voice untouched.
 
 ## Phase 1: `rt-adaptive-core` (engine crate)
 
