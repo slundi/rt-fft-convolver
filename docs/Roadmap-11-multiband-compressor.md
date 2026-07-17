@@ -337,24 +337,48 @@ add 12 unit tests (log-axis round-trip, spectral-height floor/peak, transfer
 curve = compressor acceptance, spectrum tone-lands-in-its-bin); **45 tests**
 across the crate.
 
-## Phase 4: Testing
+## Phase 4: Testing ✅
 
-- [ ] **Unit tests** (`rt-multiband-core`):
-  - Crossover reconstruction: bypassed bands sum to bit-identical
-    (IIR) or delayed-identical (linear-phase).
-  - Compressor: 20 dB above threshold at ratio 2:1 with hard knee
-    produces −10 dB gain reduction (steady state).
-  - Expander: below threshold at ratio 2:1 produces the correct
-    downward expansion.
-  - Attack / release: gain reduction reaches target within ± 10 %
-    of the specified time constant.
-- [ ] **Sidechain tests**:
-  - External sidechain path routes correctly (if in scope).
-- [ ] **RT-safety audit**:
-  - Zero allocations in `process()`.
-  - Denormal guard active.
-  - Reported latency matches actual delay in linear-phase mode.
-- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval`.
+The DSP acceptance bar is formalised in
+[`rt-multiband-core/tests/acceptance.rs`](../rt-multiband-core/tests/acceptance.rs)
+(7 tests, one per bullet, driven through the public engine), on top of the
+module unit tests and the plugin `tests/` triad. **98 tests** across the two
+crates.
+
+- [x] **Unit tests** (`rt-multiband-core`)
+  ([acceptance.rs](../rt-multiband-core/tests/acceptance.rs) + module tests):
+  - Crossover reconstruction — bypassed bands sum **magnitude-flat**
+    (< 0.1 dB) across probe tones and a broadband impulse.
+    *Deviation from the bullet:* an LR4 sum is an all-pass (flat magnitude,
+    non-zero phase), so the achievable IIR guarantee is *magnitude-flat*, not
+    literally *bit-identical* — bit-identity needs a subtractive crossover,
+    which sacrifices the 24 dB/oct slope (Phase 0 chose LR4). Documented in the
+    test module.
+  - Compressor — 20 dB above a −20 dB threshold at 2:1 hard knee gives −10 dB
+    applied gain reduction (`compressor_20db_over_2to1_hardknee_is_minus_10db`,
+    plus the stateless-curve unit test in
+    [gain_computer.rs](../rt-multiband-core/src/gain_computer.rs)).
+  - Expander — 10 dB below threshold at 2:1 gives −10 dB downward expansion.
+  - Attack / release — reach `1 − 1/e` / `1/e` within ± 10 % of the specified
+    time constant.
+- [x] **Sidechain tests** — internal (v1) SC path:
+  `internal_sidechain_hpf_gates_the_detector` proves a high SC-HPF removes a
+  low tone from the detector (≥ 6 dB less compression). External aux sidechain
+  is out of v1 scope (Phase 0), so its routing test is deferred to v2.
+- [x] **RT-safety audit**:
+  - Zero allocations in `process()` —
+    [rt_alloc.rs](../rt-multiband/tests/rt_alloc.rs) (counting allocator;
+    steady state + per-block parameter changes + mono).
+  - Denormal guard active —
+    [rt_safety.rs](../rt-multiband/tests/rt_safety.rs) `silent_tail_...` (the
+    `MultibandProcessor` installs the `DenormalGuard` on the RT boundary).
+  - Reported latency — v1 is zero-latency; `zero_bulk_latency_impulse_starts_at_sample_zero`
+    confirms the IIR crossover adds no bulk delay, and the plugin reports
+    `set_latency_samples(0)`. "Matches actual delay in linear-phase mode" is a
+    v2 concern (linear-phase deferred).
+- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval` — **deferred
+  to Phase 5** (they run against the bundled `.lv2` / `.clap` / `.vst3`
+  artifacts, which Phase 5 produces via `cargo xtask bundle rt-multiband`).
 
 ## Phase 5: Packaging & release
 
