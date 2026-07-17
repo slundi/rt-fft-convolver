@@ -1,0 +1,27 @@
+[package]
+name = "rt-loudness-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time EBU R128 / ITU-R BS.1770-4 loudness-measurement DSP primitives: K-weighting biquads, gated mean-square integrator (momentary / short-term / integrated LUFS), loudness-range (LRA) histogram, oversampled true-peak, and a lock-free result broadcast.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "loudness", "lufs", "ebu-r128", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Shared RT-safe primitives from the root crate: `DenormalGuard` (FTZ/DAZ over
+# the near-silent K-weighted tail) and the dB↔linear helpers for the peak
+# readouts.
+rt-fft-convolver = { path = ".." }
+# Roadmap-10 Phase 0 reuse: the tested oversampled inter-sample-peak envelope
+# (itself reusing `rt-drive-core`'s Kaiser half-band polyphase `Oversampler`)
+# is exactly the BS.1770-4 4× true-peak detector this crate needs — reused
+# rather than re-implemented.
+rt-limiter-core = { path = "../rt-limiter-core" }
+
+[dev-dependencies]
+# Micro-benchmarks would live here; kept for parity with the other core crates.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }

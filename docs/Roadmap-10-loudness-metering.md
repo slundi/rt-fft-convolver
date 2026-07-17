@@ -163,26 +163,42 @@ host's processing block (≤ 512 samples assumed for sizing).
   part of BS.1770 and would add an FFT/analysis path unrelated to the
   loudness gate; revisit only on request.
 
-## Phase 1: `rt-loudness-core` (engine crate)
+## Phase 1: `rt-loudness-core` (engine crate) ✅
 
-- [ ] **Workspace layout**:
-  - `rt-loudness-core` — measurement engine.
-  - `rt-loudness-meter` — plugin.
-- [ ] **K-weighting filter** (BS.1770-4):
-  - Two biquad stages (pre-filter + RLB high-pass).
-  - Per-channel state.
-- [ ] **Mean-square integrator**:
-  - 400 ms window for momentary.
-  - 3 s window for short-term.
-  - Gated running mean for integrated (relative and absolute gates
-    per BS.1770-4).
-- [ ] **True-peak detector**:
-  - 4× oversampling, peak-hold over a rolling window.
-- [ ] **LRA (loudness range)**:
-  - Histogram of short-term values, 10th–95th percentile spread.
-- [ ] **Result-broadcast channel**:
-  - Off-RT consumer reads latest values via atomics for UI /
-    logging.
+Engine crate built, unit- and integration-tested (33 tests), clippy- and
+machete-clean, and wired into the workspace `members` + `default-members`.  The
+full-scale-stereo-sine ≈ 0 LUFS BS.1770 calibration check passes end-to-end.
+
+- **Workspace layout**:
+  - [`rt-loudness-core`](../rt-loudness-core) — measurement engine (created).
+    `rt-loudness-meter` — plugin (deferred to Phase 2).
+- **K-weighting filter** (BS.1770-4)
+  ([kweight.rs](../rt-loudness-core/src/kweight.rs)):
+  - Two biquad stages (shelving pre-filter + RLB high-pass), transposed
+    direct-form II, per-channel [`KWeightingFilter`].
+  - Sample-rate-independent (De Man / `libebur128` bilinear design); a unit
+    test asserts the 48 kHz coefficients match the standard's table.
+- **Mean-square integrator**
+  ([integrator.rs](../rt-loudness-core/src/integrator.rs),
+  [lra.rs](../rt-loudness-core/src/lra.rs)):
+  - 400 ms momentary + 3 s short-term over a fixed 100 ms sub-block ring (no
+    raw-sample buffering — O(1) memory in session length).
+  - Gated running mean for integrated via a fixed [`LoudnessHistogram`]
+    (absolute −70 LUFS + relative −10 LU gates, BS.1770-4).
+- **True-peak detector**
+  ([truepeak.rs](../rt-loudness-core/src/truepeak.rs)):
+  - 4× oversampling with peak-hold — **reuses**
+    [`rt_limiter_core::TruePeakDetector`] (Phase 0 decision), one per channel,
+    plus a sample-peak (dBFS) hold alongside.
+- **LRA (loudness range)**
+  ([lra.rs](../rt-loudness-core/src/lra.rs)):
+  - Histogram of short-term values, gated (−20 LU) 10th–95th percentile spread
+    per EBU Tech 3342, sharing the [`LoudnessHistogram`] machinery.
+- **Result-broadcast channel**
+  ([broadcast.rs](../rt-loudness-core/src/broadcast.rs)):
+  - [`MeterBroadcast`] — seven `f32`-packed `AtomicU32`s; the audio thread
+    `store`s [`MeterValues`] wait-free, the off-RT UI / logger `load`s the
+    latest set.  [`LoudnessMeter::publish`] wires the whole chain to it.
 
 ## Phase 2: `rt-loudness-meter` plugin
 
