@@ -295,6 +295,37 @@ impl AdaptiveProcessor {
         self.feedback_events
     }
 
+    /// Copy the detector's latest magnitude spectrum into `out` (one value per
+    /// display bin) for the editor's spectrum view.  Allocation-free.
+    pub fn probe_spectrum(&self, out: &mut [f32]) {
+        crate::ui::downsample_spectrum_into(
+            self.detector.magnitude(),
+            self.detector.bin_width_hz(),
+            out,
+        );
+    }
+
+    /// Copy the active notches (channel 0) into `freqs` / `ages`, zero-filling
+    /// unused slots — for the editor's inventory list and highlight markers.
+    /// Allocation-free.
+    pub fn copy_notches(&self, freqs: &mut [f32], ages: &mut [u64]) {
+        for slot in freqs.iter_mut() {
+            *slot = 0.0;
+        }
+        for slot in ages.iter_mut() {
+            *slot = 0;
+        }
+        for (index, (_, info)) in self.notch_banks[0].active().enumerate() {
+            if index >= freqs.len() {
+                break;
+            }
+            freqs[index] = info.freq_hz;
+            if index < ages.len() {
+                ages[index] = info.age_samples;
+            }
+        }
+    }
+
     /// Render `main` in place using `params`; `sidechain` is the (mono) far-end
     /// reference for AEC (ignored by the other modes).
     ///
@@ -346,13 +377,16 @@ impl AdaptiveProcessor {
         gain: f32,
         block: usize,
     ) {
-        // Detect on channel 0 and mirror any new notch onto every channel.
+        // Always analyse channel 0 so the editor's spectrum view and the
+        // peak-hold stay live; only *allocate* notches when auto detection is on
+        // and not frozen.  A confirmed partial is mirrored onto every channel.
+        self.detector.set_sensitivity(params.sensitivity);
+        let detected = self.detector.process(&self.input_copies[0][..block]);
         if params.auto && !params.freeze {
-            self.detector.set_sensitivity(params.sensitivity);
             for bank in &mut self.notch_banks {
                 bank.set_max_active(params.max_notches);
             }
-            if let Some(freq) = self.detector.process(&self.input_copies[0][..block]) {
+            if let Some(freq) = detected {
                 let mut placed_new = false;
                 for bank in &mut self.notch_banks {
                     let before = bank.active_count();
@@ -724,6 +758,32 @@ mod tests {
             Some(&reference),
         );
         assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn editor_probes_expose_spectrum_and_notches() {
+        let params = AdaptiveParams {
+            mode: Mode::FeedbackSuppressor,
+            sensitivity: 0.8,
+            ..Default::default()
+        };
+        let (_controller, mut processor) = engine(1, &params);
+        let _ = run_mono(&mut processor, &params, &sine(2_000.0, 48_000), None);
+
+        // Spectrum probe: filled, finite, and non-trivial after a strong tone.
+        let mut spectrum = vec![0.0f32; crate::ui::SPECTRUM_DISPLAY_BINS];
+        processor.probe_spectrum(&mut spectrum);
+        assert!(spectrum.iter().all(|v| v.is_finite()));
+        assert!(spectrum.iter().any(|&v| v > 0.0), "spectrum probe empty");
+
+        // Notch probe: at least one notch was placed at ~2 kHz.
+        let mut freqs = vec![0.0f32; rt_adaptive_core::MAX_NOTCHES];
+        let mut ages = vec![0u64; rt_adaptive_core::MAX_NOTCHES];
+        processor.copy_notches(&mut freqs, &mut ages);
+        assert!(
+            freqs.iter().any(|&f| (f - 2_000.0).abs() < 150.0),
+            "no 2 kHz notch reported"
+        );
     }
 
     #[test]

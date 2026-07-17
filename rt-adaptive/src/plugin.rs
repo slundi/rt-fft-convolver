@@ -28,15 +28,25 @@
 //! audio thread.
 
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nih_plug::prelude::*;
+#[cfg(feature = "gui")]
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
 use crate::engine::{AdaptiveController, AdaptiveProcessor};
 use crate::params::{
     AdaptiveParams, CONVERGENCE_RANGE, DOUBLE_TALK_DB_RANGE, FilterLength, HUM_FUNDAMENTAL_RANGE,
     HUM_Q_RANGE, Mode, NOTCH_Q_RANGE, OUTPUT_GAIN_DB_RANGE, SENSITIVITY_RANGE,
 };
+#[cfg(feature = "gui")]
+use crate::ui::{
+    MidiActivity, MidiStatus, SPECTRUM_DISPLAY_BINS, format_age, format_hz, format_q,
+    freq_fraction, spectral_heights,
+};
+#[cfg(feature = "gui")]
+use rt_adaptive_core::MAX_NOTCHES;
 
 /// Off-thread work dispatched to the background executor (control thread only).
 pub enum AdaptiveTask {
@@ -132,6 +142,10 @@ struct AdaptivePluginParams {
     output_gain_db: FloatParam,
     #[id = "byp"]
     bypass: BoolParam,
+
+    #[cfg(feature = "gui")]
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 impl Default for AdaptivePluginParams {
@@ -222,6 +236,8 @@ impl Default for AdaptivePluginParams {
             .with_unit(" dB"),
             bypass: BoolParam::new("Bypass", false)
                 .with_value_to_string(formatters::v2s_bool_bypass()),
+            #[cfg(feature = "gui")]
+            editor_state: EguiState::from_size(560, 600),
         }
     }
 }
@@ -259,6 +275,33 @@ pub struct AdaptivePlugin {
     processor: Option<AdaptiveProcessor>,
     /// Change detection so we only rebuild on an actual filter-length move.
     last_length: FilterLengthParam,
+
+    // ── Editor telemetry (audio thread → egui editor), packed atomics. ──
+    /// Monotonic feedback-notch-placement counter — drives the detection LED.
+    feedback_events: Arc<AtomicU64>,
+    /// Number of active feedback notches.
+    active_notches: Arc<AtomicU32>,
+    /// Mains fundamental currently driving the hum comb (`f32` bits).
+    tracked_hum_hz: Arc<AtomicU32>,
+    /// Host sample rate in Hz (`f32` bits) — converts notch ages to seconds.
+    sample_rate_hz: Arc<AtomicU32>,
+
+    /// Log-collapsed magnitude spectrum (`f32` bits) — the feedback display.
+    #[cfg(feature = "gui")]
+    spectrum: Arc<Vec<AtomicU32>>,
+    /// Active-notch centre frequencies (`f32` bits, `0` = empty slot).
+    #[cfg(feature = "gui")]
+    notch_freqs: Arc<Vec<AtomicU32>>,
+    /// Active-notch ages in samples (saturating to `u32`).
+    #[cfg(feature = "gui")]
+    notch_ages: Arc<Vec<AtomicU32>>,
+    /// Audio-thread scratch the probes fill before publishing to the atomics.
+    #[cfg(feature = "gui")]
+    probe_spectrum: Vec<f32>,
+    #[cfg(feature = "gui")]
+    probe_freqs: Vec<f32>,
+    #[cfg(feature = "gui")]
+    probe_ages: Vec<u64>,
 }
 
 impl Default for AdaptivePlugin {
@@ -268,7 +311,103 @@ impl Default for AdaptivePlugin {
             controller: Arc::new(Mutex::new(None)),
             processor: None,
             last_length: FilterLengthParam::L512,
+            feedback_events: Arc::new(AtomicU64::new(0)),
+            active_notches: Arc::new(AtomicU32::new(0)),
+            tracked_hum_hz: Arc::new(AtomicU32::new(0)),
+            sample_rate_hz: Arc::new(AtomicU32::new(48_000.0f32.to_bits())),
+            #[cfg(feature = "gui")]
+            spectrum: Arc::new(
+                (0..SPECTRUM_DISPLAY_BINS)
+                    .map(|_| AtomicU32::new(0))
+                    .collect(),
+            ),
+            #[cfg(feature = "gui")]
+            notch_freqs: Arc::new((0..MAX_NOTCHES).map(|_| AtomicU32::new(0)).collect()),
+            #[cfg(feature = "gui")]
+            notch_ages: Arc::new((0..MAX_NOTCHES).map(|_| AtomicU32::new(0)).collect()),
+            #[cfg(feature = "gui")]
+            probe_spectrum: vec![0.0; SPECTRUM_DISPLAY_BINS],
+            #[cfg(feature = "gui")]
+            probe_freqs: vec![0.0; MAX_NOTCHES],
+            #[cfg(feature = "gui")]
+            probe_ages: vec![0; MAX_NOTCHES],
         }
+    }
+}
+
+/// Per-frame editor state owned by the egui closure.
+#[cfg(feature = "gui")]
+struct AdaptiveEditorState {
+    /// Detection LED (pulses when a new notch is placed).
+    led: MidiActivity,
+    /// Last feedback-event count seen, to detect a fresh placement.
+    last_events: u64,
+}
+
+#[cfg(feature = "gui")]
+impl AdaptiveEditorState {
+    fn new() -> Self {
+        Self {
+            led: MidiActivity::new(),
+            last_events: 0,
+        }
+    }
+}
+
+/// Draw the feedback-detection LED (green pulse when a notch is placed).
+#[cfg(feature = "gui")]
+fn draw_led(ui: &mut egui::Ui, led: &MidiActivity) {
+    use egui::Color32;
+    let base = match led.status() {
+        MidiStatus::Recognised => Color32::from_rgb(0x40, 0xd0, 0x60),
+        MidiStatus::Unrecognised => Color32::from_rgb(0xd0, 0x50, 0x40),
+        MidiStatus::Idle => Color32::from_rgb(0x30, 0x30, 0x38),
+    };
+    let level = led.level().clamp(0.0, 1.0);
+    let dim = Color32::from_rgb(0x22, 0x24, 0x2a);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * level) as u8;
+    let colour = Color32::from_rgb(
+        lerp(dim.r(), base.r()),
+        lerp(dim.g(), base.g()),
+        lerp(dim.b(), base.b()),
+    );
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.0, colour);
+    ui.label("Detect");
+}
+
+/// Draw the spectrum bars with vertical markers at each active notch frequency.
+#[cfg(feature = "gui")]
+fn draw_spectrum(ui: &mut egui::Ui, heights: &[f32], notch_freqs: &[f32]) {
+    use egui::Color32;
+    const PANEL: Color32 = Color32::from_rgb(0x12, 0x14, 0x1a);
+    const BAR: Color32 = Color32::from_rgb(0x3a, 0x46, 0x60);
+    const NOTCH: Color32 = Color32::from_rgb(0xe0, 0x9a, 0x54);
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 120.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 4.0, PANEL);
+    if !heights.is_empty() {
+        let bin_width = rect.width() / heights.len() as f32;
+        for (index, &height) in heights.iter().enumerate() {
+            let x = rect.left() + index as f32 * bin_width;
+            let top = rect.bottom() - height * rect.height();
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x, top),
+                egui::pos2(x + (bin_width - 1.0).max(1.0), rect.bottom()),
+            );
+            ui.painter().rect_filled(bar, 0.0, BAR);
+        }
+    }
+    // Active-notch markers.
+    for &freq in notch_freqs.iter().filter(|&&f| f > 0.0) {
+        let x = rect.left() + freq_fraction(freq) * rect.width();
+        ui.painter().line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.5, NOTCH),
+        );
     }
 }
 
@@ -306,6 +445,171 @@ impl Plugin for AdaptivePlugin {
         self.params.clone()
     }
 
+    #[cfg(feature = "gui")]
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let feedback_events = self.feedback_events.clone();
+        let active_notches = self.active_notches.clone();
+        let tracked_hum_hz = self.tracked_hum_hz.clone();
+        let sample_rate_hz = self.sample_rate_hz.clone();
+        let spectrum = self.spectrum.clone();
+        let notch_freqs = self.notch_freqs.clone();
+        let notch_ages = self.notch_ages.clone();
+
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            AdaptiveEditorState::new(),
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                // Pulse the LED when the notch-placement counter advances.
+                let events = feedback_events.load(Ordering::Relaxed);
+                if events > state.last_events {
+                    state.led.trigger(true);
+                }
+                state.last_events = events;
+                state.led.decay(0.08);
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Header: name + detection LED + bypass ──
+                    ui.horizontal(|ui| {
+                        ui.heading("RT Adaptive");
+                        draw_led(ui, &state.led);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.bypass, setter));
+                        });
+                    });
+                    ui.separator();
+
+                    // ── Mode selector ──
+                    ui.horizontal(|ui| {
+                        ui.label("Mode");
+                        ui.add(widgets::ParamSlider::for_param(&params.mode, setter));
+                    });
+
+                    let control = |ui: &mut egui::Ui, label: &str, add: &dyn Fn(&mut egui::Ui)| {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            add(ui);
+                        });
+                    };
+
+                    match params.mode.value() {
+                        ModeParam::Feedback => {
+                            // Spectrum + active-notch markers.
+                            let magnitude: Vec<f32> = spectrum
+                                .iter()
+                                .map(|slot| f32::from_bits(slot.load(Ordering::Relaxed)))
+                                .collect();
+                            let freqs: Vec<f32> = notch_freqs
+                                .iter()
+                                .map(|slot| f32::from_bits(slot.load(Ordering::Relaxed)))
+                                .collect();
+                            draw_spectrum(ui, &spectral_heights(&magnitude, -60.0), &freqs);
+
+                            control(ui, "Sensitivity", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.sensitivity,
+                                    setter,
+                                ));
+                            });
+                            control(ui, "Max Notches", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.max_notches,
+                                    setter,
+                                ));
+                            });
+                            control(ui, "Notch Q", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(&params.notch_q, setter));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add(widgets::ParamSlider::for_param(&params.auto, setter));
+                                ui.add(widgets::ParamSlider::for_param(&params.freeze, setter));
+                                ui.add(widgets::ParamSlider::for_param(&params.reset, setter));
+                            });
+
+                            // ── Notch inventory ──
+                            ui.separator();
+                            let count = active_notches.load(Ordering::Relaxed);
+                            ui.monospace(format!("Notches: {count}"));
+                            let rate = f32::from_bits(sample_rate_hz.load(Ordering::Relaxed));
+                            let ages: Vec<u64> = notch_ages
+                                .iter()
+                                .map(|slot| slot.load(Ordering::Relaxed) as u64)
+                                .collect();
+                            for (freq, age) in
+                                freqs.iter().zip(ages.iter()).filter(|(f, _)| **f > 0.0)
+                            {
+                                ui.monospace(format!(
+                                    "  {} · {} · {}",
+                                    format_hz(*freq),
+                                    format_q(params.notch_q.value()),
+                                    format_age(*age, rate),
+                                ));
+                            }
+                        }
+                        ModeParam::Hum => {
+                            control(ui, "Fundamental", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.hum_fundamental_hz,
+                                    setter,
+                                ));
+                            });
+                            control(ui, "Harmonics", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.hum_harmonics,
+                                    setter,
+                                ));
+                            });
+                            control(ui, "Q", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(&params.hum_q, setter));
+                            });
+                            ui.add(widgets::ParamSlider::for_param(
+                                &params.hum_adaptive,
+                                setter,
+                            ));
+                            if params.hum_adaptive.value() {
+                                let hz = f32::from_bits(tracked_hum_hz.load(Ordering::Relaxed));
+                                ui.monospace(format!("Tracked: {}", format_hz(hz)));
+                            }
+                        }
+                        ModeParam::Echo => {
+                            control(ui, "Filter Length", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.filter_length,
+                                    setter,
+                                ));
+                            });
+                            control(ui, "Convergence", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.convergence,
+                                    setter,
+                                ));
+                            });
+                            control(ui, "Double-Talk", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.double_talk_db,
+                                    setter,
+                                ));
+                            });
+                        }
+                    }
+
+                    // ── Global ──
+                    ui.separator();
+                    control(ui, "Output", &|ui| {
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.output_gain_db,
+                            setter,
+                        ));
+                    });
+
+                    // Keep animating even without host automation.
+                    ctx.request_repaint();
+                });
+            },
+        )
+    }
+
     fn task_executor(&mut self) -> TaskExecutor<Self> {
         let controller = self.controller.clone();
         Box::new(move |task| {
@@ -340,6 +644,8 @@ impl Plugin for AdaptivePlugin {
 
         // Every mode is zero-latency in the direct path.
         context.set_latency_samples(processor.latency_samples() as u32);
+        self.sample_rate_hz
+            .store(sample_rate.to_bits(), Ordering::Relaxed);
 
         *self.controller.lock().unwrap() = Some(controller);
         self.processor = Some(processor);
@@ -378,6 +684,32 @@ impl Plugin for AdaptivePlugin {
                 .and_then(|reference| reference.as_slice().first().map(|channel| &**channel));
 
             processor.process(buffer.as_slice(), sidechain, &snapshot);
+
+            // Publish read-only telemetry (a `.store` is a use, so these stay
+            // live in the no-gui build too).
+            self.feedback_events
+                .store(processor.feedback_events(), Ordering::Relaxed);
+            self.active_notches
+                .store(processor.active_notches() as u32, Ordering::Relaxed);
+            self.tracked_hum_hz
+                .store(processor.tracked_hum_hz().to_bits(), Ordering::Relaxed);
+
+            // Refresh the spectrum + notch snapshots only while the editor is
+            // open (the display probes are otherwise never paid for).
+            #[cfg(feature = "gui")]
+            if self.params.editor_state.is_open() {
+                processor.probe_spectrum(&mut self.probe_spectrum);
+                processor.copy_notches(&mut self.probe_freqs, &mut self.probe_ages);
+                for (slot, &value) in self.spectrum.iter().zip(&self.probe_spectrum) {
+                    slot.store(value.to_bits(), Ordering::Relaxed);
+                }
+                for (slot, &freq) in self.notch_freqs.iter().zip(&self.probe_freqs) {
+                    slot.store(freq.to_bits(), Ordering::Relaxed);
+                }
+                for (slot, &age) in self.notch_ages.iter().zip(&self.probe_ages) {
+                    slot.store(age.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+                }
+            }
         }
 
         ProcessStatus::Normal

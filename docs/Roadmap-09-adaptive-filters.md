@@ -247,15 +247,32 @@ The Phase-3 egui editor is deferred (no `gui` feature yet).
   [`rt_alloc.rs`](../rt-adaptive/tests/rt_alloc.rs) (zero-alloc including on notch
   placement).
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
-- [ ] **Spectrum display** with active notches highlighted.
-- [ ] **Notch inventory**: list of active notches with frequency,
-  Q, depth, age.
-- [ ] **Feedback-detection LED** — flashes when a new notch is
-  placed.
-- [ ] **Hum-fundamental tracker** display (if adaptive hum is on).
+Editor built the way every sibling does: pure, unit-tested logic in
+[`ui.rs`](../rt-adaptive/src/ui.rs); the `nih-plug-egui` drawing in
+[`plugin.rs`](../rt-adaptive/src/plugin.rs) behind the `gui` feature.  Audio →
+editor telemetry is lock-free (packed atomics), and the spectrum/notch probes
+run **only while the editor is open** (`editor_state.is_open()`).  Verified with
+`just check-gui rt-adaptive` (GL/X11 devshell, `-D warnings` clean).
+
+- **`nih-plug-egui`** — **decision** (workspace-wide; iced not used).
+- **Spectrum display** with active notches highlighted — a log-collapsed
+  magnitude spectrum ([`downsample_spectrum_into`](../rt-adaptive/src/ui.rs) →
+  [`spectral_heights`](../rt-adaptive/src/ui.rs)) with a vertical marker at each
+  active notch ([`freq_fraction`](../rt-adaptive/src/ui.rs)).
+- **Notch inventory** — list of active notches with frequency, Q, and age
+  ([`format_hz`](../rt-adaptive/src/ui.rs) / `format_q` / `format_age`); depth
+  is fixed (full-depth notch, per the Phase 2 decision).
+- **Feedback-detection LED** — flashes on a new placement, driven by the
+  processor's monotonic `feedback_events` counter through the reused
+  [`MidiActivity`](rt_ir_plugin_core::ui::MidiActivity) pulse/decay helper.
+- **Hum-fundamental tracker** display — shows the tracked mains frequency when
+  `Hum Adaptive` is on (`AdaptiveProcessor::tracked_hum_hz`).
+- **Telemetry plumbing**: `AdaptiveProcessor::probe_spectrum` /
+  `copy_notches` (allocation-free) feed the audio-thread scratch that
+  `process()` publishes to `Arc<Vec<AtomicU32>>` snapshots; `ui.rs` helpers are
+  unit-tested without the framework.
 
 ## Phase 4: Testing
 

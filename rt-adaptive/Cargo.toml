@@ -15,17 +15,20 @@ crate-type = ["lib", "cdylib"]
 [features]
 # The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
 # Build the actual plugin with `cargo build -p rt-adaptive --features nih`.
-# The Phase-3 nih-plug-egui editor will land behind a `gui` feature.
+# `gui` adds the Phase-3 nih-plug-egui editor.
 default = []
 nih = ["dep:nih_plug"]
+gui = ["nih", "dep:nih_plug_egui"]
 
 [dependencies]
 # The adaptive-filter DSP engines (feedback / hum / echo).
 rt-adaptive-core = { path = "../rt-adaptive-core" }
-# Shared plugin foundation: lock-free control→audio handoff for the echo bank.
+# Shared plugin foundation: lock-free control→audio handoff for the echo bank,
+# plus the MidiActivity LED helper reused by the editor.
 rt-ir-plugin-core = { path = "../rt-ir-plugin-core" }
 # DenormalGuard on the audio thread + dB↔linear helpers.
 rt-fft-convolver = { path = ".." }
 
 # nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

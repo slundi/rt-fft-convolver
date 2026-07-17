@@ -125,6 +125,25 @@ impl FeedbackDetector {
         }
     }
 
+    /// The latest linear magnitude spectrum (`fft_size / 2 + 1` bins).
+    ///
+    /// Updated on every analysed frame; intended for a display probe, not the
+    /// detection logic.  Bin `k` is centred at `k * `[`bin_width_hz`] Hz.
+    ///
+    /// [`bin_width_hz`]: FeedbackDetector::bin_width_hz
+    #[inline]
+    pub fn magnitude(&self) -> &[f32] {
+        &self.magnitude
+    }
+
+    /// Frequency spacing (Hz) between adjacent [`magnitude`] bins.
+    ///
+    /// [`magnitude`]: FeedbackDetector::magnitude
+    #[inline]
+    pub fn bin_width_hz(&self) -> f32 {
+        self.sample_rate / self.fft_size as f32
+    }
+
     /// Feed a block and return the frequency (Hz) of a newly confirmed feedback
     /// partial, if any.  Only the strongest confirmed bin per analysis frame is
     /// reported; call repeatedly across blocks to catch successive howls.
@@ -273,6 +292,29 @@ mod tests {
     fn silence_returns_none() {
         let mut detector = FeedbackDetector::new(SR, 512);
         assert_eq!(detector.process(&vec![0.0f32; 4096]), None);
+    }
+
+    #[test]
+    fn magnitude_spectrum_is_exposed_for_display() {
+        let mut detector = FeedbackDetector::new(SR, 512);
+        assert_eq!(detector.magnitude().len(), 512 / 2 + 1);
+        assert!((detector.bin_width_hz() - SR / 512.0).abs() < 1e-3);
+        // After analysing a 2 kHz tone the corresponding bin dominates.
+        let tone = make_sine(2_000.0, SR, 512 * 4);
+        detector.process(&tone);
+        let bin = (2_000.0 / detector.bin_width_hz()).round() as usize;
+        let peak = detector
+            .magnitude()
+            .iter()
+            .cloned()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap()
+            .0;
+        assert!(
+            (peak as i32 - bin as i32).abs() <= 1,
+            "peak bin {peak} != {bin}"
+        );
     }
 
     #[test]
