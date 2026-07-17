@@ -58,3 +58,43 @@ After adding/editing/deleting code, always finish with those steps
 1. write tests for new code
 2. run `cargo fmt && cargo clippy` and fix clippy errors from your new code
 3. suggest conventional commit
+
+## Plugin conventions
+
+The workspace is a family of audio plugins built from `docs/Roadmap-##-*.md`.
+Each follows one shape; see the `.claude/skills/` (`scaffold-plugin`,
+`plugin-editor`, `package-plugin`, `rt-safety-audit`) for the step-by-step
+procedures. The always-true rules:
+
+- **Two crates per plugin.** `rt-<name>-core` is the framework-agnostic,
+  fully-unit-tested DSP; `rt-<name>` is the `nih-plug` wrapper. No plugin
+  framework leaks into a `*-core` crate. Both go in the root `Cargo.toml`
+  `members` **and** `default-members`.
+- **Feature gating.** Plugin crates use `default = []`, `nih = ["dep:nih_plug"]`,
+  `gui = ["nih", "dep:nih_plug_egui"]` so `cargo test`/`clippy` stay fast and
+  offline; the nih-plug `Plugin` impl lives in a `#[cfg(feature="nih")] plugin`
+  module, the egui editor behind `gui`.
+- **RT-safety contract.** `process()` / `process_block()` must not allocate,
+  lock, or panic. Reserve all storage in `new()` (mark it "**Allocates** —
+  off-RT only"). Wrap near-silent FFT paths in
+  `rt_fft_convolver::DenormalGuard`. MIDI handling mutates only fixed-size
+  arrays.
+- **Controller/Processor threading.** Anything that reallocates on a parameter
+  change is built off-thread by a `*Controller` and published to the audio-thread
+  `*Processor` through `rt_ir_plugin_core::ir_handoff`. `params.rs` owns a
+  framework-agnostic `*Params` (Copy) with `clamped()` + `structural_changed()`;
+  `structural_changed()` decides what triggers a rebuild, everything else is
+  applied in place per block. Engines the audio thread mutates (e.g. MIDI note
+  state) stay resident in the Processor, not behind the handoff.
+- **Reuse over re-implementation.** Prefer the shared crates — `rt-fft-convolver`
+  (`Ring`, `FftHandler`, `DenormalGuard`, dB helpers), `rt-pitch-core`
+  (`Shifter`, `PitchTracker`, `FormantEstimator`, STFT framing),
+  `rt-ir-plugin-core` (`ir_handoff`, `MidiActivity`, `pad_state`) — over a second
+  parallel implementation. Record such decisions in the roadmap's Phase 0.
+- **Tests.** Each `*-core` type gets unit tests with known IRs; each plugin ships
+  the `tests/` triad (`integration.rs`, `rt_safety.rs`, `rt_alloc.rs`).
+- **Verify the GUI.** The `gui` feature links GL/X11 — check it with
+  `just check-gui rt-<name>` (an ad-hoc Nix devshell), not a bare
+  `cargo clippy --features gui`.
+- **Task runner.** `just` mirrors CI (`just ci`, `just lint`, `just test`,
+  `just bundle`, …). Register new plugins in the `justfile` `plugins :=` list.

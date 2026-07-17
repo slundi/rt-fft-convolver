@@ -41,6 +41,11 @@ lint-gui:
     cargo clippy -p rt-ir-cab --features {{gui_features}} -- -D warnings
     cargo clippy -p rt-ir-reverb --features {{gui_features}} -- -D warnings
 
+# Clippy a plugin's egui editor in an ad-hoc Nix devshell that supplies the
+# GL/X11/xcb/wayland dev libs the `gui` feature needs. Usage: just check-gui rt-vox
+check-gui plugin:
+    nix develop --impure --expr 'let pkgs = (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}; in pkgs.mkShell { nativeBuildInputs = [ pkgs.pkg-config ]; buildInputs = [ pkgs.libGL pkgs.xorg.libX11 pkgs.xorg.libxcb pkgs.xorg.libXcursor pkgs.xorg.libXrandr pkgs.xorg.libXi pkgs.libxkbcommon pkgs.wayland ]; }' --command cargo clippy -p {{plugin}} --features {{gui_features}} -- -D warnings
+
 # Format all code.
 fmt:
     cargo fmt --all
