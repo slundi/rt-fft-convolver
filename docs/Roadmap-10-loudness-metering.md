@@ -19,35 +19,149 @@ Plugin format target: **LV2 + CLAP + VST3** via
   exactly.  This is the primary quality gate.
 - **Multiple channel configurations** — mono, stereo, 5.1, 7.1
   (LUFS meters need surround support for broadcast use).
-  [decision] whether v1 supports beyond stereo.
+  **Decision (Phase 0): mono + stereo in v1; 5.1 / 7.1 deferred to v2**
+  — see Phase 0 below.
 - **RT-safe** — filter states are per-channel biquads, integration
   buffers are ring-buffers.
 - **History logging** off-RT for offline review of a session.
 
-## Prerequisites in `rt-fft-convolver`
+## Prerequisites in `rt-fft-convolver` ✅
 
-- [ ] `DenormalGuard`.
-- [ ] Polyphase resampler primitives (from `rt-drive-core` if
-  extracted into a shared crate) for true-peak measurement at 4×.
+- `DenormalGuard` — present and tested
+  ([src/utils/denormals.rs](../src/utils/denormals.rs)); RAII FTZ/DAZ
+  guard, re-exported at the crate root
+  ([src/lib.rs](../src/lib.rs)). Wraps the K-weighting filter and
+  mean-square integrator so a long silent passage (a paused session,
+  a fade-out tail) never drives the biquad states or the running-sum
+  accumulators into denormal arithmetic.
+- Polyphase resampler for 4× true-peak — **present, and one layer
+  better than the prerequisite asked for.** `rt-drive-core` already
+  exposes the Kaiser half-band polyphase
+  [`Oversampler`](../rt-drive-core/src/resampler.rs) (the "shared
+  crate" the note anticipated), **and**
+  [`rt_limiter_core::TruePeakDetector`](../rt-limiter-core/src/detector.rs)
+  already wraps it into a tested BS.1770-style inter-sample-peak
+  envelope (`detect_block` → max `|x|` over the oversampled
+  sub-samples). The meter reuses that primitive directly rather than
+  re-implementing 4× true-peak — see the true-peak decision in Phase 0.
+- `db_to_linear` / `linear_to_db` dB helpers — present and exported;
+  used for the dBFS / dBTP readouts and the target-compliance
+  thresholds.
 
-## Phase 0: Compliance decisions
+## Phase 0: Compliance decisions ✅
 
-- [ ] **Standards to comply with** — [decision]:
-  - EBU R128 (broadcast, −23 LUFS).
-  - ITU-R BS.1770-4 (measurement algorithm — mandatory).
-  - AES71 (broadcast).
-  - Streaming targets (Spotify −14, YouTube −14, Apple Music −16,
-    Tidal −14, Amazon Music −14).
-- [ ] **Metering windows to expose** — [decision]:
-  - Momentary (400 ms).
-  - Short-term (3 s).
-  - Integrated (session).
-  - Range (LRA).
-  - True peak (dBTP).
-  - Peak (dBFS).
-- [ ] **Channel configurations** — [decision]:
-  - Mono, stereo (v1).
-  - 5.1, 7.1 (v2).
+The organising Phase 0 finding is that **every listed "standard" shares
+one measurement algorithm — BS.1770-4 — and differs only in its target
+numbers.** R128, the streaming specs, and the broadcast specs are not
+distinct DSP; they are distinct *presets* (a target LUFS + a dBTP
+ceiling) over a single gated-K-weighted-loudness engine. That collapses
+the standards decision into "implement BS.1770-4 once, ship the rest as
+Phase 5 presets," and keeps v1 inside its analysis-only, zero-latency,
+reference-compliant design principles. The second finding is that the
+two heaviest DSP pieces — 4× true-peak oversampling and the K-weighting
+biquads — already exist tested in sibling `*-core` crates, so this
+plugin reuses rather than re-implements.
+
+Cost figures below are per instance at 48 kHz; "block" means the
+host's processing block (≤ 512 samples assumed for sizing).
+
+- **Standards to comply with** — **decision: implement ITU-R BS.1770-4
+  as the sole measurement engine; ship EBU R128, the streaming targets,
+  and the broadcast targets as presets (Phase 5) over it.**
+  - *Rationale.* BS.1770-4 is mandatory and non-negotiable (it is the
+    Phase 4 quality gate). R128 (−23 LUFS, −1 dBTP), Spotify/YouTube/
+    Tidal/Amazon (−14), Apple Music (−16), podcast (−16), broadcast
+    (−23) all *measure* loudness identically; they only change the
+    target line the compliance LED compares against. AES71 is a
+    broadcast-interconnect/metadata context, not a separate loudness
+    maths — treated as a target/label, not a second algorithm.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **One BS.1770-4 engine + preset targets** (chosen) | 1× engine; presets are ~2 floats each (negligible) | 1× engine cost | Low — one gated-loudness path, exhaustively test-vector-verified once |
+    | Per-standard measurement paths | N× integrator/histogram state | N× (redundant) | High — N code paths to keep in sync with the test vectors; no upside |
+
+  - *Example.* Switching `Target` from EBU R128 to Spotify changes the
+    compliance thresholds from (−23 LUFS, −1 dBTP) to (−14 LUFS,
+    −1 dBTP); the momentary/short-term/integrated/LRA/true-peak numbers
+    themselves are byte-for-byte identical — only the LED colour logic
+    moves.
+
+- **True-peak measurement** — **decision: reuse
+  `rt_limiter_core::TruePeakDetector` (4× oversampling) per channel**
+  rather than re-implement the polyphase path, per the workspace
+  "reuse over re-implementation" rule.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **Reuse `TruePeakDetector` @ 4×** (chosen) | scratch `max_block·4` f32 + half-band FIR state per channel (~8 KB/ch @ 512) | dominant per-sample cost of the whole meter, but a fraction of a limiter (no gain stage); est. well under 1 % | Low — tested primitive; `detect_block` gives the per-sample envelope, we peak-hold its max |
+    | Depend on `rt_drive_core::Oversampler` directly, write the max-abs loop here | same scratch | same | Low-med — ~10 lines duplicated from the limiter; no benefit (metering ignores the latency-alignment that `TruePeakDetector` adds) |
+    | 2× oversampling | half the scratch | ~half the true-peak CPU | Low, but BS.1770-4 specifies ≥ 4× — fails the 0.1 dBTP Phase 4 test |
+
+  - *Note.* Metering is analysis-only, so the detector's reported group
+    delay is irrelevant here (we want the max, not sample-aligned gain
+    reduction) — a further reason the tested primitive drops straight in.
+
+- **Metering windows to expose** — **decision: ship all listed windows
+  — Momentary (400 ms), Short-term (3 s), Integrated (gated session),
+  LRA, True peak (dBTP), Sample peak (dBFS) — plus RMS** (the UI in
+  Phase 3 already lists RMS). They are cheap because they share the
+  per-100 ms-block mean-square rather than each buffering raw samples.
+  - *Implementation that makes them cheap.* K-weighted samples are
+    accumulated into a running mean-square over **100 ms gating blocks**
+    (BS.1770's grid). Momentary = mean of the last **4** block energies;
+    short-term = last **30**. Integrated and LRA read a **histogram of
+    block/short-term loudness** (0.1 LU bins, ≈ 700 bins spanning −70…0
+    LUFS) so the relative gate and the 10th–95th-percentile spread are
+    O(1) to update and need no unbounded log on the RT thread.
+  - *Options considered.*
+
+    | Window | Memory (per channel/meter) | CPU load | Complexity |
+    |---|---|---|---|
+    | Momentary / Short-term via **100 ms block sums** (chosen) | ring of 30 f64 block energies (~240 B) | 1 mul-add/sample + one divide/100 ms | Low |
+    | Momentary / Short-term via **raw sample rings** (rejected) | 400 ms → ~19 k f32/ch (~77 KB); 3 s → ~144 k f32/ch (~576 KB) | same | Low, but ~100× the memory for no accuracy gain |
+    | Integrated + LRA via **histogram** (chosen) | ~700 bins ×4 B ≈ 2.8 KB, fixed | O(1) per block | Med — gate logic (abs −70 LUFS, rel −10 LU) |
+    | Integrated via **full block log** (rejected) | unbounded, grows with session | O(1) append, O(n) recompute | RT-unsafe (grows / reallocates) |
+
+  - *Example.* At 48 kHz a 100 ms block is 4800 K-weighted squared
+    samples summed into one f64; the integrated meter's histogram bin
+    for that block's loudness is incremented; nothing per-sample is
+    retained, so a 3-hour session costs the same RAM as a 3-second one.
+
+- **Channel configurations** — **decision: mono + stereo in v1; 5.1 /
+  7.1 deferred to v2.** BS.1770 channel weighting (C/L/R = 1.0, LFE
+  excluded, Ls/Rs = +1.5 dB ≈ 1.41 linear) is designed in from the
+  start so the v1 summation is the surround formula with the surround
+  weights set to the stereo subset — v2 is added channels, not a
+  rewrite.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **Mono + stereo v1** (chosen) | 1–2× per-channel state (biquads + true-peak scratch) | 1–2× true-peak (the multiplier) | Low — covers music/streaming/podcast, the bulk of users |
+    | 5.1 / 7.1 in v1 | 6–8× per-channel state (~48–64 KB true-peak scratch) | 6–8× true-peak cost | Med-high — host **channel-layout negotiation** (nih-plug `AudioIOLayout`), surround bus plumbing, and multichannel test vectors; broadcast-only audience |
+
+  - *Rationale.* True-peak oversampling is the per-channel CPU
+    multiplier, so surround multiplies the meter's only non-trivial
+    cost 6–8×; deferring it keeps v1 light and ships the 90 % case
+    sooner. The weighted-sum is written surround-shaped now to make v2
+    additive. (This resolves the same `[decision]` in the Phase 2 I/O
+    section.)
+
+- **UI framework** — **decision: `nih-plug-egui`**, matching every other
+  plugin in the workspace (`rt-limiter`, `rt-adaptive`, … all use
+  `nih_plug_egui`) so the shared [`plugin-editor`](../.claude/skills)
+  procedure and the lock-free telemetry pattern apply unchanged.
+  (Resolves the `[decision]` in Phase 3.) `nih-plug-iced` was the
+  alternative but would be the only iced editor in the repo — extra
+  build surface and no reuse.
+
+- **Spectral / vectorscope / correlation meter** — **decision: out of
+  scope for v1** (kept in the roadmap's out-of-scope list). They are not
+  part of BS.1770 and would add an FFT/analysis path unrelated to the
+  loudness gate; revisit only on request.
 
 ## Phase 1: `rt-loudness-core` (engine crate)
 
@@ -74,7 +188,8 @@ Plugin format target: **LV2 + CLAP + VST3** via
 
 - [ ] **I/O**:
   - Stereo in → stereo out (pass-through).
-  - Multichannel — [decision].
+  - Multichannel — **v2** (5.1 / 7.1); see Phase 0 channel-config
+    decision.
 - [ ] **Meter controls**:
   - `Target` (dropdown: EBU R128 / Spotify / YouTube / Apple Music /
     custom).
@@ -95,7 +210,7 @@ Plugin format target: **LV2 + CLAP + VST3** via
 
 ## Phase 3: UI
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
+- [ ] **`nih-plug-egui`** — decided in Phase 0 (workspace convention).
 - [ ] **Large numeric readouts**: momentary, short-term,
   integrated LUFS, LRA, true peak, peak, RMS.
 - [ ] **Meter graph**: last 60 s of short-term LUFS scrolling.
@@ -138,9 +253,9 @@ Plugin format target: **LV2 + CLAP + VST3** via
 
 - Auto-gain to hit a target LUFS — that is limiter / maximiser
   territory ([Roadmap-07-true-peak-limiter.md]).
-- Spectral / vectorscope / correlation meter — [decision] whether
-  to add later.  These are common companion features but not part
-  of BS.1770.
+- Spectral / vectorscope / correlation meter — **out of scope for v1**
+  (Phase 0); common companion features but not part of BS.1770.  Add
+  later on request.
 - Dolby dialogue-intelligence metering — proprietary, out of scope.
 - ATSC A/85 (US broadcast) — same math family as R128; add later
   if requested.
