@@ -254,44 +254,59 @@ lock-free [`MeterBroadcast`] each frame — no extra telemetry atomics were
 needed, since the broadcast already carries every reading.  `gui` clippy is
 clean under `just check-gui rt-loudness-meter`.
 
-- [x] **`nih-plug-egui`** — the workspace framework (Phase 0); persisted
+- **`nih-plug-egui`** — the workspace framework (Phase 0); persisted
   `#[persist = "editor-state"] editor_state: Arc<EguiState>`.
-- [x] **Large numeric readouts** — momentary, short-term, integrated LUFS, LRA,
+- **Large numeric readouts** — momentary, short-term, integrated LUFS, LRA,
   true peak (dBTP), sample peak (dBFS), RMS, via [`ui::format_lufs`] /
   [`format_lu`] / [`format_dbtp`] / [`format_dbfs`] (silence → `−∞`).
-- [x] **Meter graph** — scrolling short-term LUFS over
+- **Meter graph** — scrolling short-term LUFS over
   [`LoudnessHistory`](../rt-loudness-meter/src/ui.rs) (600 samples ≈ 60 s at the
   100 ms short-term cadence; the editor pushes at 10 Hz regardless of repaint
   rate), with the target line drawn across it.
-- [x] **Histogram** — the recent short-term distribution via
+- **Histogram** — the recent short-term distribution via
   [`ui::histogram_bins`] (drawn from the same history ring rather than plumbing
   the core's gated histogram through telemetry).
-- [x] **Target-compliance LED** — green / amber / red from
+- **Target-compliance LED** — green / amber / red from
   [`ui::compliance`]: within ±0.5 LU of target → green, ±2 LU → amber, else red;
   the true-peak ceiling is a hard limit (over → red regardless of loudness).
-- [x] **Playhead-integration** — [`ui::effective_running`] holds integrated /
+- **Playhead-integration** — [`ui::effective_running`] holds integrated /
   LRA while the host transport is stopped; a host that reports no position
   (`pos_samples() == None`, e.g. a live monitor) leaves the manual `Start/Stop`
   in charge.  (Auto-*reset* on transport rewind is a later refinement; manual
   `Reset` covers it for now.)
 
-## Phase 4: Testing
+## Phase 4: Testing ✅
 
-- [ ] **Unit tests** (`rt-loudness-core`):
-  - BS.1770-4 reference test vectors — the plugin **must** pass
-    all of them within tolerance.  Non-negotiable.
-  - K-weighting frequency response matches the standard curve.
-  - True-peak of a 5 kHz full-scale sine at 44.1 kHz is measured
-    correctly to within 0.1 dBTP.
-  - Integrated LUFS gating: silence excluded from the integrated
-    result per the absolute-gate rule.
-- [ ] **Multichannel tests** (if in scope):
-  - 5.1 channel weighting matches BS.1770 (LFE excluded, side
-    channels weighted 1.41).
-- [ ] **RT-safety audit**:
-  - Zero allocations in `process()`.
-  - Denormal guard active.
-- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval`.
+The BS.1770-4 / EBU R128 acceptance suite is the primary quality gate and now
+passes end-to-end
+([bs1770_compliance.rs](../rt-loudness-core/tests/bs1770_compliance.rs), 6
+tests), on top of the per-type unit tests (34) and the plugin triad (Phase 2).
+
+- [x] **Unit tests** (`rt-loudness-core`)
+  ([bs1770_compliance.rs](../rt-loudness-core/tests/bs1770_compliance.rs)):
+  - BS.1770-4 / EBU R128 **calibration** — a dual-mono 1 kHz sine at −23 and
+    −33 dBFS reads that value on momentary / short-term / integrated to within
+    the standard's **±0.1 LU** (at 48 kHz and 44.1 kHz).  This is the reference
+    vector that pins the −0.691 offset, the K-weighting, and the channel sum.
+  - K-weighting frequency response matches the standard curve — the ≈ +0.69 dB
+    at 1 kHz (which the −0.691 offset cancels), the ≈ +4 dB high shelf, and the
+    RLB sub-bass rejection; the exact 48 kHz coefficients are asserted in the
+    [`kweight`](../rt-loudness-core/src/kweight.rs) unit tests.
+  - True-peak of a 5 kHz **full-scale** sine at 44.1 kHz recovered to within
+    **0.1 dBTP** (shipped 4× design), and confirmed above the sample peak.
+  - Integrated gating — silence excluded by the −70 LUFS **absolute gate**
+    (integrated stays finite near −23, not −∞), plus a **relative-gate** test
+    (a −40 passage under a −18 programme is excluded).
+- [~] **Multichannel tests** — **N/A for v1** (mono + stereo only, Phase 0);
+  the BS.1770 surround weights land with the 5.1 / 7.1 work in v2.
+- [x] **RT-safety audit** — the plugin triad (Phase 2):
+  - Zero allocations in `process()`
+    ([rt_alloc.rs](../rt-loudness-meter/tests/rt_alloc.rs)).
+  - Denormal guard active + bit-transparent pass-through + varying block sizes
+    ([rt_safety.rs](../rt-loudness-meter/tests/rt_safety.rs)).
+- [ ] **Host validation** (`lv2lint`, `clap-validator`, `pluginval`) — run
+  against the built `.lv2` / `.clap` / `.vst3` bundles; deferred to Phase 5
+  (packaging / CI), where the bundles are produced.
 
 ## Phase 5: Packaging & release
 
