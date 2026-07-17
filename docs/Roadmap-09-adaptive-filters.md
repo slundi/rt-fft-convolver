@@ -164,25 +164,45 @@ is deferred to a later version).
     near-end talker starts, the detector freezes `w` and the direct path
     passes their voice untouched.
 
-## Phase 1: `rt-adaptive-core` (engine crate)
+## Phase 1: `rt-adaptive-core` (engine crate) ✅
 
-- [ ] **Workspace layout**:
-  - `rt-adaptive-core` — engine.
-  - `rt-adaptive` — plugin.
-- [ ] **LMS / NLMS / RLS** primitives:
-  - `AdaptiveFilter<const N: usize>` — fixed-length tap vector.
-  - `update(&mut self, input: f32, error: f32)` — per-sample update.
-- [ ] **Feedback detector**:
-  - Rolling FFT (small size, e.g. 512) for peak detection.
-  - Peak-hold + threshold logic to distinguish howlback from tone.
-- [ ] **Notch bank**:
-  - Fixed capacity (e.g. 24 notches).
-  - Biquad per notch, RT-safely allocated / deallocated (bool
-    enable per slot).
-- [ ] **Hum tracker**:
-  - Fundamental estimation via zero-crossing rate or autocorrelation.
-  - Comb-notch coefficient update.
-- [ ] **Optional block-LMS** using `rt-fft-convolver` for AEC.
+Engine crate built, unit-tested (19 tests), clippy- and machete-clean, and
+wired into the workspace `members` + `default-members`.  Every RLS option was
+dropped per the Phase 0 decision.
+
+- **Workspace layout**:
+  - [`rt-adaptive-core`](../rt-adaptive-core) — engine (created; added to the
+    workspace).  `rt-adaptive` — plugin (deferred to Phase 2).
+- **LMS / NLMS** primitive
+  ([`AdaptiveFilter<const N>`](../rt-adaptive-core/src/adaptive.rs)):
+  - Fixed-length inline `[f32; N]` tap vector; `AdaptiveFilter::nlms(mu)` /
+    `::lms(mu)` constructors (RLS dropped — Phase 0).
+  - The per-sample `update(input, error)` from the roadmap is realised as two
+    O(N) steps so the caller owns the error: `predict(input) -> y` (shift the
+    sample in, return `wᵀ·x`) then `adapt(error)` (`w += μ·e·x / (‖x‖²+ε)`).
+    Running `‖x‖²` is maintained in O(1).
+  - Convergence proven by a system-identification test (identifies a known
+    echo path from white noise, residual → ~0).
+- **Feedback detector**
+  ([`FeedbackDetector`](../rt-adaptive-core/src/detector.rs)):
+  - Rolling Hann-windowed FFT (default 512) over a `Ring`, `DenormalGuard`-wrapped.
+  - Per-bin peak-hold + peak-to-average threshold (sensitivity-mapped) with a
+    persistence count distinguishes a sustained howl from broadband music;
+    reports the confirmed frequency (parabolically interpolated).
+- **Notch bank** ([`NotchBank`](../rt-adaptive-core/src/notch.rs)):
+  - Fixed [`MAX_NOTCHES`](../rt-adaptive-core/src/notch.rs) = 24 slots, one
+    reused `rt_spectral_core::Biquad` notch each, `enabled` bool per slot.
+  - `allocate`/`release`/`reset` are RT-safe coefficient math; a `max_active`
+    cap (`Max Notches`), near-duplicate suppression, and per-slot age/freq/Q
+    inventory for the Phase 3 UI.  Meets the > 20 dB Phase 4 rejection bar.
+- **Hum tracker** ([`HumTracker`](../rt-adaptive-core/src/hum.rs)):
+  - Fundamental estimation via reused `rt_pitch_core::PitchTracker`
+    (autocorrelation), confidence-gated and clamped to `nominal ± max_drift`.
+  - Drives a reused `rt_spectral_core::HumNotchBank` comb; `Adaptive` off pins
+    it to the nominal 50 / 60 Hz.
+- **Block-LMS** — intentionally **deferred to v1.1** per the Phase 0 algorithm
+  decision (the FFT long-filter AEC path adds latency); the time-domain NLMS
+  core above covers v1.
 
 ## Phase 2: `rt-adaptive` plugin
 
