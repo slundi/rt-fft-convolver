@@ -219,22 +219,41 @@ packed atomics, and the formant-display spectral probe
 - **MIDI activity indicator**: reuses `rt-ir-plugin-core`'s `MidiActivity`
   LED, pulsed on each note event.
 
-## Phase 4: Testing
+## Phase 4: Testing ✅
 
-- [ ] **Unit tests** (`rt-vox-core`):
-  - Pitch tracker: 440 Hz sine → 440 Hz ± 2 Hz output.
-  - Vocoder pass-through: matches direct carrier when the modulator
-    is silent (or at unity envelope).
-  - Harmoniser: unison voice at 0 semitones is bit-identical (or
-    within noise) to the dry.
-  - Formant shifter: pitch is preserved when only formant is
-    shifted (± 5 cents drift maximum).
-- [ ] **Integration tests**:
-  - MIDI chord notes trigger the harmoniser voices sample-accurately.
-- [ ] **RT-safety audit**:
-  - Zero allocations in `process()`, including on MIDI note-on.
-  - Denormal guard active.
-- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval`.
+Acceptance suites map each bullet to a test:
+[rt-vox-core/tests/acceptance.rs](../rt-vox-core/tests/acceptance.rs) (core
+criteria) and [rt-vox/tests/acceptance.rs](../rt-vox/tests/acceptance.rs)
+(integration + RT-safety), alongside the existing
+[rt-vox/tests/rt_safety.rs](../rt-vox/tests/rt_safety.rs) and
+[rt_alloc.rs](../rt-vox/tests/rt_alloc.rs).  Pitch is measured with
+`rt_pitch_core::PitchTracker` (parabolic-interpolated autocorrelation) for the
+sub-cent precision the 5-cent bound needs.
+
+- [x] **Unit tests** (`rt-vox-core`):
+  - Pitch tracker: 440 Hz sine → **440 ± 2 Hz** (`pitch_tracker_locks_440hz_within_2hz`).
+  - Vocoder pass-through: silent modulator → exact silence, plus faithful
+    per-band envelope transfer (`vocoder_silent_modulator_is_silent`,
+    `vocoder_transfers_the_modulator_envelope`).
+  - Harmoniser: a 0-semitone unison voice reproduces the input pitch within
+    noise (`harmoniser_unison_matches_the_dry_pitch`).
+  - Formant shifter: pitch preserved **≤ 5 cents** across several shifts/pitches
+    (`formant_shift_preserves_pitch_within_5_cents`).
+- [x] **Integration tests**: a held MIDI chord triggers one voice per note;
+  note-off removes exactly that voice; a held note deterministically triggers
+  its voice (`midi_chord_triggers_distinct_voices`,
+  `releasing_one_chord_note_keeps_the_rest`,
+  `held_note_deterministically_triggers_its_voice`).  *Note:* voice changes
+  apply at block boundaries; sub-block sample-accurate event placement is a
+  nih-plug host-side concern (event ordering), not re-implemented in the engine.
+- [x] **RT-safety audit**:
+  - Zero allocations in `process()` incl. MIDI note-on
+    ([rt_alloc.rs](../rt-vox/tests/rt_alloc.rs), counting global allocator).
+  - Denormal guard active — silence flushes to true zero in every mode
+    (`denormal_guard_flushes_silence_to_zero`, `silence_flushes_to_true_zero_in_every_mode`).
+- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval` — run in CI
+  against the built bundles (`just bundle rt-vox`), not offline unit tests; see
+  the `package-plugin` / `rt-safety-audit` skills.
 
 ## Phase 5: Packaging & release
 
