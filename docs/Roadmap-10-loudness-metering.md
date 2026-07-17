@@ -245,17 +245,35 @@ resident [`MeterProcessor`](../rt-loudness-meter/src/engine.rs) is built once in
     DAW-automatable host parameters is not supported by the framework —
     deferred / N-A; the broadcast is the reporting channel.
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** — decided in Phase 0 (workspace convention).
-- [ ] **Large numeric readouts**: momentary, short-term,
-  integrated LUFS, LRA, true peak, peak, RMS.
-- [ ] **Meter graph**: last 60 s of short-term LUFS scrolling.
-- [ ] **Histogram**: LRA distribution.
-- [ ] **Target-compliance LED**: green / amber / red versus the
-  chosen target.
-- [ ] **Playhead-integration**: reset / hold on transport if the
-  host provides transport state.
+Editor built behind the `gui` feature, with the pure drawing/format logic in
+[ui.rs](../rt-loudness-meter/src/ui.rs) (13 unit tests) and the `egui` drawing
+in [plugin.rs](../rt-loudness-meter/src/plugin.rs).  The editor reads the
+lock-free [`MeterBroadcast`] each frame — no extra telemetry atomics were
+needed, since the broadcast already carries every reading.  `gui` clippy is
+clean under `just check-gui rt-loudness-meter`.
+
+- [x] **`nih-plug-egui`** — the workspace framework (Phase 0); persisted
+  `#[persist = "editor-state"] editor_state: Arc<EguiState>`.
+- [x] **Large numeric readouts** — momentary, short-term, integrated LUFS, LRA,
+  true peak (dBTP), sample peak (dBFS), RMS, via [`ui::format_lufs`] /
+  [`format_lu`] / [`format_dbtp`] / [`format_dbfs`] (silence → `−∞`).
+- [x] **Meter graph** — scrolling short-term LUFS over
+  [`LoudnessHistory`](../rt-loudness-meter/src/ui.rs) (600 samples ≈ 60 s at the
+  100 ms short-term cadence; the editor pushes at 10 Hz regardless of repaint
+  rate), with the target line drawn across it.
+- [x] **Histogram** — the recent short-term distribution via
+  [`ui::histogram_bins`] (drawn from the same history ring rather than plumbing
+  the core's gated histogram through telemetry).
+- [x] **Target-compliance LED** — green / amber / red from
+  [`ui::compliance`]: within ±0.5 LU of target → green, ±2 LU → amber, else red;
+  the true-peak ceiling is a hard limit (over → red regardless of loudness).
+- [x] **Playhead-integration** — [`ui::effective_running`] holds integrated /
+  LRA while the host transport is stopped; a host that reports no position
+  (`pos_samples() == None`, e.g. a live monitor) leaves the manual `Start/Stop`
+  in charge.  (Auto-*reset* on transport rewind is a later refinement; manual
+  `Reset` covers it for now.)
 
 ## Phase 4: Testing
 

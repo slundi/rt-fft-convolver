@@ -16,10 +16,14 @@
 //!   integration on `Start/Stop`, edge-triggers `Reset`, publishes the
 //!   lock-free broadcast) and [`MeterLogger`](engine::MeterLogger) (off-RT
 //!   worker polling the broadcast into a CSV / JSON file).
+//! - [`ui`] — pure, `egui`-free editor logic (LUFS / dBTP formatting, the
+//!   scrolling short-term [`LoudnessHistory`](ui::LoudnessHistory), the
+//!   [`Compliance`](ui::Compliance) LED classifier, the display histogram, and
+//!   the transport gate), unit-testable without the plugin framework.
 //! - `plugin` — the actual `nih-plug` `Plugin` implementation, compiled only
 //!   with the **`nih`** feature (`cargo build -p rt-loudness-meter --features
-//!   nih`).  Analysis-only: audio passes through untouched.  The editor
-//!   (Phase 3) will live behind the **`gui`** feature.
+//!   nih`).  Analysis-only: audio passes through untouched.  The
+//!   `nih-plug-egui` editor (Phase 3) is behind the **`gui`** feature.
 //!
 //! # Why no controller / handoff
 //!
@@ -31,9 +35,11 @@
 
 pub mod engine;
 pub mod params;
+pub mod ui;
 
 pub use engine::{LogFormat, MeterLogger, MeterProcessor};
 pub use params::{CUSTOM_DBTP_RANGE, CUSTOM_LUFS_RANGE, LoudnessParams, Target};
+pub use ui::{Compliance, LoudnessHistory};
 
 // Re-export the DSP core so downstream callers only depend on one crate.
 pub use rt_loudness_core as loudness_core;
