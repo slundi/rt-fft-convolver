@@ -32,8 +32,10 @@ use rt_ir_plugin_core::{IrConsumer, IrPublisher, ir_handoff};
 
 use crate::params::{AdaptiveParams, FilterLength, Mode};
 
-/// Analysis-FFT size for the feedback detector (Roadmap-09 "e.g. 512").
-const DETECTOR_FFT: usize = 512;
+/// Analysis-FFT size for the feedback detector (Roadmap-09 "small size, e.g.
+/// 512").  2048 buys finer bin resolution (≈ 23 Hz at 48 kHz) so a placed notch
+/// lands close enough to the true howl to reject it by > 20 dB end-to-end.
+const DETECTOR_FFT: usize = 2048;
 
 /// Root-mean-square level of a slice (block double-talk / energy metric).
 fn rms(buf: &[f32]) -> f32 {

@@ -274,24 +274,46 @@ run **only while the editor is open** (`editor_state.is_open()`).  Verified with
   `process()` publishes to `Arc<Vec<AtomicU32>>` snapshots; `ui.rs` helpers are
   unit-tested without the framework.
 
-## Phase 4: Testing
+## Phase 4: Testing ✅
 
-- [ ] **Unit tests** (`rt-adaptive-core`):
-  - LMS convergence: input = white noise + tone, filter should
-    converge to null the tone within N samples (documented bound).
-  - Notch bank: adding a 1 kHz notch at Q=10 attenuates a 1 kHz
-    sine by > 20 dB.
-  - Hum tracker: 60 Hz + harmonics input has fundamental identified
-    within ± 0.5 Hz.
-- [ ] **Integration tests**:
-  - Loopback simulation for feedback: a synthetic delay-line
-    "acoustic path" is fed back into the input, plugin should
-    prevent divergence.
-- [ ] **RT-safety audit**:
-  - Zero allocations in `process()`, including on notch
-    allocation.
-  - Denormal guard active.
-- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval`.
+Acceptance suites map each bullet to a test:
+[rt-adaptive-core/tests/acceptance.rs](../rt-adaptive-core/tests/acceptance.rs)
+(core criteria, exercised through the public API) and
+[rt-adaptive/tests/acceptance.rs](../rt-adaptive/tests/acceptance.rs)
+(integration + RT-safety as quantitative dB criteria), alongside the existing
+[integration.rs](../rt-adaptive/tests/integration.rs),
+[rt_safety.rs](../rt-adaptive/tests/rt_safety.rs), and
+[rt_alloc.rs](../rt-adaptive/tests/rt_alloc.rs).  Frequency energy is measured
+with a Goertzel probe (no external reference vectors).
+
+- [x] **Unit tests** (`rt-adaptive-core`):
+  - NLMS convergence: identifies a known echo path from white noise, residual
+    < 1e-3 within a documented 15 000-sample bound
+    (`nlms_converges_to_null_within_documented_bound`).
+  - Notch bank: a 1 kHz notch at Q=10 attenuates a 1 kHz sine by **> 20 dB**
+    (`notch_bank_attenuates_1khz_by_over_20db`).
+  - Hum tracker: a drifted 59.7 Hz hum + harmonics is identified within
+    **± 0.5 Hz** (`hum_tracker_identifies_fundamental_within_half_hz`).
+  - Detector: a sustained howl is located within ± 100 Hz
+    (`feedback_detector_locates_howl_frequency`).
+- [x] **Integration tests**: the feedback loopback (a synthetic resonant
+  delay-line acoustic path with loop gain > 1) stays bounded under suppression
+  where bypass diverges (`feedback_loop_is_bounded_versus_bypass_divergence`);
+  end-to-end the feedback mode rejects a howl by **> 20 dB**, hum mode rejects
+  60 Hz by **> 20 dB**, and echo mode reaches **> 15 dB ERLE**
+  (`feedback_mode_attenuates_howl_by_over_20db`,
+  `hum_mode_attenuates_mains_by_over_20db`, `echo_mode_achieves_documented_erle`).
+  *Note:* the > 20 dB end-to-end feedback rejection needs the detector's 2048-pt
+  analysis FFT (≈ 23 Hz bins) so the placed notch lands close enough to the howl.
+- [x] **RT-safety audit**:
+  - Zero allocations in `process()` incl. on notch placement
+    ([rt_alloc.rs](../rt-adaptive/tests/rt_alloc.rs), counting global allocator).
+  - Denormal guard active — silence flushes to true zero in every mode
+    (`denormal_guard_flushes_silence_to_zero_in_every_mode`,
+    `silence_flushes_to_true_zero_in_every_mode`).
+- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval` — run in CI
+  against the built bundles (`just bundle rt-adaptive`), not offline unit tests;
+  see the `package-plugin` skill (Phase 5).
 
 ## Phase 5: Packaging & release
 
