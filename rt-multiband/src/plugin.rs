@@ -24,11 +24,23 @@
 //! CC `20..24` for threshold, `24..28` for makeup — see
 //! [`crate::params::decode_cc`]). A CC message sets an override that persists
 //! until the host moves that band's knob, which reclaims control.
+//!
+//! # Editor (Phase 3, `gui` feature)
+//!
+//! A `nih-plug-egui` editor: an input spectrum with three draggable crossover
+//! lines, per-band gain-reduction meters, per-band transfer curves, solo/mute,
+//! and global in/out meters. The audio thread publishes read-only telemetry
+//! through packed atomics; the display-only [`SpectrumProbe`] runs **only while
+//! the editor is open**.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
+#[cfg(feature = "gui")]
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use nih_plug::prelude::*;
+#[cfg(feature = "gui")]
+use nih_plug_egui::EguiState;
 
 use crate::engine::MultibandProcessor;
 use crate::params::{
@@ -37,7 +49,18 @@ use crate::params::{
     OUTPUT_GAIN_DB_RANGE, RATIO_RANGE, RELEASE_MS_RANGE, SC_HPF_HZ_RANGE, StereoLinkChoice,
     THRESHOLD_DB_RANGE, cc_value_to_range, decode_cc,
 };
+#[cfg(feature = "gui")]
+use crate::spectrum::SpectrumProbe;
+#[cfg(feature = "gui")]
+use crate::ui::{DISPLAY_MIN_HZ, SILENCE_DBFS, peak_dbfs};
 use rt_multiband_core::NUM_BANDS;
+
+/// Analysis frame for the editor spectrum probe (display only).
+#[cfg(feature = "gui")]
+const SPECTRUM_FRAME: usize = 1_024;
+/// Log-spaced display bins in the editor spectrum.
+#[cfg(feature = "gui")]
+const SPECTRUM_BINS: usize = 56;
 
 /// `nih-plug` band-mode enum (mirrors [`BandModeChoice`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
@@ -224,6 +247,10 @@ struct MultibandPluginParams {
 
     #[nested(array, group = "Bands")]
     bands: [BandPluginParams; NUM_BANDS],
+
+    #[cfg(feature = "gui")]
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 impl Default for MultibandPluginParams {
@@ -272,6 +299,8 @@ impl Default for MultibandPluginParams {
             bypass: BoolParam::new("Bypass", false)
                 .with_value_to_string(formatters::v2s_bool_bypass()),
             bands,
+            #[cfg(feature = "gui")]
+            editor_state: EguiState::from_size(680, 560),
         }
     }
 }
@@ -310,6 +339,26 @@ pub struct MultibandPlugin {
     last_threshold_db: [f32; NUM_BANDS],
     /// Last host makeup value per band, to detect a host-initiated move.
     last_makeup_db: [f32; NUM_BANDS],
+
+    // ── Editor telemetry (packed `f32::to_bits`), audio thread → editor. ──
+    /// Per-band gain reduction in dB (`≤ 0`).
+    #[cfg(feature = "gui")]
+    band_gr_db: [Arc<AtomicU32>; NUM_BANDS],
+    /// Input peak in dBFS.
+    #[cfg(feature = "gui")]
+    input_dbfs: Arc<AtomicU32>,
+    /// Output peak in dBFS.
+    #[cfg(feature = "gui")]
+    output_dbfs: Arc<AtomicU32>,
+    /// Log-spaced input magnitude spectrum (one packed `f32` per display bin).
+    #[cfg(feature = "gui")]
+    spectrum: Arc<Vec<AtomicU32>>,
+    /// Display-only spectrum analyser; runs only while the editor is open.
+    #[cfg(feature = "gui")]
+    probe: Option<SpectrumProbe>,
+    /// Reusable scratch for the probe output (off the audio-alloc path).
+    #[cfg(feature = "gui")]
+    spectrum_scratch: Vec<f32>,
 }
 
 impl Default for MultibandPlugin {
@@ -325,6 +374,18 @@ impl Default for MultibandPlugin {
             midi_makeup_db: [None; NUM_BANDS],
             last_threshold_db,
             last_makeup_db,
+            #[cfg(feature = "gui")]
+            band_gr_db: std::array::from_fn(|_| Arc::new(AtomicU32::new(0.0f32.to_bits()))),
+            #[cfg(feature = "gui")]
+            input_dbfs: Arc::new(AtomicU32::new(SILENCE_DBFS.to_bits())),
+            #[cfg(feature = "gui")]
+            output_dbfs: Arc::new(AtomicU32::new(SILENCE_DBFS.to_bits())),
+            #[cfg(feature = "gui")]
+            spectrum: Arc::new((0..SPECTRUM_BINS).map(|_| AtomicU32::new(0)).collect()),
+            #[cfg(feature = "gui")]
+            probe: None,
+            #[cfg(feature = "gui")]
+            spectrum_scratch: vec![0.0; SPECTRUM_BINS],
         }
     }
 }
@@ -389,6 +450,11 @@ impl Plugin for MultibandPlugin {
         self.params.clone()
     }
 
+    #[cfg(feature = "gui")]
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        editor::create(self)
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
@@ -398,6 +464,15 @@ impl Plugin for MultibandPlugin {
         let sample_rate = buffer_config.sample_rate;
         let snapshot = self.params.snapshot();
         self.processor = Some(MultibandProcessor::new(sample_rate, &snapshot));
+        #[cfg(feature = "gui")]
+        {
+            self.probe = Some(SpectrumProbe::new(
+                SPECTRUM_FRAME,
+                sample_rate,
+                SPECTRUM_BINS,
+                DISPLAY_MIN_HZ,
+            ));
+        }
         // Zero-latency IIR crossover (v1); report it explicitly.
         context.set_latency_samples(0);
         true
@@ -429,9 +504,51 @@ impl Plugin for MultibandPlugin {
         let mut snapshot = self.params.snapshot();
         self.apply_midi(&mut snapshot);
 
-        // ── 3. Render (the processor installs the DenormalGuard itself). ──
+        // ── 3. Input metering + spectrum (gui, before the buffer is
+        //       overwritten; the probe runs only while the editor is open). ──
+        #[cfg(feature = "gui")]
+        let editor_open = self.params.editor_state.is_open();
+        #[cfg(feature = "gui")]
+        if editor_open {
+            let slice = buffer.as_slice();
+            let input_peak = slice
+                .iter()
+                .map(|channel| peak_dbfs(channel))
+                .fold(SILENCE_DBFS, f32::max);
+            self.input_dbfs
+                .store(input_peak.to_bits(), Ordering::Relaxed);
+            if let (Some(probe), Some(channel)) = (self.probe.as_mut(), slice.first())
+                && probe.push_block(channel, &mut self.spectrum_scratch)
+            {
+                for (atomic, &magnitude) in self.spectrum.iter().zip(&self.spectrum_scratch) {
+                    atomic.store(magnitude.to_bits(), Ordering::Relaxed);
+                }
+            }
+        }
+
+        // ── 4. Render (the processor installs the DenormalGuard itself). ──
         if let Some(processor) = self.processor.as_mut() {
             processor.process(buffer.as_slice(), &snapshot);
+        }
+
+        // ── 5. Output metering + per-band gain reduction (gui). ──
+        #[cfg(feature = "gui")]
+        if editor_open {
+            let output_peak = buffer
+                .as_slice()
+                .iter()
+                .map(|channel| peak_dbfs(channel))
+                .fold(SILENCE_DBFS, f32::max);
+            self.output_dbfs
+                .store(output_peak.to_bits(), Ordering::Relaxed);
+            if let Some(processor) = self.processor.as_ref() {
+                for (index, atomic) in self.band_gr_db.iter().enumerate() {
+                    atomic.store(
+                        processor.band_gain_reduction_db(index).to_bits(),
+                        Ordering::Relaxed,
+                    );
+                }
+            }
         }
 
         ProcessStatus::Normal
@@ -461,3 +578,281 @@ impl Vst3Plugin for MultibandPlugin {
 
 nih_export_clap!(MultibandPlugin);
 nih_export_vst3!(MultibandPlugin);
+
+/// The `nih-plug-egui` editor (Phase 3), isolated behind the `gui` feature.
+#[cfg(feature = "gui")]
+mod editor {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use nih_plug::prelude::{Editor, FloatParam, ParamSetter};
+    use nih_plug_egui::{create_egui_editor, egui, widgets};
+
+    use super::{MultibandPlugin, MultibandPluginParams};
+    use crate::ui::{
+        DISPLAY_MAX_HZ, DISPLAY_MIN_HZ, MAX_GR_DB, METER_FLOOR_DBFS, SPECTRUM_FLOOR_DB,
+        dbfs_to_fraction, format_db, format_hz, fraction_to_hz, gr_to_fraction, hz_to_fraction,
+        spectral_heights, threshold_to_fraction, transfer_output_db,
+    };
+    use rt_multiband_core::NUM_BANDS;
+
+    use egui::Color32;
+
+    const PANEL: Color32 = Color32::from_rgb(0x14, 0x16, 0x1a);
+    const GRID: Color32 = Color32::from_rgb(0x2a, 0x2e, 0x36);
+    const SPECTRUM: Color32 = Color32::from_rgb(0x4c, 0x6a, 0x92);
+    const CROSSOVER: Color32 = Color32::from_rgb(0xf0, 0xb0, 0x60);
+    const GR_FILL: Color32 = Color32::from_rgb(0xd8, 0x7a, 0x52);
+    const IN_FILL: Color32 = Color32::from_rgb(0x5a, 0x74, 0xa0);
+    const OUT_FILL: Color32 = Color32::from_rgb(0x62, 0xb0, 0x8a);
+    const CURVE: Color32 = Color32::from_rgb(0x8a, 0xc0, 0xf0);
+
+    /// Per-frame editor state: which crossover line (if any) is being dragged.
+    struct EditorState {
+        dragging: Option<usize>,
+    }
+
+    /// Build the editor, cloning the lock-free telemetry handles into the
+    /// drawing closure.
+    pub(super) fn create(plugin: &MultibandPlugin) -> Option<Box<dyn Editor>> {
+        let params = plugin.params.clone();
+        let band_gr = plugin.band_gr_db.clone();
+        let input_dbfs = plugin.input_dbfs.clone();
+        let output_dbfs = plugin.output_dbfs.clone();
+        let spectrum = plugin.spectrum.clone();
+
+        create_egui_editor(
+            plugin.params.editor_state.clone(),
+            EditorState { dragging: None },
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    header(ui, &params, setter);
+                    ui.separator();
+                    spectrum_panel(ui, &params, setter, &spectrum, state);
+                    ui.separator();
+                    band_strip(ui, &params, setter, &band_gr);
+                    ui.separator();
+                    meters(ui, &input_dbfs, &output_dbfs);
+                });
+                // Keep repainting so the meters/spectrum animate without
+                // parameter automation driving the frame.
+                ctx.request_repaint();
+            },
+        )
+    }
+
+    /// Read a packed-`f32` atomic.
+    fn load(atomic: &AtomicU32) -> f32 {
+        f32::from_bits(atomic.load(Ordering::Relaxed))
+    }
+
+    fn header(ui: &mut egui::Ui, params: &MultibandPluginParams, setter: &ParamSetter) {
+        ui.horizontal(|ui| {
+            ui.heading("RT Multiband");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(widgets::ParamSlider::for_param(&params.bypass, setter));
+                ui.label("Bypass");
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label("In");
+            ui.add(widgets::ParamSlider::for_param(&params.input_gain_db, setter).with_width(90.0));
+            ui.label("Out");
+            ui.add(
+                widgets::ParamSlider::for_param(&params.output_gain_db, setter).with_width(90.0),
+            );
+            ui.label("Mix");
+            ui.add(widgets::ParamSlider::for_param(&params.mix, setter).with_width(90.0));
+            ui.label("Link");
+            ui.add(widgets::ParamSlider::for_param(&params.link, setter).with_width(120.0));
+        });
+    }
+
+    /// The three host crossover parameters, low → high.
+    fn crossover_params(params: &MultibandPluginParams) -> [&FloatParam; NUM_BANDS - 1] {
+        [
+            &params.crossover1_hz,
+            &params.crossover2_hz,
+            &params.crossover3_hz,
+        ]
+    }
+
+    fn spectrum_panel(
+        ui: &mut egui::Ui,
+        params: &MultibandPluginParams,
+        setter: &ParamSetter,
+        spectrum: &[AtomicU32],
+        state: &mut EditorState,
+    ) {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 150.0), egui::Sense::drag());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, PANEL);
+
+        // Spectrum bars on the log-frequency x-axis.
+        let magnitudes: Vec<f32> = spectrum.iter().map(load).collect();
+        let heights = spectral_heights(&magnitudes, SPECTRUM_FLOOR_DB);
+        let bin_width = rect.width() / heights.len().max(1) as f32;
+        for (index, &height) in heights.iter().enumerate() {
+            let x = rect.left() + index as f32 * bin_width;
+            let top = rect.bottom() - rect.height() * height;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x, top),
+                    egui::pos2(x + bin_width * 0.9, rect.bottom()),
+                ),
+                0.0,
+                SPECTRUM,
+            );
+        }
+
+        // Draggable crossover lines.
+        let lines = crossover_params(params);
+        let pointer_x = response.interact_pointer_pos().map(|pos| pos.x);
+        // Grab the nearest line to the pointer on drag start.
+        if response.drag_started()
+            && let Some(px) = pointer_x
+        {
+            let nearest = lines
+                .iter()
+                .enumerate()
+                .min_by(|a, b| {
+                    let ax = line_x(rect, a.1.value());
+                    let bx = line_x(rect, b.1.value());
+                    (ax - px).abs().partial_cmp(&(bx - px).abs()).unwrap()
+                })
+                .map(|(index, _)| index);
+            state.dragging = nearest;
+            if let Some(index) = nearest {
+                setter.begin_set_parameter(lines[index]);
+            }
+        }
+        if response.dragged()
+            && let (Some(index), Some(px)) = (state.dragging, pointer_x)
+        {
+            let fraction = ((px - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let hz = fraction_to_hz(fraction, DISPLAY_MIN_HZ, DISPLAY_MAX_HZ);
+            setter.set_parameter(lines[index], hz);
+        }
+        if response.drag_stopped()
+            && let Some(index) = state.dragging.take()
+        {
+            setter.end_set_parameter(lines[index]);
+        }
+
+        for line in lines {
+            let x = line_x(rect, line.value());
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(2.0, CROSSOVER),
+            );
+            painter.text(
+                egui::pos2(x + 3.0, rect.top() + 2.0),
+                egui::Align2::LEFT_TOP,
+                format_hz(line.value()),
+                egui::FontId::monospace(10.0),
+                CROSSOVER,
+            );
+        }
+    }
+
+    /// Pixel x of a crossover line at `hz` within `rect` (log axis).
+    fn line_x(rect: egui::Rect, hz: f32) -> f32 {
+        rect.left() + rect.width() * hz_to_fraction(hz, DISPLAY_MIN_HZ, DISPLAY_MAX_HZ)
+    }
+
+    fn band_strip(
+        ui: &mut egui::Ui,
+        params: &MultibandPluginParams,
+        setter: &ParamSetter,
+        band_gr: &[Arc<AtomicU32>; NUM_BANDS],
+    ) {
+        ui.columns(NUM_BANDS, |columns| {
+            for (index, ui) in columns.iter_mut().enumerate() {
+                let band = &params.bands[index];
+                ui.vertical_centered(|ui| {
+                    ui.strong(format!("Band {}", index + 1));
+                });
+                // Gain-reduction meter + transfer curve side by side.
+                ui.horizontal(|ui| {
+                    gr_meter(ui, load(&band_gr[index]));
+                    transfer_curve(ui, &band.snapshot());
+                });
+                ui.add(widgets::ParamSlider::for_param(&band.mode, setter));
+                ui.add(widgets::ParamSlider::for_param(&band.threshold_db, setter));
+                ui.add(widgets::ParamSlider::for_param(&band.ratio, setter));
+                ui.add(widgets::ParamSlider::for_param(&band.attack_ms, setter));
+                ui.add(widgets::ParamSlider::for_param(&band.release_ms, setter));
+                ui.add(widgets::ParamSlider::for_param(&band.knee_db, setter));
+                ui.add(widgets::ParamSlider::for_param(&band.makeup_db, setter));
+                ui.add(widgets::ParamSlider::for_param(&band.blend, setter));
+                ui.add(widgets::ParamSlider::for_param(&band.sc_hpf_hz, setter));
+                ui.horizontal(|ui| {
+                    ui.add(widgets::ParamSlider::for_param(&band.solo, setter));
+                    ui.add(widgets::ParamSlider::for_param(&band.mute, setter));
+                });
+            }
+        });
+    }
+
+    /// A small vertical gain-reduction meter (grows downward from the top).
+    fn gr_meter(ui: &mut egui::Ui, gr_db: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 90.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, PANEL);
+        let fraction = gr_to_fraction(gr_db, MAX_GR_DB);
+        let fill = egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.right(), rect.top() + rect.height() * fraction),
+        );
+        painter.rect_filled(fill, 2.0, GR_FILL);
+    }
+
+    /// A small static transfer-curve plot (input dB → output dB).
+    fn transfer_curve(ui: &mut egui::Ui, band: &crate::params::BandParams) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(90.0, 90.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, PANEL);
+        // 1:1 reference diagonal.
+        painter.line_segment(
+            [rect.left_bottom(), rect.right_top()],
+            egui::Stroke::new(1.0, GRID),
+        );
+        // The transfer curve sampled across the threshold range.
+        let steps = 48;
+        let points: Vec<egui::Pos2> = (0..=steps)
+            .map(|step| {
+                let input_db = -60.0 + 60.0 * step as f32 / steps as f32;
+                let output_db = transfer_output_db(band, input_db);
+                let x = rect.left() + rect.width() * threshold_to_fraction(input_db);
+                let y = rect.bottom() - rect.height() * threshold_to_fraction(output_db);
+                egui::pos2(x, y)
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, CURVE)));
+    }
+
+    fn meters(ui: &mut egui::Ui, input_dbfs: &AtomicU32, output_dbfs: &AtomicU32) {
+        meter_bar(ui, "In ", load(input_dbfs), IN_FILL);
+        meter_bar(ui, "Out", load(output_dbfs), OUT_FILL);
+    }
+
+    /// A horizontal dBFS level bar with a numeric readout.
+    fn meter_bar(ui: &mut egui::Ui, label: &str, dbfs: f32, fill: Color32) {
+        ui.horizontal(|ui| {
+            ui.monospace(label);
+            let width = (ui.available_width() - 80.0).max(40.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 14.0), egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, PANEL);
+            let fraction = dbfs_to_fraction(dbfs, METER_FLOOR_DBFS);
+            let filled = egui::Rect::from_min_max(
+                rect.left_top(),
+                egui::pos2(rect.left() + rect.width() * fraction, rect.bottom()),
+            );
+            painter.rect_filled(filled, 2.0, fill);
+            ui.monospace(format_db(dbfs));
+        });
+    }
+}

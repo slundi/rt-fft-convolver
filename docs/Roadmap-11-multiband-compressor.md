@@ -304,14 +304,38 @@ linking, live crossover retune), [`rt_safety.rs`](../rt-multiband/tests/rt_safet
 state + per-block parameter changes + mono) — plus params/engine/ui unit
 tests: **33 tests** across the crate.
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
-- [ ] **Spectrum display** with draggable crossover lines.
-- [ ] **Per-band gain-reduction meters**.
-- [ ] **Per-band transfer-curve display**: threshold, ratio, knee.
-- [ ] **Solo / Mute buttons per band**.
-- [ ] **Global meters**: input, output.
+The editor is split the family way: pure, egui-free logic in
+[`ui.rs`](../rt-multiband/src/ui.rs) (unit-tested — transfer curve, log-frequency
+axis, spectrum heights, dB/GR/Hz formatters) and the `nih-plug-egui` drawing in
+[`plugin.rs`](../rt-multiband/src/plugin.rs) behind `#[cfg(feature = "gui")]`.
+The audio thread publishes read-only telemetry through packed atomics (per-band
+GR, in/out peak, a log-spaced spectrum array); the display-only
+[`SpectrumProbe`](../rt-multiband/src/spectrum.rs) FFT runs **only while the
+editor is open** (`editor_state.is_open()` gate).
+
+- **`nih-plug-egui`** — **decision: egui**, matching every other plugin in
+  the workspace (`rt-limiter`, `rt-vox`, `rt-pitch`); `nih-plug-iced` not used.
+- **Spectrum display** with **draggable crossover lines** — log-frequency
+  magnitude bars from the [`SpectrumProbe`](../rt-multiband/src/spectrum.rs),
+  with three crossover lines the user drags to set `Crossover 1/2/3`
+  (`begin/set/end_set_parameter`, nearest-line grab).
+- **Per-band gain-reduction meters** — a vertical GR bar per band, fed by
+  the `band_gr_db` telemetry atomics.
+- **Per-band transfer-curve display** (threshold / ratio / knee / mode) —
+  [`ui::transfer_output_db`](../rt-multiband/src/ui.rs) sampled across the
+  threshold range, drawn against the 1:1 diagonal.
+- **Solo / Mute buttons per band** — `ParamSlider`s on the per-band
+  `solo`/`mute` bool params.
+- **Global meters**: input, output — horizontal dBFS bars from the
+  `input_dbfs` / `output_dbfs` telemetry atomics.
+
+**Verified.** `just check-gui rt-multiband` (Nix devshell with GL/X11) —
+`cargo clippy --features gui -- -D warnings` clean. `ui.rs` / `spectrum.rs`
+add 12 unit tests (log-axis round-trip, spectral-height floor/peak, transfer
+curve = compressor acceptance, spectrum tone-lands-in-its-bin); **45 tests**
+across the crate.
 
 ## Phase 4: Testing
 

@@ -17,12 +17,19 @@ crate-type = ["lib", "cdylib"]
 # Build the actual plugin with `cargo build -p rt-multiband --features nih`.
 default = []
 nih = ["dep:nih_plug"]
+# `gui` adds the Phase-3 nih-plug-egui editor (spectrum, per-band GR meters,
+# transfer curves, solo/mute, in/out meters).
+gui = ["nih", "dep:nih_plug_egui"]
 
 [dependencies]
 # The multi-band dynamics engine.
 rt-multiband-core = { path = "../rt-multiband-core" }
-# DenormalGuard on the audio thread + dB↔linear helpers.
+# DenormalGuard on the audio thread + dB↔linear helpers + the `FftHandler`
+# behind the display-only spectrum probe.
 rt-fft-convolver = { path = ".." }
+# Real→complex FFT for the editor spectrum analyser (display only).
+realfft = "3.5"
 
 # nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

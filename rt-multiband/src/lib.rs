@@ -25,6 +25,7 @@
 
 pub mod engine;
 pub mod params;
+pub mod spectrum;
 pub mod ui;
 
 pub use engine::MultibandProcessor;
@@ -34,7 +35,11 @@ pub use params::{
     MultibandParams, OUTPUT_GAIN_DB_RANGE, RATIO_RANGE, RELEASE_MS_RANGE, SC_HPF_HZ_RANGE,
     StereoLinkChoice, THRESHOLD_CC_BASE, THRESHOLD_DB_RANGE, cc_value_to_range, decode_cc,
 };
-pub use ui::{MAX_GR_DB, METER_FLOOR_DBFS, SILENCE_DBFS, peak_dbfs};
+pub use spectrum::SpectrumProbe;
+pub use ui::{
+    DISPLAY_MAX_HZ, DISPLAY_MIN_HZ, MAX_GR_DB, METER_FLOOR_DBFS, SILENCE_DBFS, SPECTRUM_FLOOR_DB,
+    peak_dbfs,
+};
 
 // Re-export the DSP core so downstream callers only depend on one crate.
 pub use rt_multiband_core as multiband_core;
