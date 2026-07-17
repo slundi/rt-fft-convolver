@@ -198,16 +198,26 @@ held MIDI notes.
 - **Latency reporting** per mode (vocoder / harmoniser / formant each report
   their own algorithmic latency).
 
-## Phase 3: UI
+## Phase 3: UI ✅
 
-- [ ] **`nih-plug-egui`** or **`nih-plug-iced`** — [decision].
-- [ ] **Pitch tracking indicator**: current detected pitch (Hz +
-  note name) and confidence bar.
-- [ ] **Formant display**: current spectral envelope overlaid on
-  the input spectrum.
-- [ ] **Voice grid** for the harmoniser: 4 rows × interval / level /
-  formant / detune columns.
-- [ ] **MIDI activity indicator**.
+The pure, `egui`-free editor logic lives in [ui.rs](../rt-vox/src/ui.rs)
+(unit-tested); the egui drawing is in [plugin.rs](../rt-vox/src/plugin.rs)
+behind the **`gui`** feature.  The audio thread publishes telemetry through
+packed atomics, and the formant-display spectral probe
+([rt-vox-core/src/spectral_probe.rs](../rt-vox-core/src/spectral_probe.rs)) runs
+**only while the editor is open** so its FFT/LPC cost is paid only when watched.
+
+- **`nih-plug-egui`** — decision: matches every sibling plugin in the
+  workspace (`rt-pitch`, `rt-limiter`).
+- **Pitch tracking indicator**: detected pitch (Hz + note name via
+  [`hz_to_note_name`](../rt-vox/src/ui.rs)) with a confidence bar.
+- **Formant display**: log-spaced input magnitude spectrum with the LPC
+  formant envelope overlaid (via [`SpectralProbe`](../rt-vox-core/src/spectral_probe.rs)
+  + [`spectral_heights`](../rt-vox/src/ui.rs)).
+- **Voice grid** for the harmoniser: one row per voice with interval /
+  level / pan / formant / detune (+ enable) and a formatted summary line.
+- **MIDI activity indicator**: reuses `rt-ir-plugin-core`'s `MidiActivity`
+  LED, pulsed on each note event.
 
 ## Phase 4: Testing
 

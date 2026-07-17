@@ -42,6 +42,8 @@ pub struct Harmoniser {
     tracker: VoicePitchTracker,
     /// Last tracked fundamental in Hz, cached for UI / interval maths.
     detected_hz: Option<f32>,
+    /// Confidence of the last tracked fundamental in `[0, 1]` (UI readout).
+    detected_confidence: f32,
 }
 
 impl Harmoniser {
@@ -74,6 +76,7 @@ impl Harmoniser {
             // every 512 samples.
             tracker: VoicePitchTracker::new(sample_rate, 65.0, 1000.0, 512, max_block),
             detected_hz: None,
+            detected_confidence: 0.0,
         }
     }
 
@@ -158,6 +161,12 @@ impl Harmoniser {
         self.detected_hz
     }
 
+    /// Confidence `[0, 1]` of the most recent pitch estimate (UI readout).
+    #[inline]
+    pub fn detected_confidence(&self) -> f32 {
+        self.detected_confidence
+    }
+
     /// Algorithmic latency in samples (the per-voice shifter latency).
     #[inline]
     pub fn latency_samples(&self) -> usize {
@@ -177,6 +186,7 @@ impl Harmoniser {
         // Update the pitch estimate for this block once.
         if let Some(estimate) = self.tracker.process_block(input) {
             self.detected_hz = Some(estimate.frequency);
+            self.detected_confidence = estimate.confidence;
         }
 
         for index in 0..self.voices.len() {

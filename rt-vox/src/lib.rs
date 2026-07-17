@@ -15,6 +15,9 @@
 //!   [`VoxProcessor`](engine::VoxProcessor) (audio thread: runs the active mode,
 //!   mixes dry/wet with latency compensation, routes MIDI to the harmoniser),
 //!   joined by the lock-free handoff from `rt-ir-plugin-core`.
+//! - [`ui`] — pure, `egui`-free editor logic (note-name / latency formatting,
+//!   spectral-display normalisation, voice-grid cell labels), unit-testable
+//!   without the plugin framework.
 //! - `plugin` — the actual `nih-plug` `Plugin` implementation, compiled only
 //!   with the **`nih`** feature (`cargo build -p rt-vox --features nih`).  The
 //!   `nih-plug-egui` editor (Phase 3) is behind the **`gui`** feature.  Kept off
@@ -22,6 +25,7 @@
 
 pub mod engine;
 pub mod params;
+pub mod ui;
 
 pub use engine::{VoxController, VoxProcessor};
 pub use params::{
@@ -29,6 +33,7 @@ pub use params::{
     PITCH_SHIFT_RANGE, RELEASE_MS_RANGE, VOICE_INTERVAL_RANGE, VOICE_LEVEL_RANGE, VoiceParams,
     VoxParams,
 };
+pub use ui::SPECTRUM_DISPLAY_BINS;
 
 // Re-export the DSP core so downstream callers only depend on one crate.
 pub use rt_vox_core as vox_core;

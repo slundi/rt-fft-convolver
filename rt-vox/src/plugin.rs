@@ -35,6 +35,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nih_plug::prelude::*;
+#[cfg(feature = "gui")]
+use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 
 use crate::engine::{VoxController, VoxProcessor};
 use crate::params::{
@@ -42,7 +44,18 @@ use crate::params::{
     OUTPUT_GAIN_DB_RANGE, PITCH_SHIFT_RANGE, RELEASE_MS_RANGE, VOICE_INTERVAL_RANGE,
     VOICE_LEVEL_RANGE, VoiceParams, VoxParams,
 };
+#[cfg(feature = "gui")]
+use crate::ui::{
+    MidiActivity, MidiStatus, SPECTRUM_DISPLAY_BINS, confidence_fraction, format_detune, format_hz,
+    format_interval, format_latency_ms, format_level, format_pan, hz_to_note_name, latency_ms,
+    spectral_heights,
+};
 use rt_vox_core::{ScaleKind, SnapMode};
+
+/// MIDI-activity codes published from the audio thread to the editor LED.
+#[cfg(feature = "gui")]
+const MIDI_NONE: u32 = 0;
+const MIDI_NOTE: u32 = 1;
 
 /// Off-thread work dispatched to the background executor (control thread only).
 pub enum VoxTask {
@@ -249,6 +262,10 @@ struct VoxPluginParams {
     dry_delay_compensation: BoolParam,
     #[id = "byp"]
     bypass: BoolParam,
+
+    #[cfg(feature = "gui")]
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 impl Default for VoxPluginParams {
@@ -341,6 +358,8 @@ impl Default for VoxPluginParams {
             ),
             bypass: BoolParam::new("Bypass", false)
                 .with_value_to_string(formatters::v2s_bool_bypass()),
+            #[cfg(feature = "gui")]
+            editor_state: EguiState::from_size(560, 640),
         }
     }
 }
@@ -393,11 +412,29 @@ pub struct VoxPlugin {
     /// Last latency reported to the host, to avoid redundant notifications.
     last_reported_latency: usize,
 
-    // ── Editor telemetry (audio thread → future egui editor). ──
+    // ── Editor telemetry (audio thread → egui editor), packed atomics. ──
     /// Detected input pitch in Hz (`f32` bits), or `0` when untracked.
     detected_hz: Arc<AtomicU32>,
+    /// Confidence `[0, 1]` of the detected pitch (`f32` bits).
+    detected_confidence: Arc<AtomicU32>,
     /// Current reported latency in samples.
     latency_samples: Arc<AtomicU32>,
+    /// Host sample rate in Hz (`f32` bits) — converts the latency badge to ms.
+    sample_rate_hz: Arc<AtomicU32>,
+    /// Last MIDI-activity code (see `MIDI_*`) — the header LED.
+    midi_code: Arc<AtomicU32>,
+
+    /// Log-spaced input magnitude spectrum (`f32` bits) — the formant display.
+    #[cfg(feature = "gui")]
+    spectrum_mag: Arc<Vec<AtomicU32>>,
+    /// Log-spaced formant envelope (`f32` bits) overlaid on the magnitude.
+    #[cfg(feature = "gui")]
+    spectrum_env: Arc<Vec<AtomicU32>>,
+    /// Audio-thread scratch the probe fills before publishing to the atomics.
+    #[cfg(feature = "gui")]
+    probe_mag: Vec<f32>,
+    #[cfg(feature = "gui")]
+    probe_env: Vec<f32>,
 }
 
 impl Default for VoxPlugin {
@@ -409,8 +446,128 @@ impl Default for VoxPlugin {
             last_bands: BandsParam::B16,
             last_reported_latency: usize::MAX,
             detected_hz: Arc::new(AtomicU32::new(0)),
+            detected_confidence: Arc::new(AtomicU32::new(0)),
             latency_samples: Arc::new(AtomicU32::new(0)),
+            sample_rate_hz: Arc::new(AtomicU32::new(48_000.0f32.to_bits())),
+            midi_code: Arc::new(AtomicU32::new(0)),
+            #[cfg(feature = "gui")]
+            spectrum_mag: Arc::new(
+                (0..SPECTRUM_DISPLAY_BINS)
+                    .map(|_| AtomicU32::new(0))
+                    .collect(),
+            ),
+            #[cfg(feature = "gui")]
+            spectrum_env: Arc::new(
+                (0..SPECTRUM_DISPLAY_BINS)
+                    .map(|_| AtomicU32::new(0))
+                    .collect(),
+            ),
+            #[cfg(feature = "gui")]
+            probe_mag: vec![0.0; SPECTRUM_DISPLAY_BINS],
+            #[cfg(feature = "gui")]
+            probe_env: vec![0.0; SPECTRUM_DISPLAY_BINS],
         }
+    }
+}
+
+/// Per-frame editor state owned by the egui closure.
+#[cfg(feature = "gui")]
+struct VoxEditorState {
+    midi: MidiActivity,
+}
+
+#[cfg(feature = "gui")]
+impl VoxEditorState {
+    fn new() -> Self {
+        Self {
+            midi: MidiActivity::new(),
+        }
+    }
+}
+
+/// Draw a labelled horizontal bar for `fraction` (`0..=1`) with a readout.
+#[cfg(feature = "gui")]
+fn draw_bar(ui: &mut egui::Ui, label: &str, fraction: f32, readout: &str) {
+    use egui::Color32;
+    const BG: Color32 = Color32::from_rgb(0x14, 0x16, 0x1c);
+    const FILL: Color32 = Color32::from_rgb(0x5c, 0xc8, 0x9a);
+    ui.horizontal(|ui| {
+        ui.monospace(label);
+        let width = (ui.available_width() - 64.0).max(40.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 12.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, BG);
+        let fill = egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(
+                rect.left() + rect.width() * fraction.clamp(0.0, 1.0),
+                rect.bottom(),
+            ),
+        );
+        ui.painter().rect_filled(fill, 2.0, FILL);
+        ui.monospace(readout);
+    });
+}
+
+/// Draw the MIDI-activity LED (green pulse on a recognised note event).
+#[cfg(feature = "gui")]
+fn draw_midi_led(ui: &mut egui::Ui, midi: &MidiActivity) {
+    use egui::Color32;
+    let base = match midi.status() {
+        MidiStatus::Recognised => Color32::from_rgb(0x40, 0xd0, 0x60),
+        MidiStatus::Unrecognised => Color32::from_rgb(0xd0, 0x50, 0x40),
+        MidiStatus::Idle => Color32::from_rgb(0x30, 0x30, 0x38),
+    };
+    let level = midi.level().clamp(0.0, 1.0);
+    let dim = Color32::from_rgb(0x22, 0x24, 0x2a);
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * level) as u8;
+    let colour = Color32::from_rgb(
+        lerp(dim.r(), base.r()),
+        lerp(dim.g(), base.g()),
+        lerp(dim.b(), base.b()),
+    );
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.0, colour);
+    ui.label("MIDI");
+}
+
+/// Draw the formant display: magnitude spectrum as bars, envelope as a line.
+#[cfg(feature = "gui")]
+fn draw_spectrum(ui: &mut egui::Ui, magnitude: &[f32], envelope: &[f32]) {
+    use egui::Color32;
+    const PANEL: Color32 = Color32::from_rgb(0x12, 0x14, 0x1a);
+    const BAR: Color32 = Color32::from_rgb(0x3a, 0x46, 0x60);
+    const LINE: Color32 = Color32::from_rgb(0xe0, 0x9a, 0x54);
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 110.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 4.0, PANEL);
+    if magnitude.is_empty() {
+        return;
+    }
+    let bin_width = rect.width() / magnitude.len() as f32;
+    for (index, &height) in magnitude.iter().enumerate() {
+        let x = rect.left() + index as f32 * bin_width;
+        let top = rect.bottom() - height * rect.height();
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x, top),
+            egui::pos2(x + (bin_width - 1.0).max(1.0), rect.bottom()),
+        );
+        ui.painter().rect_filled(bar, 0.0, BAR);
+    }
+    // Envelope polyline over the bars.
+    let points: Vec<egui::Pos2> = envelope
+        .iter()
+        .enumerate()
+        .map(|(index, &height)| {
+            let x = rect.left() + (index as f32 + 0.5) * bin_width;
+            egui::pos2(x, rect.bottom() - height * rect.height())
+        })
+        .collect();
+    if points.len() > 1 {
+        ui.painter()
+            .add(egui::Shape::line(points, egui::Stroke::new(2.0, LINE)));
     }
 }
 
@@ -446,6 +603,183 @@ impl Plugin for VoxPlugin {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    #[cfg(feature = "gui")]
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let detected_hz = self.detected_hz.clone();
+        let detected_confidence = self.detected_confidence.clone();
+        let latency_samples = self.latency_samples.clone();
+        let sample_rate_hz = self.sample_rate_hz.clone();
+        let midi_code = self.midi_code.clone();
+        let spectrum_mag = self.spectrum_mag.clone();
+        let spectrum_env = self.spectrum_env.clone();
+
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            VoxEditorState::new(),
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                // Consume the latest MIDI pulse and decay the LED this frame.
+                if midi_code.swap(MIDI_NONE, Ordering::Relaxed) != MIDI_NONE {
+                    state.midi.trigger(true);
+                }
+                state.midi.decay(0.08);
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Header: name + MIDI LED + bypass ──────────────────
+                    ui.horizontal(|ui| {
+                        ui.heading("RT Vox");
+                        draw_midi_led(ui, &state.midi);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(widgets::ParamSlider::for_param(&params.bypass, setter));
+                        });
+                    });
+                    ui.separator();
+
+                    // ── Mode selector ─────────────────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Mode");
+                        ui.add(widgets::ParamSlider::for_param(&params.mode, setter));
+                    });
+
+                    // ── Pitch-tracking indicator ──────────────────────────
+                    let hz = f32::from_bits(detected_hz.load(Ordering::Relaxed));
+                    let confidence = f32::from_bits(detected_confidence.load(Ordering::Relaxed));
+                    ui.horizontal(|ui| {
+                        ui.monospace(egui::RichText::new(hz_to_note_name(hz)).size(24.0).strong());
+                        ui.monospace(format_hz(hz));
+                    });
+                    draw_bar(
+                        ui,
+                        "Conf",
+                        confidence_fraction(confidence),
+                        &format!("{:.0}%", confidence_fraction(confidence) * 100.0),
+                    );
+
+                    // ── Formant display (magnitude + envelope) ────────────
+                    let magnitude: Vec<f32> = spectrum_mag
+                        .iter()
+                        .map(|slot| f32::from_bits(slot.load(Ordering::Relaxed)))
+                        .collect();
+                    let envelope: Vec<f32> = spectrum_env
+                        .iter()
+                        .map(|slot| f32::from_bits(slot.load(Ordering::Relaxed)))
+                        .collect();
+                    draw_spectrum(
+                        ui,
+                        &spectral_heights(&magnitude, -60.0),
+                        &spectral_heights(&envelope, -60.0),
+                    );
+
+                    // ── Mode-specific controls ────────────────────────────
+                    ui.separator();
+                    let control = |ui: &mut egui::Ui, label: &str, add: &dyn Fn(&mut egui::Ui)| {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            add(ui);
+                        });
+                    };
+                    match params.mode.value() {
+                        ModeParam::Vocoder => {
+                            control(ui, "Bands", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(&params.bands, setter));
+                            });
+                            control(ui, "Attack", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(&params.attack_ms, setter));
+                            });
+                            control(ui, "Release", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(&params.release_ms, setter));
+                            });
+                            control(ui, "Formant", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.vocoder_formant_shift,
+                                    setter,
+                                ));
+                            });
+                            control(ui, "Sibilance", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(&params.sibilance, setter));
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.sibilance_amount,
+                                    setter,
+                                ));
+                            });
+                        }
+                        ModeParam::Harmoniser => {
+                            control(ui, "Snap", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(&params.snap_mode, setter));
+                            });
+                            control(ui, "Key", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(&params.key, setter));
+                                ui.add(widgets::ParamSlider::for_param(&params.scale_kind, setter));
+                            });
+                            // Voice grid: one row per harmony voice.
+                            for (index, voice) in params.voices.iter().enumerate() {
+                                ui.separator();
+                                ui.monospace(format!(
+                                    "Voice {}: {} · {} · {} · {}",
+                                    index + 1,
+                                    format_interval(voice.interval.value()),
+                                    format_level(voice.level.value()),
+                                    format_pan(voice.pan.value()),
+                                    format_detune(voice.detune.value()),
+                                ));
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(widgets::ParamSlider::for_param(&voice.enabled, setter));
+                                    ui.add(widgets::ParamSlider::for_param(
+                                        &voice.interval,
+                                        setter,
+                                    ));
+                                    ui.add(widgets::ParamSlider::for_param(&voice.level, setter));
+                                    ui.add(widgets::ParamSlider::for_param(&voice.pan, setter));
+                                    ui.add(widgets::ParamSlider::for_param(
+                                        &voice.formant_shift,
+                                        setter,
+                                    ));
+                                    ui.add(widgets::ParamSlider::for_param(&voice.detune, setter));
+                                });
+                            }
+                        }
+                        ModeParam::FormantShifter => {
+                            control(ui, "Formant", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.formant_shift,
+                                    setter,
+                                ));
+                            });
+                            control(ui, "Pitch", &|ui| {
+                                ui.add(widgets::ParamSlider::for_param(
+                                    &params.formant_pitch_shift,
+                                    setter,
+                                ));
+                            });
+                        }
+                    }
+
+                    // ── Global controls + latency badge ───────────────────
+                    ui.separator();
+                    control(ui, "Mix", &|ui| {
+                        ui.add(widgets::ParamSlider::for_param(&params.mix, setter));
+                    });
+                    control(ui, "Output", &|ui| {
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.output_gain_db,
+                            setter,
+                        ));
+                    });
+                    let samples = latency_samples.load(Ordering::Relaxed) as usize;
+                    let rate = f32::from_bits(sample_rate_hz.load(Ordering::Relaxed));
+                    ui.horizontal(|ui| {
+                        ui.label("Latency");
+                        ui.monospace(format_latency_ms(latency_ms(samples, rate)));
+                    });
+
+                    // Keep animating even without host automation.
+                    ctx.request_repaint();
+                });
+            },
+        )
     }
 
     fn task_executor(&mut self) -> TaskExecutor<Self> {
@@ -509,8 +843,14 @@ impl Plugin for VoxPlugin {
         while let Some(event) = context.next_event() {
             if let Some(processor) = self.processor.as_mut() {
                 match event {
-                    NoteEvent::NoteOn { note, .. } => processor.note_on(note),
-                    NoteEvent::NoteOff { note, .. } => processor.note_off(note),
+                    NoteEvent::NoteOn { note, .. } => {
+                        processor.note_on(note);
+                        self.midi_code.store(MIDI_NOTE, Ordering::Relaxed);
+                    }
+                    NoteEvent::NoteOff { note, .. } => {
+                        processor.note_off(note);
+                        self.midi_code.store(MIDI_NOTE, Ordering::Relaxed);
+                    }
                     NoteEvent::Choke { .. } => processor.all_notes_off(),
                     _ => {}
                 }
@@ -549,6 +889,24 @@ impl Plugin for VoxPlugin {
                 processor.detected_hz().unwrap_or(0.0).to_bits(),
                 Ordering::Relaxed,
             );
+            self.detected_confidence
+                .store(processor.detected_confidence().to_bits(), Ordering::Relaxed);
+            self.sample_rate_hz
+                .store(context.transport().sample_rate.to_bits(), Ordering::Relaxed);
+
+            // Refresh the formant display only while the editor is open — the
+            // probe's FFT + LPC cost is otherwise never paid.
+            #[cfg(feature = "gui")]
+            if self.params.editor_state.is_open()
+                && processor.probe_spectrum(&mut self.probe_mag, &mut self.probe_env)
+            {
+                for (slot, &value) in self.spectrum_mag.iter().zip(&self.probe_mag) {
+                    slot.store(value.to_bits(), Ordering::Relaxed);
+                }
+                for (slot, &value) in self.spectrum_env.iter().zip(&self.probe_env) {
+                    slot.store(value.to_bits(), Ordering::Relaxed);
+                }
+            }
         }
 
         ProcessStatus::Normal

@@ -35,9 +35,10 @@ use rt_ir_plugin_core::{IrConsumer, IrPublisher, ir_handoff};
 use rt_pitch_core::{
     FormantMethod, PhaseVocoder, Shifter, clamp_ratio, semitones_to_ratio, window::WindowKind,
 };
-use rt_vox_core::{FormantShifter, Harmoniser, MAX_VOICES, Scale, Vocoder};
+use rt_vox_core::{FormantShifter, Harmoniser, MAX_VOICES, Scale, SpectralProbe, Vocoder};
 
 use crate::params::{Mode, VoxParams};
+use crate::ui::SPECTRUM_DISPLAY_BINS;
 
 /// STFT frame size shared by the vocoder and the formant-mode paths.
 const VOX_FRAME: usize = 1024;
@@ -182,6 +183,8 @@ pub struct VoxProcessor {
     wet_b: Vec<f32>,
     /// Formant-mode intermediate (pitch-shift output).
     pitch_scratch: Vec<f32>,
+    /// Editor-display spectral probe (driven only while the editor is open).
+    probe: SpectralProbe,
 
     sample_rate: f32,
     harmoniser_latency: usize,
@@ -221,6 +224,7 @@ impl VoxProcessor {
             wet_a: vec![0.0; max_block],
             wet_b: vec![0.0; max_block],
             pitch_scratch: vec![0.0; max_block],
+            probe: SpectralProbe::new(VOX_FRAME, sample_rate, SPECTRUM_DISPLAY_BINS, max_block),
             sample_rate,
             harmoniser_latency,
             formant_latency,
@@ -273,6 +277,28 @@ impl VoxProcessor {
     #[inline]
     pub fn detected_hz(&self) -> Option<f32> {
         self.harmoniser.detected_hz()
+    }
+
+    /// Confidence `[0, 1]` of the most recent tracked pitch (editor readout).
+    #[inline]
+    pub fn detected_confidence(&self) -> f32 {
+        self.harmoniser.detected_confidence()
+    }
+
+    /// Refresh the editor's formant display from the **last processed** input
+    /// block, writing `SPECTRUM_DISPLAY_BINS` magnitude / envelope values.
+    ///
+    /// Intended to be called by the plugin only while the editor is open (so the
+    /// probe's FFT + LPC cost is paid only when something is watching).  Returns
+    /// `true` when the arrays were refreshed this call.  Allocation-free.
+    pub fn probe_spectrum(&mut self, magnitude: &mut [f32], envelope: &mut [f32]) -> bool {
+        let len = self.last_process_samples.min(self.input_copies[0].len());
+        if len == 0 {
+            return false;
+        }
+        // Split the borrow: the probe reads channel 0's snapshot.
+        let (probe, input) = (&mut self.probe, &self.input_copies[0][..len]);
+        probe.process_block(input, magnitude, envelope)
     }
 
     /// Render `main` in place using `params`; `sidechain` is the (mono) vocoder
@@ -463,6 +489,7 @@ impl VoxProcessor {
         for delay in &mut self.dry_delays {
             delay.reset();
         }
+        self.probe.reset();
         self.wet_a.fill(0.0);
         self.wet_b.fill(0.0);
         self.pitch_scratch.fill(0.0);
@@ -722,6 +749,32 @@ mod tests {
         assert!(controller.apply_structural(&more));
         let out = run_mono(&mut processor, &more, &sawtooth(220.0, 4096));
         assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn probe_and_confidence_feed_the_editor() {
+        let params = VoxParams {
+            mode: Mode::Harmoniser,
+            snap_mode: rt_vox_core::SnapMode::Free,
+            ..Default::default()
+        };
+        let (_controller, mut processor) = engine(1, &params);
+        let mut mag = vec![0.0f32; crate::ui::SPECTRUM_DISPLAY_BINS];
+        let mut env = vec![0.0f32; crate::ui::SPECTRUM_DISPLAY_BINS];
+
+        let input = sine(220.0, 24_000);
+        let mut probed = false;
+        for chunk in input.chunks(BLOCK) {
+            let mut buffer = chunk.to_vec();
+            {
+                let mut main: [&mut [f32]; 1] = [&mut buffer];
+                processor.process(&mut main, None, &params);
+            }
+            probed |= processor.probe_spectrum(&mut mag, &mut env);
+        }
+        assert!(probed, "probe never produced a frame");
+        assert!(mag.iter().all(|v| v.is_finite()) && mag.iter().any(|&v| v > 0.0));
+        assert!(processor.detected_confidence() > 0.5, "pitch not tracked");
     }
 
     #[test]
