@@ -167,39 +167,36 @@ allocation-free, no second tracker to maintain" design principles.
     shifting (formants held) is the complementary `rt-pitch-core`
     formant-preserving vocoder.
 
-## Phase 2: `rt-vox` plugin
+## Phase 2: `rt-vox` plugin ✅
 
-- [ ] **I/O**:
-  - Mono in (voice) + sidechain in (carrier, for vocoder mode) →
-    stereo out.
-  - Stereo in → stereo out for the harmoniser / formant modes.
-- [ ] **Mode selector**:
-  - `Vocoder` / `Harmoniser` / `Formant Shifter`.
-- [ ] **Vocoder controls**:
-  - `Bands` (8 / 16 / 24 / 32).
-  - `Attack`, `Release` (envelope followers).
-  - `Formant Shift` (± 1 octave).
-  - `Sibilance Handling` (bool + amount) — passes highs from the
-    modulator directly.
-- [ ] **Harmoniser controls**:
-  - `Voice N Interval` (× 4 voices, e.g. −12 … +12 semitones).
-  - `Voice N Level`.
-  - `Voice N Pan`.
-  - `Voice N Formant Shift`.
-  - `Voice N Detune`.
-  - `Snap Mode` (free / scale / MIDI).
-  - `Key` and `Scale` (if scale mode).
-- [ ] **Formant Shifter controls**:
-  - `Formant Shift` (± 1 octave).
-  - `Pitch Shift` (± 12 semitones, if desired).
-- [ ] **Global controls**:
-  - `Mix` (0–100 %).
-  - `Output Gain`.
-  - `Bypass`.
-- [ ] **MIDI**:
-  - Note in → chord voices for the harmoniser.
-  - CC on `Formant Shift` and per-voice `Interval`.
-- [ ] **Latency reporting** per mode.
+Built as the framework-agnostic [`VoxController`](../rt-vox/src/engine.rs) +
+[`VoxProcessor`](../rt-vox/src/engine.rs) (unit-tested) plus a thin `nih-plug`
+wrapper ([plugin.rs](../rt-vox/src/plugin.rs), behind the `nih` feature).
+Parameters live in [params.rs](../rt-vox/src/params.rs).  **Design note:** the
+band count is the only *structural* control (rebuilds the vocoder off-thread);
+the harmoniser and formant paths stay resident so a mode switch never drops
+held MIDI notes.
+
+- **I/O**:
+  - Mono/stereo main in + a **mono sidechain** (vocoder carrier) → out.  The
+    carrier falls back to the input itself (self-vocoding) when unpatched.
+  - Stereo in → stereo out for the harmoniser (panned voices) / formant modes
+    (per-channel).
+- **Mode selector**: `Vocoder` / `Harmoniser` / `Formant Shifter`.
+- **Vocoder controls**: `Bands` (8/16/24/32), `Attack`, `Release`,
+  `Formant Shift` (± 1 octave), `Sibilance Handling` (bool + amount, passes the
+  modulator's highs direct).
+- **Harmoniser controls**: per-voice `Interval` / `Level` / `Pan` /
+  `Formant Shift` / `Detune` (× 4 voices + enable), `Snap Mode`
+  (Free / Scale / MIDI), `Key` and `Scale`.
+- **Formant Shifter controls**: `Formant Shift` (± 1 octave) and an
+  independent `Pitch Shift` (± 12 semitones, formant-preserving).
+- **Global controls**: `Mix` (0–100 %), `Output Gain`, `Bypass`, plus dry-
+  delay compensation so the mix stays phase-aligned.
+- **MIDI**: note on/off → harmoniser chord voices (allocation-free); CC
+  binds to any continuous control via host MIDI-learn (`MidiConfig::Basic`).
+- **Latency reporting** per mode (vocoder / harmoniser / formant each report
+  their own algorithmic latency).
 
 ## Phase 3: UI
 

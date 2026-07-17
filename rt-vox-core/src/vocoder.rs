@@ -58,6 +58,19 @@ pub struct Vocoder {
     out_frame: Vec<f32>,
     /// Smoothed per-band gain applied to the carrier this frame.
     band_gain: Vec<f32>,
+
+    /// Fractional band offset applied when the carrier reads the modulator's
+    /// band gains — the vocoder `Formant Shift` control.  Positive shifts the
+    /// spectral character upward.
+    formant_shift_bands: f32,
+    /// Pass the modulator's high bins straight through (sibilance handling):
+    /// consonants (`s`, `t`, `f`) live above the vocoder's band resolution and
+    /// sound clearer routed direct instead of through the carrier.
+    sibilance_enabled: bool,
+    /// Blend `[0, 1]` of direct modulator into the sibilance region.
+    sibilance_amount: f32,
+    /// First FFT bin treated as sibilance (from a fixed ~5 kHz cutoff).
+    sibilance_start_bin: usize,
 }
 
 impl Vocoder {
@@ -110,6 +123,12 @@ impl Vocoder {
             mod_spectrum: vec![Complex::default(); bins],
             car_spectrum: vec![Complex::default(); bins],
             out_frame: vec![0.0; frame],
+            formant_shift_bands: 0.0,
+            sibilance_enabled: false,
+            sibilance_amount: 0.0,
+            // ~5 kHz: consonant energy sits above this.
+            sibilance_start_bin: ((5_000.0 / sample_rate) * frame as f32).min(bins as f32 - 1.0)
+                as usize,
         }
     }
 
@@ -125,6 +144,41 @@ impl Vocoder {
         for follower in &mut self.followers {
             follower.set_times(attack_ms, release_ms, frame_rate);
         }
+    }
+
+    /// Set the vocoder `Formant Shift` in semitones (± an octave is typical).
+    ///
+    /// Converted to a fractional band offset using the average band width in
+    /// semitones, so the shift reads musically regardless of the band count.
+    /// Cheap; safe per block on the audio thread.
+    pub fn set_formant_shift_semitones(&mut self, semitones: f32) {
+        // Bands span ~`low_hz`..Nyquist ≈ 80 Hz..24 kHz ≈ 8.2 octaves; a band is
+        // therefore ~`8.2 * 12 / count` semitones wide.
+        let semitones_per_band = 8.2 * 12.0 / self.bands.count() as f32;
+        self.formant_shift_bands = semitones / semitones_per_band;
+    }
+
+    /// Configure sibilance handling: when `enabled`, blend `amount` of the
+    /// modulator's high band directly into the output.
+    pub fn set_sibilance(&mut self, enabled: bool, amount: f32) {
+        self.sibilance_enabled = enabled;
+        self.sibilance_amount = amount.clamp(0.0, 1.0);
+    }
+
+    /// Linear interpolation of the per-band gain array at fractional band
+    /// `position`, edge-clamped.
+    #[inline]
+    fn band_gain_at(&self, position: f32) -> f32 {
+        let last = self.band_gain.len() - 1;
+        if position <= 0.0 {
+            return self.band_gain[0];
+        }
+        if position >= last as f32 {
+            return self.band_gain[last];
+        }
+        let base = position.floor() as usize;
+        let frac = position - base as f32;
+        self.band_gain[base] * (1.0 - frac) + self.band_gain[base + 1] * frac
     }
 
     /// Process one block: `modulator` and `carrier` shape into `output`.
@@ -180,10 +234,18 @@ impl Vocoder {
             self.band_gain[band] = self.followers[band].process(level);
         }
 
-        // Apply each band's gain to the carrier bins, then IFFT.
+        // Apply each band's (formant-shifted) gain to the carrier bins, then
+        // pass the modulator's highs through in the sibilance region.
         for bin in 0..self.bins {
-            let gain = self.band_gain[self.bands.band_of_bin(bin)];
-            self.car_spectrum[bin] *= gain;
+            let band = self.bands.band_of_bin(bin) as f32;
+            let gain = self.band_gain_at(band - self.formant_shift_bands);
+            let mut value = self.car_spectrum[bin] * gain;
+            if self.sibilance_enabled && bin >= self.sibilance_start_bin {
+                // Blend toward the raw modulator bin for crisp consonants.
+                value = value * (1.0 - self.sibilance_amount)
+                    + self.mod_spectrum[bin] * self.sibilance_amount;
+            }
+            self.car_spectrum[bin] = value;
         }
         self.fft
             .inverse(&mut self.car_spectrum, &mut self.out_frame);
@@ -275,6 +337,63 @@ mod tests {
             rms(&out_low[FRAME * 3..]),
             rms(&out_high[FRAME * 3..])
         );
+    }
+
+    #[test]
+    fn silent_modulator_stays_silent_with_all_controls() {
+        // Formant shift + sibilance must not manufacture signal from silence.
+        let mut voc = Vocoder::new(FRAME, 16, SAMPLE_RATE, 5.0, 50.0, MAX_BLOCK);
+        voc.set_formant_shift_semitones(7.0);
+        voc.set_sibilance(true, 1.0);
+        let carrier = make_sawtooth(110.0, SAMPLE_RATE, 12_000);
+        let modulator = vec![0.0f32; carrier.len()];
+        let out = run(&mut voc, &modulator, &carrier);
+        assert!(rms(&out) < 1e-6, "controls leaked signal: {}", rms(&out));
+    }
+
+    #[test]
+    fn sibilance_injects_modulator_highs() {
+        // A modulator with strong high-frequency content and a low carrier:
+        // with sibilance on, high-frequency energy should reach the output.
+        let carrier = make_sawtooth(110.0, SAMPLE_RATE, 16_000);
+        let modulator = make_sine(9_000.0, SAMPLE_RATE, 16_000);
+
+        let mut dry = Vocoder::new(FRAME, 16, SAMPLE_RATE, 2.0, 30.0, MAX_BLOCK);
+        let plain = run(&mut dry, &modulator, &carrier);
+
+        let mut sib = Vocoder::new(FRAME, 16, SAMPLE_RATE, 2.0, 30.0, MAX_BLOCK);
+        sib.set_sibilance(true, 1.0);
+        let sibilant = run(&mut sib, &modulator, &carrier);
+
+        // The direct high-frequency modulator path adds energy the carrier
+        // (which is weak up there) cannot supply on its own.
+        assert!(
+            rms(&sibilant[FRAME * 3..]) > rms(&plain[FRAME * 3..]),
+            "sibilance {} should exceed plain {}",
+            rms(&sibilant[FRAME * 3..]),
+            rms(&plain[FRAME * 3..])
+        );
+    }
+
+    #[test]
+    fn formant_shift_changes_output() {
+        let carrier = make_sawtooth(110.0, SAMPLE_RATE, 16_000);
+        let modulator = make_sawtooth(220.0, SAMPLE_RATE, 16_000);
+
+        let mut flat = Vocoder::new(FRAME, 24, SAMPLE_RATE, 2.0, 30.0, MAX_BLOCK);
+        let base = run(&mut flat, &modulator, &carrier);
+
+        let mut up = Vocoder::new(FRAME, 24, SAMPLE_RATE, 2.0, 30.0, MAX_BLOCK);
+        up.set_formant_shift_semitones(12.0);
+        let shifted = run(&mut up, &modulator, &carrier);
+
+        // The two outputs must differ once the formant character is shifted.
+        let diff: f32 = base[FRAME * 3..]
+            .iter()
+            .zip(&shifted[FRAME * 3..])
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff > 1e-3, "formant shift had no audible effect: {diff}");
     }
 
     #[test]

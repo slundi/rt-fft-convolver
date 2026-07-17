@@ -15,14 +15,18 @@
 //! RT-safety requirement).  Output is **wet only** — the dry/wet `Mix` control
 //! lives in the Phase-2 plugin.
 
-use rt_pitch_core::{PhaseVocoder, window::WindowKind};
+use rt_pitch_core::{FormantMethod, PhaseVocoder, window::WindowKind};
 
+use crate::formant_shift::FormantShifter;
 use crate::pitch::VoicePitchTracker;
 use crate::voice::Voice;
 use crate::voicing::{Scale, SnapMode, hz_to_midi, midi_to_semitone_offset};
 
 /// Maximum number of simultaneous harmony voices (Roadmap-08 Phase 2: 4).
 pub const MAX_VOICES: usize = 4;
+
+/// STFT frame size for the per-voice phase vocoders and formant shifters.
+const VOICE_FRAME: usize = 1024;
 
 /// Voice manager that renders a chord of pitch-shifted voices from one input.
 pub struct Harmoniser {
@@ -47,11 +51,15 @@ impl Harmoniser {
     /// **Allocates** — construct off the audio thread.
     pub fn new(sample_rate: f32, max_block: usize) -> Self {
         // 1024-point phase vocoders: chord-capable and formant-aware, the
-        // Roadmap-08 default back-end for harmony voices.
+        // Roadmap-08 default back-end for harmony voices.  Formant preservation
+        // keeps each shifted voice natural; the per-voice `FormantShifter` then
+        // applies any *deliberate* formant move.
         let voices = (0..MAX_VOICES)
             .map(|_| {
-                let shifter = Box::new(PhaseVocoder::new(1024, max_block, WindowKind::Hann));
-                Voice::new(shifter, max_block)
+                let mut pv = PhaseVocoder::new(VOICE_FRAME, max_block, WindowKind::Hann);
+                pv.set_formant_preservation(Some(FormantMethod::Cepstral));
+                let formant = FormantShifter::new(VOICE_FRAME, sample_rate, max_block);
+                Voice::new(Box::new(pv), formant, max_block)
             })
             .collect();
 
@@ -82,13 +90,23 @@ impl Harmoniser {
     }
 
     /// Configure a voice's fixed offset (semitones) and enable it for the
-    /// `Free` / `Scale` modes.
+    /// `Free` / `Scale` modes (convenience for tests / simple hosts).
     ///
     /// # Panics
     /// Panics if `index >= MAX_VOICES`.
     pub fn set_voice_interval(&mut self, index: usize, semitones: f32) {
         self.free_intervals[index] = semitones;
         self.enabled[index] = true;
+    }
+
+    /// Set a voice's fixed offset (semitones) **without** changing its enabled
+    /// state — the plugin drives interval and enablement as separate controls.
+    ///
+    /// # Panics
+    /// Panics if `index >= MAX_VOICES`.
+    #[inline]
+    pub fn set_voice_free_interval(&mut self, index: usize, semitones: f32) {
+        self.free_intervals[index] = semitones;
     }
 
     /// Enable or disable a voice for the `Free` / `Scale` modes.
@@ -99,7 +117,8 @@ impl Harmoniser {
         self.enabled[index] = enabled;
     }
 
-    /// Mutable access to a voice's mix parameters (level / pan / detune).
+    /// Mutable access to a voice's mix parameters (level / pan / detune /
+    /// formant shift).
     ///
     /// # Panics
     /// Panics if `index >= MAX_VOICES`.

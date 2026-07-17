@@ -38,6 +38,7 @@ members = [
     "rt-limiter-core",
     "rt-limiter",
     "rt-vox-core",
+    "rt-vox",
     "xtask",
 ]
 # `xtask` exists only for `cargo xtask …` (the bundler); keep it out of plain
@@ -62,6 +63,7 @@ default-members = [
     "rt-limiter-core",
     "rt-limiter",
     "rt-vox-core",
+    "rt-vox",
 ]
 
 [package.metadata.docs.rs]
