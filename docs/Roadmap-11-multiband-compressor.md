@@ -11,56 +11,207 @@ Plugin format target: **LV2 + CLAP + VST3** via
 
 ## Design principles
 
-- **Band count** — [decision]:
-  - Fixed at 4 (simplest UI).
-  - Fixed at 6.
-  - User-configurable 2–6.
-- **Crossover topology** — [decision]:
-  - Linkwitz-Riley 4th-order (24 dB/oct, phase-coherent when summed
-    within a band).
-  - Linear-phase FIR (higher CPU + latency, ideal for mastering).
-  - Both, user-selectable.
+- **Band count** — **Decision (Phase 0): fixed at 4 in v1**
+  (3 crossovers); configurable 2–6 deferred to v2 — see Phase 0.
+- **Crossover topology** — **Decision (Phase 0): Linkwitz-Riley
+  4th-order IIR in v1** (24 dB/oct, phase-coherent when summed within a
+  band, zero latency); linear-phase FIR via `rt-fft-convolver` deferred
+  to v2 — see Phase 0.
 - **Per-band mode** — each band independently compressor, expander,
   gate, or bypass.
 - **RT-safe** — all state per-band and per-channel, allocation-free
   on the audio thread.
-- **Sidechain input** — per-band sidechain filter, plus external
-  sidechain — [decision] whether external sidechain is v1 or v2.
-- **Zero-latency mode** with the IIR crossover; higher-latency
-  linear-phase mode reported accurately to the host.
+- **Sidechain input** — per-band internal sidechain filter (HPF +
+  shelf). **Decision (Phase 0): external (aux-input) sidechain deferred
+  to v2** — see Phase 0.
+- **Zero-latency mode** with the IIR crossover; the higher-latency
+  linear-phase mode (v2) will be reported accurately to the host.
 
-## Prerequisites in `rt-fft-convolver`
+## Prerequisites in `rt-fft-convolver` ✅
 
-- [ ] `DenormalGuard`.
-- [ ] For the linear-phase crossover option: reuse
-  `rt-fft-convolver` as an FIR convolution engine (this is the
-  primary architectural link to this library).
-- [ ] Parameter-smoothing utility — [decision] whether to extract
-  from `mixer.rs` or keep local.
+- `DenormalGuard` — present and tested
+  ([src/utils/denormals.rs](../src/utils/denormals.rs)); RAII FTZ/DAZ
+  guard, re-exported at the crate root. Wraps each band's envelope
+  follower and gain computer so a silent band (or a silent passage in
+  any band) never drives the one-pole detector states or the crossover
+  biquad states into denormal arithmetic.
+- FIR convolution engine for the linear-phase crossover — **present.**
+  The partitioned convolver — the heavy, hard-to-get-right part — already
+  exists and is tested (`UniformPartitionEngine`, `HybridConvolver`,
+  `OfflineConvolver`, all re-exported at the crate root). The v1 crossover
+  is LR4 IIR (zero-latency, see Phase 0), so this link is **not on the v1
+  critical path**; it is the drop-in engine for the v2 linear-phase mode
+  (design windowed-sinc band-split FIRs, convolve, report latency).
+- Parameter-smoothing utility — **decision: keep local.** There is
+  nothing clean to extract: [mixer.rs](../src/engine/mixer.rs) has no
+  general smoother (only an equal-power dry/wet crossfade folded into two
+  gains at set-time), and `rt_limiter_core::GainComputer` is a
+  look-ahead-limiter-specific reduction smoother, not a generic ramp.
+  `rt-multiband-core` gets its own small one-pole `ParamSmoother` for
+  click-free crossover-frequency / threshold / makeup changes; nih-plug's
+  own `Smoother` still handles wrapper-level param smoothing in Phase 2.
+  - *Options considered.*
 
-## Phase 0: DSP decisions
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **Local one-pole `ParamSmoother` in core** (chosen) | 2 f32/param (current + target) | 1 mul-add/param/sample | Low — ~15 lines, no cross-crate coupling |
+    | Extract a shared smoother from `mixer.rs` | same | same | Med — mixer has no smoother to extract; would mean *adding* one there and re-exporting for one consumer |
+    | Depend on `rt_limiter_core::GainComputer` | its full release-curve state | its per-sample cost | Med — wrong shape (feed-forward limiter reduction, not a generic parameter ramp) |
 
-- [ ] **Detector topology** — [decision]:
-  - Peak.
-  - RMS.
-  - Peak / RMS blend.
-  - Program-dependent (auto).
-- [ ] **Knee** — [decision]:
-  - Hard knee only.
-  - Soft knee (user-configurable width).
-  - Both.
-- [ ] **Envelope follower** — [decision]:
-  - Analog-modelled (attack/release with capacitor charge curve).
-  - Linear.
-  - RC + look-ahead.
-- [ ] **Look-ahead** — [decision]:
-  - Off (zero-latency).
-  - Fixed (e.g. 3 ms).
-  - User-configurable.
-- [ ] **Stereo linking** — [decision]:
-  - Linked (max detector across L/R).
-  - Independent.
-  - M/S with per-band selectable.
+## Phase 0: DSP decisions ✅
+
+The organising Phase 0 finding is that **v1 is deliberately the
+zero-latency, IIR, fixed-4-band core** — every heavier option
+(linear-phase FIR crossover, external sidechain, look-ahead, >4 /
+configurable bands, M/S) is a clean v2 add-on that does not change the
+v1 signal-flow contract. That keeps the v1 audio path allocation-free
+and zero-latency, honours the "reuse over re-implementation" rule (the
+FIR path drops onto the existing convolver when v2 wants it), and lets
+the per-band dynamics engine be exhaustively unit-tested against the
+Phase 4 targets before any latency or aux-bus plumbing is layered on.
+
+Cost figures below are per instance at 48 kHz, stereo, 4 bands; "block"
+means the host's processing block (≤ 512 samples assumed for sizing).
+
+### Scope / topology decisions
+
+- **Band count** — **decision: fixed at 4 in v1**; user-configurable
+  2–6 deferred to v2.
+  - *Rationale.* 4 bands (3 crossovers) is the classic multiband layout
+    (Waves C4) and covers every Phase 5 preset — mastering-glue,
+    drum-bus, vocal-de-esser (one active band, others bypassed),
+    broadcast-loudness, bass-tightener. A fixed count keeps the state
+    arrays, UI, and crossover tree static, so nothing reallocates on a
+    parameter change.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **Fixed 4** (chosen) | 4× band state + 3 LR4 crossovers/ch (a few hundred bytes) | 3 crossovers + 4 band processors/sample | Low — static arrays, static UI |
+    | Fixed 6 | ~1.5× the above (5 crossovers, 6 bands) | ~1.5× | Low, but a heavier fixed UI for marginal benefit at guitar/bus scope |
+    | Configurable 2–6 | sized for 6, N active | N-dependent | Med–High — off-thread crossover-tree rebuild on count change + UI reflow |
+
+- **Crossover topology** — **decision: Linkwitz-Riley 4th-order IIR
+  (24 dB/oct) in v1**; linear-phase FIR (via `rt-fft-convolver`)
+  deferred to v2.
+  - *Rationale.* LR4 is a cascade of two identical Butterworth 2nd-order
+    biquads per split; the summed low+high output of one split is
+    all-pass (magnitude-flat), which is what makes bypassed bands
+    reconstruct the input — the Phase 4 bit-identical bypass test. It is
+    zero-latency, matching the design principle. Linear-phase FIR is
+    ideal for mastering but adds latency, CPU, FIR band-split design, and
+    delayed-reconstruction tests; since the convolver it would reuse
+    already exists, deferring it costs nothing architecturally.
+  - *Reconstruction note (>2 bands).* Summing three LR4 splits naïvely
+    leaves a phase error between non-adjacent bands. The standard fix is
+    an **all-pass correction** (or processing splits as a serial tree)
+    so the bypassed-band sum stays flat — see Phase 1 "Band-sum
+    reconstruction". This is the one genuinely subtle part of the IIR
+    path and gets its own test.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Latency | Complexity |
+    |---|---|---|---|---|
+    | **LR4 IIR, v1** (chosen) | 2 biquads/crossover/ch | low (a handful of mul-adds/sample/split) | 0 | Med — all-pass reconstruction across 3 splits |
+    | Linear-phase FIR now | FFT partitions/band (KB–MB per IR length) | high (FFT/block) | FIR half-length | High — band-split design + latency reporting + delayed-recon tests |
+    | Both, selectable, v1 | union of the two | mode-dependent | mode-dependent | High — ships both paths and the switch in v1 |
+
+- **Sidechain** — **decision: internal (band-content) sidechain with a
+  per-band SC HPF + shelf in v1**; external aux-input sidechain deferred
+  to v2.
+  - *Rationale.* An internal SC filter covers the common cases
+    (de-essing, bass-ducking, tilting the detector without touching the
+    audio path) at the cost of one biquad per band. External sidechain
+    needs an nih-plug aux input bus and a per-host support matrix
+    (`clap-validator` / `pluginval` aux-port coverage), which is a
+    packaging/validation concern better isolated to its own version.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **Internal SC filter, v1** (chosen) | 1 biquad/band/ch | 1 biquad/band/sample | Low |
+    | External aux input, v1 | + aux input buffers | low (routing only) | Med–High — aux-bus plumbing + host validation matrix |
+
+- **Look-ahead** — **decision: off (zero-latency) in v1**;
+  user-configurable look-ahead deferred to v2.
+  - *Rationale.* Keeps the v1 promise of a zero-latency path and avoids a
+    full-signal delay line + host latency reporting. When v2 adds it,
+    `rt_limiter_core::DelayLine` is the ready-made, tested delay
+    primitive to reuse.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Latency | Complexity |
+    |---|---|---|---|---|
+    | **Off, v1** (chosen) | 0 | 0 | 0 | Low |
+    | Fixed (e.g. 3 ms) | ~fs·3 ms f32/ch (~576 B/ch) | low | 3 ms (reported) | Med — delay line + latency reporting |
+    | User-configurable | max-lookahead buffer/ch | low | param-dependent (reported) | Med |
+
+### Per-band dynamics decisions
+
+- **Detector topology** — **decision: Peak / RMS blend with a per-band
+  blend control** (0 = pure RMS, 1 = pure peak); program-dependent
+  (auto) deferred.
+  - *Rationale.* Low bands want RMS (musical, level-riding, ignores
+    transients); high bands and the de-esser band want peak (transient
+    control). A single per-band blend knob subsumes both pure modes and
+    is what the reference designs (FabFilter Pro-MB) expose. RMS costs
+    one square + one one-pole mean-square state per band.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **Peak / RMS blend** (chosen) | 1 mean-square state/band/ch (+ peak state) | square + one-pole + blend/sample | Low–Med |
+    | Peak only | peak state only | cheapest | Low, but no musical low-band riding |
+    | RMS only | mean-square state | one-pole/sample | Low, but poor transient control up top |
+    | Program-dependent (auto) | + adaptation state | + adaptation logic | Med–High — deferred; blend covers the need |
+
+- **Knee** — **decision: soft knee with user-configurable width;
+  width = 0 gives an exact hard knee** (so "both" fall out of one gain
+  computer).
+  - *Rationale.* A single quadratic-interpolation soft-knee gain
+    computer degenerates to a hard knee at width 0, so there is no reason
+    to ship two code paths. The extra cost is a branch and a quadratic
+    only in the ± width/2 region around threshold.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **Soft knee, width param (0 = hard)** (chosen) | none extra | branch + quadratic near threshold | Low |
+    | Hard knee only | none | cheapest | Low, but no soft-knee musical option |
+    | Separate hard + soft paths | none | same | Med — two computers to keep in sync for no gain |
+
+- **Envelope follower** — **decision: analog-modelled branching one-pole**
+  with separate attack/release capacitor-charge coefficients
+  `coeff = exp(−1 / (t · fs))`, computed off-RT on any time-constant
+  change.
+  - *Rationale.* The RC one-pole is the standard, cheap, well-understood
+    follower and directly matches the Phase 4 attack/release
+    time-constant test (±10 % of the specified τ). "Linear" ramps are
+    less musical; "RC + look-ahead" is subsumed by the (deferred)
+    look-ahead decision.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **Analog-modelled RC one-pole** (chosen) | 1 f32 state/band/ch; 2 coeffs precomputed | 1 branch + 1 one-pole/sample | Low |
+    | Linear attack/release | 1 state | 1 add/clamp/sample | Low, but less natural, harder to hit τ test |
+    | RC + look-ahead | + delay line | + delay | Med — depends on the deferred look-ahead |
+
+- **Stereo linking** — **decision: linked (max detector across L/R) as
+  the default, with a per-band Independent toggle**; M/S-selectable
+  linking deferred to v2.
+  - *Rationale.* Linking the detector (drive both channels' gain from
+    `max(|L|, |R|)`) prevents the stereo-image shift that independent
+    per-channel gain reduction causes — the right default. Independent is
+    a free toggle (skip the `max`). M/S linking needs an encode/decode
+    matrix wrapped around the whole band processor and is a v2 feature.
+  - *Options considered.*
+
+    | Option | Memory | CPU load | Complexity |
+    |---|---|---|---|
+    | **Linked + per-band Independent toggle** (chosen) | shared detector/band | 1 `max`/sample when linked | Low |
+    | Linked only | shared detector | 1 `max`/sample | Low, but no independent option |
+    | M/S per-band selectable | + M/S matrix state | + encode/decode/sample | Med — deferred to v2 |
 
 ## Phase 1: `rt-multiband-core` (engine crate)
 
