@@ -200,29 +200,50 @@ full-scale-stereo-sine ≈ 0 LUFS BS.1770 calibration check passes end-to-end.
     `store`s [`MeterValues`] wait-free, the off-RT UI / logger `load`s the
     latest set.  [`LoudnessMeter::publish`] wires the whole chain to it.
 
-## Phase 2: `rt-loudness-meter` plugin
+## Phase 2: `rt-loudness-meter` plugin ✅
 
-- [ ] **I/O**:
-  - Stereo in → stereo out (pass-through).
+Plugin crate built ([rt-loudness-meter](../rt-loudness-meter)), wired into the
+workspace, unit- and triad-tested (23 tests), clippy-clean on both the default
+and `--features nih` builds, and machete-clean.  Analysis-only: audio passes
+through bit-for-bit (a `rt_safety` test asserts it).  There is **no**
+`*Controller` / `ir_handoff` — nothing reallocates on a parameter change, so a
+resident [`MeterProcessor`](../rt-loudness-meter/src/engine.rs) is built once in
+`initialize`.
+
+- [x] **I/O** ([plugin.rs](../rt-loudness-meter/src/plugin.rs)):
+  - Stereo in → stereo out and mono in → mono out (pass-through).
   - Multichannel — **v2** (5.1 / 7.1); see Phase 0 channel-config
     decision.
-- [ ] **Meter controls**:
-  - `Target` (dropdown: EBU R128 / Spotify / YouTube / Apple Music /
-    custom).
-  - `Custom Target` (LUFS + dBTP if custom).
-  - `Reset` (clears integrated + LRA + history).
-  - `Start / Stop` (integration control — some workflows start
-    integration on transport play).
-  - `Bypass` (irrelevant — the plugin doesn't modify audio, but
-    LV2 requires it).
-- [ ] **Logging controls**:
-  - `Log to File` (bool + path).  Off-RT worker writes CSV /
-    JSON.
-- [ ] **MIDI**:
-  - CC on `Reset` and `Start / Stop` (transport integration).
-- [ ] **Reporting**:
-  - All meter values exposed as read-only host parameters so a
-    DAW can log or automate against them.
+- [x] **Meter controls**
+  ([params.rs](../rt-loudness-meter/src/params.rs)):
+  - `Target` (dropdown: EBU R128 / Streaming −14 / Apple·Podcast −16 /
+    Custom) — the presets collapse Spotify/YouTube/Tidal/Amazon (all −14)
+    into one entry per the Phase-0 "one engine, preset targets" decision;
+    [`Target::thresholds`] resolves the (LUFS, dBTP) pair.
+  - `Custom Target` (`custom_target_lufs` + `custom_target_dbtp`, used when
+    `Target = Custom`).
+  - `Reset` (rising-edge clears integrated + LRA + peak holds).
+  - `Start / Stop` (`running`) — freezes integrated + LRA while momentary /
+    short-term / peaks stay live (new [`LoudnessMeter::set_integrating`]).
+  - `Bypass` (formal no-op — audio is never modified — present for LV2).
+- [x] **Logging controls**
+  ([engine.rs](../rt-loudness-meter/src/engine.rs)):
+  - `Log` bool → the off-RT [`MeterLogger`](../rt-loudness-meter/src/engine.rs)
+    worker polls the lock-free broadcast into a CSV / JSON file; started /
+    stopped via the host background executor, never on the audio thread.  The
+    file-*path* picker lands with the Phase 3 editor (a `#[persist]` path field
+    is already in place); until a path is set, `Log` is inert.
+- [x] **MIDI**:
+  - `Reset` and `Start / Stop` are automatable `BoolParam`s a host binds to a
+    footswitch / transport CC via MIDI learn (the idiomatic `nih-plug` path),
+    so `MIDI_INPUT` stays `None` — matching the sibling `rt-limiter` /
+    `rt-adaptive` decision.
+- [~] **Reporting**:
+  - Meter values are published every block through the lock-free
+    [`MeterBroadcast`] (the editor and logger read it).  `nih-plug` has no
+    first-class *output-parameter* concept, so exposing the readings as
+    DAW-automatable host parameters is not supported by the framework —
+    deferred / N-A; the broadcast is the reporting channel.
 
 ## Phase 3: UI
 

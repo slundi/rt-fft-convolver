@@ -42,6 +42,7 @@ members = [
     "rt-adaptive-core",
     "rt-adaptive",
     "rt-loudness-core",
+    "rt-loudness-meter",
     "xtask",
 ]
 # `xtask` exists only for `cargo xtask …` (the bundler); keep it out of plain
@@ -70,6 +71,7 @@ default-members = [
     "rt-adaptive-core",
     "rt-adaptive",
     "rt-loudness-core",
+    "rt-loudness-meter",
 ]
 
 [package.metadata.docs.rs]

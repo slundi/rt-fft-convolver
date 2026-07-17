@@ -189,6 +189,13 @@ impl LoudnessMeter {
         self.num_channels
     }
 
+    /// Enable or freeze integrated / LRA accumulation (the `Start/Stop`
+    /// control).  Momentary, short-term and the peak holds keep updating
+    /// regardless.  **Real-time safe.**
+    pub fn set_integrating(&mut self, integrating: bool) {
+        self.integrator.set_integrating(integrating);
+    }
+
     /// Analyse one block of every channel (all slices the same length).
     /// The signal is **not** modified — the meter is measurement-only.
     ///

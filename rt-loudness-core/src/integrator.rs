@@ -62,6 +62,9 @@ pub struct LoudnessIntegrator {
     current_count: u32,
     /// Samples per 100 ms sub-block at the configured rate.
     samples_per_subblock: u32,
+    /// When `false`, the momentary / short-term windows stay live but the
+    /// integrated and LRA histograms are frozen (a stopped `Start/Stop`).
+    integrating: bool,
     /// Gated 400 ms-block-loudness histogram → integrated LUFS.
     integrated: LoudnessHistogram,
     /// Gated 3 s short-term-loudness histogram → LRA.
@@ -82,9 +85,18 @@ impl LoudnessIntegrator {
             current_sum: 0.0,
             current_count: 0,
             samples_per_subblock,
+            integrating: true,
             integrated: LoudnessHistogram::new(),
             lra: LoudnessHistogram::new(),
         }
+    }
+
+    /// Enable or freeze the **integrated / LRA** accumulation (the `Start/Stop`
+    /// control).  The momentary and short-term windows keep updating either
+    /// way — only the session-long gated histograms pause.
+    #[inline]
+    pub fn set_integrating(&mut self, integrating: bool) {
+        self.integrating = integrating;
     }
 
     /// Feed one channel-weighted mean-square sample.  **Real-time safe.**
@@ -107,6 +119,11 @@ impl LoudnessIntegrator {
         self.current_sum = 0.0;
         self.current_count = 0;
 
+        // While stopped the momentary / short-term rings above still roll, but
+        // the session-long gated histograms are frozen.
+        if !self.integrating {
+            return;
+        }
         // A new 400 ms block completes every 100 ms once four sub-blocks exist;
         // its loudness feeds the integrated gate.
         if self.subblocks_done >= MOMENTARY_SUBBLOCKS as u64 {
@@ -243,6 +260,21 @@ mod tests {
             (integrated - -20.691).abs() < 0.3,
             "integrated {integrated} should ignore the silence"
         );
+    }
+
+    #[test]
+    fn stopped_freezes_integrated_but_not_momentary() {
+        let mut integrator = LoudnessIntegrator::new(SR);
+        // Accumulate 3 s of programme, then stop and feed a louder tone.
+        push_constant(&mut integrator, 0.01, 3.0);
+        let integrated_before = integrator.integrated_lufs();
+        integrator.set_integrating(false);
+        push_constant(&mut integrator, 1.0, 3.0);
+
+        // Integrated is frozen at the pre-stop value…
+        assert!((integrator.integrated_lufs() - integrated_before).abs() < 0.01);
+        // …while momentary tracked the louder tone live (power 1.0 → −0.691).
+        assert!((integrator.momentary_lufs() - -0.691).abs() < 0.05);
     }
 
     #[test]
