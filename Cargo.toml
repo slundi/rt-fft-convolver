@@ -91,9 +91,9 @@ targets = [
 [dependencies]
 hound = "3.5"
 realfft = "3.5"
-rubato = "4.0"
+rubato = "5.1"
 rustfft = "6.4"
-wide = "1.5"
+wide = "1.7"
 
 [workspace.metadata.cargo-machete]
 ignored = []
