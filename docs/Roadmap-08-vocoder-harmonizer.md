@@ -1,0 +1,279 @@
+# Roadmap: `rt-vox` (Vocoder / Harmoniser / Formant Shifter)
+
+Voice-processing plugin combining vocoder (carrier + modulator),
+harmoniser (single input → chord output), and formant shifter.
+**Decision (Phase 0): one plugin, three modes** sharing a single
+`rt-vox-core` engine crate — see Phase 0 below.
+
+**Reference implementations**: TC-Helicon VoiceLive, Boss VE-20 /
+VE-500, DigiTech Vocalist, Antares Harmony Engine, Waves OVox,
+iZotope VocalSynth.
+
+Plugin format target: **LV2 + CLAP + VST3** via
+[`nih-plug`](https://github.com/robbert-vdh/nih-plug).
+
+## Design principles
+
+- **Pitch detection is monophonic** — voice-focused; not polyphonic
+  input.
+- **Latency ≤ 15 ms** for live use.  Higher-quality "studio" mode
+  optional at longer latency.
+- **RT-safe** — pitch tracker, formant analyser, and resynthesiser
+  all allocation-free on the audio thread.
+- **MIDI chord input** for the harmoniser — chord notes come from a
+  MIDI keyboard, guitar controller, or automation.
+- **Formant control is first-class** — vocoder and harmoniser both
+  gain from correct formant handling.  Reuse the pitch-shifter
+  formant path from `rt-pitch-core` if formant support is added
+  there ([Roadmap-03-pitch-shift.md]).
+
+## Prerequisites in `rt-fft-convolver` ✅
+
+- `DenormalGuard` — present and tested
+  ([src/utils/denormals.rs](../src/utils/denormals.rs)); RAII FTZ/DAZ
+  guard, re-exported by `rt-pitch-core`.
+- `dsp/fft_handler.rs` — present and tested
+  ([src/dsp/fft_handler.rs](../src/dsp/fft_handler.rs)); allocation-free
+  real→complex / complex→real FFT, reused for FFT-vocoder band grouping
+  and formant estimation.
+- **Bonus prerequisite met**: `rt-pitch-core` is already built
+  (Roadmap-03 Phases 0–1 complete) and exports exactly the primitives
+  this plugin needs — see the reuse decisions below.
+
+## Phase 0: Algorithm decisions ✅
+
+The dominant Phase 0 finding is that **`rt-pitch-core` already ships
+RT-safe, tested implementations** of pitch tracking, formant estimation,
+and pitch shifting. Every decision below therefore favours *reuse* over a
+second parallel implementation, keeping this plugin inside the "≤ 15 ms,
+allocation-free, no second tracker to maintain" design principles.
+
+- **Plugin packaging** — **decision: one plugin, three modes**
+  (`Vocoder` / `Harmoniser` / `Formant Shifter`) over a shared
+  `rt-vox-core` crate, matching every other `*-core` + plugin pair in
+  the workspace.
+  - *Options considered.* (a) One plugin with a mode selector — the
+    three modes share the pitch tracker, formant analyser, FFT infra,
+    and the global `Mix`/`Output`/`Bypass` controls Phase 2 already
+    lists. (b) Three separate plugins over a shared core — triples
+    bundling, CI, installers, and preset banks for no user benefit.
+  - *Examples in the wild.* iZotope VocalSynth and Waves OVox are single
+    plugins with switchable modules; that is the (a) model.
+
+- **Pitch detection** — **decision: reuse
+  `rt_pitch_core::PitchTracker`** (autocorrelation + parabolic
+  interpolation) — the "simpler baseline" option, already RT-safe.
+  - *Options considered.* YIN is marginally more robust on octave errors
+    but is a *second* tracker to build and test; CREPE-style neural adds
+    heavy CPU and a model-weights dependency, breaking the RT /
+    allocation-free principle. The existing tracker already emits
+    `PitchEstimate { frequency_hz, period_samples, confidence }` and has
+    a polyphony guard (`is_polyphonic`) — everything the harmoniser and
+    formant tracker need.
+  - *Example.* A 440 Hz sine frame → `PitchEstimate { frequency_hz ≈
+    440, confidence ≈ 1.0 }`; a C-major chord → `is_polyphonic() ==
+    true`, so PSOLA-style modes auto-bypass (Phase 4 acceptance test).
+
+- **Pitch-shift back-end** — **decision: reuse `rt-pitch-core`** via
+  its off-RT-swappable `Shifter` trait (`process_block`,
+  `latency_samples`, `reset`); no voice-specific re-implementation.
+  - *Options considered.* An independent voice-tuned shifter duplicates
+    ~2 000 lines of already-tested PV/WSOLA/PSOLA code. The trait already
+    exposes `PhaseVocoder` (default, handles chords), `Wsola`
+    (low-latency mono), and `Psola` (mono voice) so the harmoniser can
+    pick per-voice.
+  - *Example.* A harmony voice a major third up:
+    `let ratio = semitones_to_ratio(4.0); // ≈ 1.26`, fed to a
+    `Box<dyn Shifter>` instance; the ±12-semitone Phase 2 range fits
+    inside `MIN_RATIO..=MAX_RATIO` (0.25..=4.0 = ±24 semitones).
+
+- **Formant analysis** — **decision: reuse
+  `rt_pitch_core::FormantEstimator`, all three `FormantMethod`s
+  selectable, default `Lpc` for the voice path.**
+  - *Options considered.* LPC (Levinson-Durbin all-pole) is the textbook
+    voice formant model and the natural fit for the vocoder's
+    envelope-transfer stage — chosen as default here even though
+    `rt-pitch-core`'s own default is `Cepstral` (cheapest, reuses the PV
+    spectrum). `TrueEnvelope` is offered for highest quality (iteration
+    count is capped for RT bounding). All three already exist and are
+    allocation-free after construction.
+  - *Example.* At 48 kHz the voice LPC order ≈ `sample_rate / 1000 + 2`
+    ≈ 50; `estimate(magnitude, &mut envelope)` yields the smooth
+    spectral envelope, and `preserve(orig_env, shifted_env, &mut mag)`
+    holds formants still when only pitch is shifted.
+
+- **Vocoder topology** — **decision: FFT-based magnitude-envelope
+  transfer, with the `Bands` control implemented as log-spaced FFT-bin
+  grouping** (a true SVF channel bank is deferred as a later "analog"
+  voicing, mirroring Roadmap-03's deferred-hybrid approach).
+  - *Options considered.* (a) Analog channel bank — 16–32 state-variable
+    band-pass filters with per-band envelope-follower cross-modulation;
+    distinctive resonant character but a new filter bank to tune and
+    test, and it does not reuse the FFT infra the prerequisite calls
+    out. (b) FFT-based — reuses `FftHandler` + the `rt-pitch-core` STFT
+    framing, gives arbitrary per-bin resolution, integrates directly with
+    the formant path, and is cheaper to get correct for a 1.0. Grouping
+    bins into N log-spaced bands preserves the familiar `Bands`
+    (8/16/24/32) control and much of the analog voicing.
+  - *Example.* Per STFT frame: take the **modulator** magnitude
+    spectrum, sum bin energies into 16 log-spaced bands, smooth each with
+    an attack/release envelope follower, then scale the **carrier**'s
+    bins in each band by that envelope and IFFT. Silent modulator →
+    silent output; unity-envelope modulator → carrier passes through
+    (Phase 4 pass-through test).
+
+- **Harmoniser voicing** — **decision: all three modes selectable
+  via a `Snap Mode` control (Free / Scale / MIDI), default MIDI** per the
+  "MIDI chord input" design principle.
+  - *Options considered.* Free = fixed per-voice semitone offsets
+    (simplest, no musical context). Scale = snap each computed harmony
+    note to the nearest degree of `Key` + `Scale` (diatonic thirds,
+    etc.). MIDI = harmony pitches taken directly from held MIDI notes —
+    the most expressive and the stated primary use case. All three share
+    the same per-voice `Shifter`; only the interval source differs.
+  - *Example.* Input note C4: **Free** `+7` → G4; **Scale** (C major,
+    "third above") → E4; **MIDI** holding E4 + G4 → two voices tracking
+    E4 and G4. Each resolves to a ratio via `semitones_to_ratio`.
+
+## Phase 1: `rt-vox-core` (engine crate) ✅
+
+- **Workspace layout**:
+  - `rt-vox-core` — engine (created; added to the workspace members).
+  - `rt-vox` — plugin (deferred to Phase 2).
+- **Pitch tracker** (reused `rt_pitch_core::PitchTracker`):
+  - [`VoicePitchTracker`](../rt-vox-core/src/pitch.rs) streams host blocks
+    through an STFT `Analyzer`, emitting a `PitchEstimate`
+    (frequency / period / confidence) every hop.
+  - Off-RT-safe: the analyzer ring and per-lag score buffer are sized up
+    front; `process_block` allocates nothing.
+- **Formant analyser** (reused `rt_pitch_core::FormantEstimator`, `Lpc`):
+  - Voice-tuned LPC order (`sample_rate / 1000 + 2`) per frame, driving the
+    formant shifter; re-exported at the crate root.
+- **Vocoder engine** ([`Vocoder`](../rt-vox-core/src/vocoder.rs)):
+  - FFT-bin channel bank grouped into log-spaced
+    [`LogBands`](../rt-vox-core/src/bands.rs) (Phase 0 topology decision).
+  - Per-band attack/release [`EnvelopeFollower`](../rt-vox-core/src/envelope.rs)
+    on the modulator.
+  - Carrier bins scaled by the smoothed modulator envelope per band.
+- **Harmoniser engine** ([`Harmoniser`](../rt-vox-core/src/harmoniser.rs)):
+  - Up to `MAX_VOICES` (4) [`Voice`](../rt-vox-core/src/voice.rs)s, each a
+    swappable `Shifter` (default `PhaseVocoder`).
+  - Voice manager with `Free` / `Scale` / `Midi`
+    [`SnapMode`](../rt-vox-core/src/voicing.rs) interval sourcing; RT-safe
+    `note_on` / `note_off`.
+- **Formant shifter** ([`FormantShifter`](../rt-vox-core/src/formant_shift.rs)):
+  - Independent path — reshapes the LPC envelope (warped by the shift factor)
+    while leaving harmonic phases intact, so pitch is preserved.  Pitch-only
+    shifting (formants held) is the complementary `rt-pitch-core`
+    formant-preserving vocoder.
+
+## Phase 2: `rt-vox` plugin ✅
+
+Built as the framework-agnostic [`VoxController`](../rt-vox/src/engine.rs) +
+[`VoxProcessor`](../rt-vox/src/engine.rs) (unit-tested) plus a thin `nih-plug`
+wrapper ([plugin.rs](../rt-vox/src/plugin.rs), behind the `nih` feature).
+Parameters live in [params.rs](../rt-vox/src/params.rs).  **Design note:** the
+band count is the only *structural* control (rebuilds the vocoder off-thread);
+the harmoniser and formant paths stay resident so a mode switch never drops
+held MIDI notes.
+
+- **I/O**:
+  - Mono/stereo main in + a **mono sidechain** (vocoder carrier) → out.  The
+    carrier falls back to the input itself (self-vocoding) when unpatched.
+  - Stereo in → stereo out for the harmoniser (panned voices) / formant modes
+    (per-channel).
+- **Mode selector**: `Vocoder` / `Harmoniser` / `Formant Shifter`.
+- **Vocoder controls**: `Bands` (8/16/24/32), `Attack`, `Release`,
+  `Formant Shift` (± 1 octave), `Sibilance Handling` (bool + amount, passes the
+  modulator's highs direct).
+- **Harmoniser controls**: per-voice `Interval` / `Level` / `Pan` /
+  `Formant Shift` / `Detune` (× 4 voices + enable), `Snap Mode`
+  (Free / Scale / MIDI), `Key` and `Scale`.
+- **Formant Shifter controls**: `Formant Shift` (± 1 octave) and an
+  independent `Pitch Shift` (± 12 semitones, formant-preserving).
+- **Global controls**: `Mix` (0–100 %), `Output Gain`, `Bypass`, plus dry-
+  delay compensation so the mix stays phase-aligned.
+- **MIDI**: note on/off → harmoniser chord voices (allocation-free); CC
+  binds to any continuous control via host MIDI-learn (`MidiConfig::Basic`).
+- **Latency reporting** per mode (vocoder / harmoniser / formant each report
+  their own algorithmic latency).
+
+## Phase 3: UI ✅
+
+The pure, `egui`-free editor logic lives in [ui.rs](../rt-vox/src/ui.rs)
+(unit-tested); the egui drawing is in [plugin.rs](../rt-vox/src/plugin.rs)
+behind the **`gui`** feature.  The audio thread publishes telemetry through
+packed atomics, and the formant-display spectral probe
+([rt-vox-core/src/spectral_probe.rs](../rt-vox-core/src/spectral_probe.rs)) runs
+**only while the editor is open** so its FFT/LPC cost is paid only when watched.
+
+- **`nih-plug-egui`** — decision: matches every sibling plugin in the
+  workspace (`rt-pitch`, `rt-limiter`).
+- **Pitch tracking indicator**: detected pitch (Hz + note name via
+  [`hz_to_note_name`](../rt-vox/src/ui.rs)) with a confidence bar.
+- **Formant display**: log-spaced input magnitude spectrum with the LPC
+  formant envelope overlaid (via [`SpectralProbe`](../rt-vox-core/src/spectral_probe.rs)
+  + [`spectral_heights`](../rt-vox/src/ui.rs)).
+- **Voice grid** for the harmoniser: one row per voice with interval /
+  level / pan / formant / detune (+ enable) and a formatted summary line.
+- **MIDI activity indicator**: reuses `rt-ir-plugin-core`'s `MidiActivity`
+  LED, pulsed on each note event.
+
+## Phase 4: Testing ✅
+
+Acceptance suites map each bullet to a test:
+[rt-vox-core/tests/acceptance.rs](../rt-vox-core/tests/acceptance.rs) (core
+criteria) and [rt-vox/tests/acceptance.rs](../rt-vox/tests/acceptance.rs)
+(integration + RT-safety), alongside the existing
+[rt-vox/tests/rt_safety.rs](../rt-vox/tests/rt_safety.rs) and
+[rt_alloc.rs](../rt-vox/tests/rt_alloc.rs).  Pitch is measured with
+`rt_pitch_core::PitchTracker` (parabolic-interpolated autocorrelation) for the
+sub-cent precision the 5-cent bound needs.
+
+- [x] **Unit tests** (`rt-vox-core`):
+  - Pitch tracker: 440 Hz sine → **440 ± 2 Hz** (`pitch_tracker_locks_440hz_within_2hz`).
+  - Vocoder pass-through: silent modulator → exact silence, plus faithful
+    per-band envelope transfer (`vocoder_silent_modulator_is_silent`,
+    `vocoder_transfers_the_modulator_envelope`).
+  - Harmoniser: a 0-semitone unison voice reproduces the input pitch within
+    noise (`harmoniser_unison_matches_the_dry_pitch`).
+  - Formant shifter: pitch preserved **≤ 5 cents** across several shifts/pitches
+    (`formant_shift_preserves_pitch_within_5_cents`).
+- [x] **Integration tests**: a held MIDI chord triggers one voice per note;
+  note-off removes exactly that voice; a held note deterministically triggers
+  its voice (`midi_chord_triggers_distinct_voices`,
+  `releasing_one_chord_note_keeps_the_rest`,
+  `held_note_deterministically_triggers_its_voice`).  *Note:* voice changes
+  apply at block boundaries; sub-block sample-accurate event placement is a
+  nih-plug host-side concern (event ordering), not re-implemented in the engine.
+- [x] **RT-safety audit**:
+  - Zero allocations in `process()` incl. MIDI note-on
+    ([rt_alloc.rs](../rt-vox/tests/rt_alloc.rs), counting global allocator).
+  - Denormal guard active — silence flushes to true zero in every mode
+    (`denormal_guard_flushes_silence_to_zero`, `silence_flushes_to_true_zero_in_every_mode`).
+- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval` — run in CI
+  against the built bundles (`just bundle rt-vox`), not offline unit tests; see
+  the `package-plugin` / `rt-safety-audit` skills.
+
+## Phase 5: Packaging & release
+
+- [ ] **CI**: Linux (x86_64 + aarch64), macOS universal, Windows
+  x86_64.
+- [ ] **Bundling**: `.lv2`, `.clap`, `.vst3`.
+- [ ] **Installers**: Debian `.deb`, macOS signed `.pkg`, Windows
+  `.exe`.
+- [ ] **Presets**: robot vocoder, choir vocoder, third-above
+  harmoniser, octave-up harmoniser, doubler (5-cent detune × 2),
+  gender-swap formant.
+- [ ] **Documentation**: manual with a mode-selection guide and
+  MIDI routing diagram.
+
+## Out of scope (future work)
+
+- Polyphonic pitch correction — different problem (per-voice
+  tracking); if pursued, a separate plugin.
+- Talkbox emulation (physical excitation model) — see
+  `rt-physical` ([Roadmap-06-physical-modeling.md]).
+- Speech synthesis / TTS — not a real-time-audio concern.
+- Convolution-based formant transfer — deferred; would reuse
+  `rt-fft-convolver`.

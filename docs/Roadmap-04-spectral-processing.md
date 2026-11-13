@@ -1,0 +1,367 @@
+# Roadmap: `rt-spectral` (Spectral Processing Plugin Suite)
+
+Real-time spectral (FFT-based) processing engine covering
+denoising, spectral gating, spectral compression, transient
+handling, and click / hum removal.  Ships as a single plugin with
+mode selection, or as multiple plugins sharing a core crate —
+[decision].
+
+**Reference implementations**: iZotope RX, Waves NS1 /
+Clarity Vx, FabFilter Pro-DS, Cedar DNS, Waves W43.
+
+Plugin format target: **LV2 + CLAP + VST3** via
+[`nih-plug`](https://github.com/robbert-vdh/nih-plug).
+
+## Design principles
+
+- **Latency exposed to the host** — one FFT frame minus one hop
+  (typically 21 – 85 ms).  Not a "live" plugin by default; targeted
+  at mixing / mastering / dialogue cleanup.
+- **All processing per FFT bin, per frame** — no allocations, no
+  locks on the audio thread.
+- **Noise profile capture is off-RT** — the audio thread only reads
+  the current profile via atomic pointer swap.
+- **Overlap-add reconstruction** with a hop / window pair that
+  guarantees COLA (Constant Overlap-Add) — typically 75 % overlap
+  with Hann.
+- **Modes ship as separate operators** on the same spectrum:
+  denoise → gate → compress → click-remove.  User can enable /
+  bypass each independently.
+
+## Prerequisites in `rt-fft-convolver` ✅
+
+- Reuse `dsp/fft_handler.rs` (`realfft`) — same real-to-complex
+  wrapper.
+- `DenormalGuard` — spectral magnitudes below the noise floor
+  are exactly the case denormals appear in.
+- Ring-buffer utilities (see [Roadmap-03-pitch-shift.md]) —
+  shared code candidate.
+
+## Phase 0: Algorithm decisions ✅
+
+### Denoise algorithm — **decision: Wiener with decision-directed SNR, learn-seeded; MCRA optional**
+
+- **Core**: per-bin **Wiener gain** driven by the **decision-directed
+  (Ephraim–Malah) a-priori SNR** estimate.  The DD estimator is what
+  keeps Wiener free of *musical noise* — it smooths the a-priori SNR
+  across frames, so isolated random bin spikes don't turn into
+  warbling tones.
+  - Gain: `G(k) = ξ(k) / (1 + ξ(k))`, with a-priori SNR
+    `ξ(k) = α·(|Y_{prev}|²·G_prev²)/N(k) + (1−α)·max(γ(k)−1, 0)`,
+    a-posteriori SNR `γ(k) = |Y(k)|² / N(k)`, smoothing `α ≈ 0.98`.
+  - `N(k)` is the per-bin noise power from the learned profile.
+- **Noise floor / oversubtraction control** exposed as `Sensitivity`
+  and `Reduction`: gain is floored at `10^(−Reduction/20)` so residual
+  is a controllable bed of attenuated noise, not a hole.
+- **Learn-seeded** (RX / Waves W43 workflow): the `Learn` button
+  captures a static per-bin profile off-RT (median magnitude across
+  frames → power).  The RT thread only reads it via `arc-swap`.
+- **MCRA** (Minima-Controlled Recursive Averaging) is kept as an
+  **optional continuous-tracking mode** for the no-learn / "set and
+  forget" path (NS1 / Cedar DNS style).  It adds per-bin minimum
+  tracking state but no new RT allocations.
+- *Rejected*: plain **spectral subtraction** (musical-noise prone — it
+  survives only as the degenerate `α=0`, oversubtraction>1 case) and
+  **deep-learning** denoise (defer to `rt-neural-amp` stack; out of
+  scope, see §Out of scope).
+
+### Transient handling — **decision: onset-detected soft bypass**
+
+- Compute **spectral flux** `SF = Σ_k max(|Y(k)|−|Y_{prev}(k)|, 0)`
+  once per frame (essentially free — magnitudes already computed).
+- On an onset (flux exceeds an adaptive median threshold), **crossfade
+  the denoise/compress depth toward unity** for that frame so pick
+  attacks and drum transients aren't smeared.  Gate/hum/click are
+  unaffected.
+- High value for a guitar-oriented suite (pick attack preservation);
+  the cost is one scalar reduction per frame.
+
+### FFT size(s) — **settled: 1024 / 2048 / 4096, default 2048**
+
+- Reported latency = **one full frame `N`** (Phase 1 implementation
+  decision, see below):
+
+  | N | frame @48 kHz | latency (`N`) | use |
+  |---|---|---|---|
+  | 1024 | 21.3 ms | **21.3 ms** | "Live" |
+  | 2048 | 42.7 ms | **42.7 ms** | "Studio" (default) |
+  | 4096 | 85.3 ms | **85.3 ms** | "HiRes" (best freq. resolution) |
+
+  - ⚠️ **Revised during Phase 1** (was tentatively `N − hop = 3N/4`).
+    The `N − hop` group delay only holds when the host block size is
+    `>= hop`.  With a *streaming* overlap-add framer and per-block pull,
+    a block-size-**independent** latency provably requires a full frame:
+    prime the analyzer with `N − hop` zeros *and* the synthesis FIFO
+    with one `hop` (`N − hop + hop = N`).  Since DAWs use blocks as small
+    as 16–64 samples (well below a 512-sample hop), reporting `N` is the
+    only value that stays exact under automation and buffer-size
+    changes.  This matches the design-principle note's original
+    "21–85 ms" (= `N`) figures.  Recompute on size / sample-rate change
+    (sizes are in samples, so ms scales with `fs`).  The click despiker
+    adds a further fixed `(window−1)/2` (2 samples at the default
+    5-tap), always imposed so toggling it never shifts PDC.
+
+### Window / overlap — **decision: Hann analysis+synthesis, 75 % overlap, fixed**
+
+- Both analysis and synthesis windowed with **Hann** (effective `Hann²`
+  weighting), **hop = N/4**.  `Hann²` at 75 % overlap satisfies COLA;
+  normalise by the constant OLA gain so an all-pass chain is unity.
+- **Not exposed** (like the pitch plugin's fixed 4× overlap): keeps
+  reported latency and buffer sizes deterministic for host
+  compensation and the RT-safety audit.  A 50 % "low-CPU" advanced
+  option is a post-1.0 candidate.
+- Reuse the existing Hann/COLA helper (shared crate, see prerequisites).
+
+### Click / hum removal — **decision: time-domain stages, not per-bin operators**
+
+This revises the Phase 1 operator list.  A click is a *broadband,
+flat-spectrum* event and hum is a *few pure lines* — both are clumsy
+and lossy to treat per-STFT-bin.  Handle them in the time domain,
+flanking the STFT core:
+
+- **Hum**: cascaded **biquad notch bank** at the fundamental (50 / 60 Hz
+  or custom) + up to N harmonics, `RBJ` notch with adjustable `Q`.
+  Surgical, sample-accurate, no added latency.  Reuse the existing
+  `biquad.rs`.
+- **Click**: **median-filter detector** (order 5–9) on the time-domain
+  signal; flag samples whose deviation from the median exceeds
+  `Sensitivity`, then **interpolate** the flagged run (cubic / short AR
+  model) up to `Max Length` samples.  A pre-STFT stage operating on the
+  input ring.
+- ⚠️ **Phase 1 impact**: drop `notch_hum` / `click_repair` from the
+  per-bin `Bin` operator chain; add a `TimeDomainPre` (click) and
+  `TimeDomainPost` (hum) stage instead.  The per-bin chain remains
+  denoise → gate → compress.
+
+## Cost model (CPU / memory / complexity)
+
+Baseline: **48 kHz, stereo, N = 2048, hop = 512**, `K = N/2+1 = 1025`
+bins, frame rate `fs/hop = 93.75 frames/s` per channel.
+
+### Per-operator complexity (per frame, per channel)
+
+| Stage | Complexity | Notes |
+|---|---|---|
+| STFT fwd + inv | `O(N log N)` | ~110 k flops/frame @ N=2048 |
+| Window + OLA | `O(N)` | 2 mul-add passes |
+| Denoise (Wiener + DD SNR) | `O(K)` | ~20 flops/bin + 1 `arc-swap` load/frame |
+| Spectral gate | `O(K)` | ~8 flops/bin |
+| Spectral compress | `O(K)` | ~15 flops/bin (log/knee) |
+| Transient (spectral flux) | `O(K)` | 1 scalar/frame |
+| Hum notch (time domain) | `O(M · hop)` | M biquads, M = harmonics |
+| Click (time domain) | `O(w · hop)` | median window `w` |
+
+### CPU estimate
+
+FFT dominates and is cheap: fwd+inv ≈ 110 k flops/frame → `×93.75 ×2 ch
+≈ 21 Mflops/s`.  All bin operators worst-case (~60 flops/bin) add
+`≈ 12 Mflops/s`.  Time-domain notch/click add a few Mflops/s.  Total
+arithmetic is **well under 100 Mflops/s** against multi-Gflop cores.
+
+Realistic wall-clock (including windowing memory traffic, `arc-swap`
+loads, denormal handling — hence `DenormalGuard`) per **stereo
+instance**:
+
+| N | est. CPU (1 core, modern x86-64) |
+|---|---|
+| 1024 | ~1.5 – 3 % (2× frame rate, higher overhead/sample) |
+| 2048 | **~1 – 2 %** |
+| 4096 | ~0.8 – 1.5 % (half the frame rate) |
+
+Larger N is *cheaper per second* (fewer frames) but costs latency and
+frequency smearing — the trade-off, not CPU, drives the size choice.
+
+### Memory (RT-resident, per stereo instance @ N=2048)
+
+| Buffer | Size |
+|---|---|
+| Input ring + OLA accumulator (×2 ch) | 4 × 2048 f32 = 32 KB |
+| Spectrum + scratch (`FftHandler`) | ~24 KB |
+| Hann window (shared) | 8 KB |
+| Noise profile, double-buffered (`arc-swap`) | 2 × 1025 f32 = 8 KB |
+| Biquad notch state, click median window | < 1 KB |
+| **Total RT footprint** | **~70 – 80 KB** |
+
+Off-RT / UI only (not on the audio thread): the Phase 3 spectrogram
+history is the memory hog — 5 s × 93.75 frames/s × 1025 bins × 4 B ≈
+**1.9 MB per channel**.  Down-sample bins/time for the display buffer;
+never size the RT path to it.
+
+### Implementation complexity ranking (effort, not runtime)
+
+1. **STFT front-end + COLA** — low (reuse `FftHandler` + window helper).
+2. **Gate / compress** — low (per-bin static curves).
+3. **Hum notch** — low (reuse `biquad.rs`).
+4. **Wiener + DD SNR denoise** — medium (per-bin SNR state, tuning).
+5. **Click detect + interpolate** — medium (false-positive tuning vs.
+   guitar transients — coordinate with the transient detector).
+6. **MCRA continuous noise tracking** — medium-high (minimum-statistics
+   state machine); optional, can land after 1.0.
+
+## Phase 1: `rt-spectral-core` (engine crate) ✅
+
+Implemented as the `rt-spectral-core` workspace crate (framework-agnostic,
+no plugin-format dependency).  43 unit tests + integration tests; `cargo
+fmt`/`clippy` clean.
+
+- **Workspace layout**:
+  - `rt-spectral-core` — algorithms (this phase).
+  - `rt-spectral` — plugin(s) (Phase 2).
+- **STFT front-end** (`window.rs`, `stft.rs`):
+  - Windowed real FFT via `realfft` (reuses `FftHandler`).
+  - COLA-verified Hann², 75 % overlap; numerically-measured OLA norm.
+  - Streaming `Analyzer`/`Synthesizer` on `Ring<f32>`, primed so latency
+    is one frame, block-size independent.
+- **Operators** (concrete per-op structs, explicit ordered pipeline —
+  cleaner than a `&mut Bin` trait; each carries its own per-bin state):
+  - `NoiseProfile { power: Vec<f32> }` — per-bin **power**, captured
+    off-RT (denoiser works in the power domain).
+  - `Denoiser::process` — Wiener + decision-directed SNR, transient depth.
+  - `SpectralGate::process` — per-bin expander, attack/release envelope.
+  - `SpectralCompressor::process` — per-bin static soft-knee curve.
+  - `HumNotchBank::process_block` — **time-domain** biquad notch bank
+    (Phase 0 revision; `biquad.rs`, `hum.rs`).
+  - `ClickRepair::process_block` — **time-domain** median despiker
+    (Phase 0 revision; `click.rs`).
+  - `TransientDetector::observe` — spectral-flux onset soft-bypass.
+- **Noise-profile capture API** (off-RT, `profile.rs`):
+  - `learn_profile(&[f32], fft_size, hop) -> NoiseProfile`.
+  - Median magnitude across frames, per-bin → power.
+- **Profile hot-swap**:
+  - `triple_buffer` SPSC channel (`profile_channel` → `ProfileSender` /
+    `ProfileReceiver`); wait-free, allocation-free read on the audio
+    thread.  Chosen over `arc-swap` — already in the workspace lockfile
+    and fits the one-writer/one-reader topology exactly.
+
+## Phase 2: `rt-spectral` plugin ✅
+
+Implemented as the `rt-spectral` workspace crate: a framework-agnostic engine
+(`SpectralController` off-RT + `SpectralProcessor` on the audio thread, joined
+by two lock-free hand-offs) plus a thin `nih-plug` wrapper behind the `nih`
+feature.  16 unit + integration tests; `cargo fmt`/`clippy` clean (default and
+`nih`); no new dependency advisories.
+
+- **I/O**:
+  - Stereo in → stereo out (and mono → mono); one independent
+    [`SpectralEngine`] per channel.
+  - Per-channel STFT.  ⚠️ **Decision — mid/side dropped for Phase 2**: it would
+    couple the two channels' STFT state and the single learned noise profile is
+    already channel-agnostic; revisit as an advanced toggle post-1.0.
+- **Mode controls** (one enable-flag each): `Denoise`, `Spectral Gate`,
+  `Spectral Compressor`, `Hum Removal`, `Click Removal`.
+- **Denoise controls**:
+  - `Learn` — edge-triggered capture of `Learn Time` (500 – 2000 ms) of the
+    mono-summed input.  Capture is written **in place** into a pre-sized
+    triple-buffer slot on the audio thread (no allocation); the profile is
+    computed + published off-RT from the background-task executor.  ⚠️ The
+    momentary push-button affordance is a Phase-3 (editor) concern — the
+    audio-thread contract only needs the rising edge.
+  - `Reduction` (0–24 dB), `Sensitivity` (−30 … +30 dB above the profile).
+- **Gate controls**: `Threshold`, `Range`, `Attack`, `Release`.
+- **Compressor controls**: `Threshold`, `Ratio`, `Knee`, `Makeup`.
+- **Hum controls**: `Fundamental` (40–120 Hz, covers 50/60 + custom),
+  `Harmonics` (1–10), `Notch Q`.
+- **Click controls**: `Sensitivity`, `Max Length` (samples).
+- **Global controls**: `Mix` (0–100 %), `Output Gain`, `Bypass`.
+- **Latency reporting** — one full STFT frame + the click despiker's fixed
+  group delay (the Phase-1 revision of "one frame minus one hop"), reported once
+  in `initialize` since the FFT size is fixed at the Phase-0 "Studio" default
+  (2048).  Transient soft-bypass runs with its Phase-0 defaults (always on).
+
+## Phase 3: UI ✅
+
+Implemented behind the `gui` feature (`cargo build -p rt-spectral --features
+gui`), mirroring the `rt-pitch` split: all pure, framework-agnostic UI logic
+lives in `rt-spectral/src/ui.rs` (log-frequency down-sampling, dB / intensity
+mapping, the `Spectrogram` history ring, `Meter` ballistics, formatters) and is
+unit-tested without `egui`; the `egui` drawing is a thin `gui`-gated layer in
+`plugin.rs`.  The audio thread feeds the editor a per-block [`TelemetryFrame`]
+(down-sampled output spectrum + aggregated meters + Learn progress) over a
+lock-free `triple_buffer`; the noise-profile overlay is read from the controller
+under its mutex on the editor thread.  New engine telemetry (`EngineMeters`,
+`spectrum_magnitude()`) added to `rt-spectral-core`.
+
+- **`nih-plug-egui`** — **decision**: `egui`, matching the `rt-pitch` /
+  `rt-drive` editors (shared idioms, one UI toolkit across the suite).
+- **Real-time spectrogram** (scrolling, newest at the right, log-frequency
+  Y axis) — rendered from the `Spectrogram` ring into an `egui` texture.
+- **Noise-profile display** overlaid on a spectrum plot (current output
+  spectrum in the accent colour, learned profile overlaid).
+- **Per-mode enable indicators** — a row of five dots lit per operator's
+  enable flag; the `Bypass` toggle sits in the header.
+- **Metering**: input, output, and per-operator gain reduction (denoise /
+  gate / compressor), each measured in the core engine from spectral energy
+  around each operator and smoothed with peak-hold + decay ballistics.
+- ⚠️ The `gui` feature needs system `gl` / `x11` (via `nih-plug-egui`), so it is
+  built in CI / on a desktop, not in the headless dev shell — identical to the
+  other plugins' editors.  Default / `nih` builds and all tests stay offline.
+
+## Phase 4: Testing ✅
+
+The named acceptance criteria land in `rt-spectral-core/tests/acceptance.rs`
+(the `rt-spectral-core` items + the integration items) and
+`rt-spectral/tests/rt_safety.rs` (the RT-safety audit), on top of the existing
+module unit tests and `tests/integration.rs` in both crates.  87 tests across
+the two crates; `cargo fmt` / `clippy -D warnings` clean.
+
+- [x] **Unit tests** (`rt-spectral-core`):
+  - STFT round-trip within the window-overlap error when all operators are
+    pass-through (`reported_latency_matches_measured_group_delay`, plus the
+    existing `analysis_synthesis_reconstructs` / `full_passthrough_*`).
+  - Denoise on noise + tone reduces the floor while the tone's magnitude
+    (measured by Goertzel projection, which rejects the noise) is preserved to
+    within 0.5 dB (`denoise_reduces_floor_and_preserves_tone_within_half_db`).
+  - Hum notch attenuates a pure 60 Hz sine by > 40 dB
+    (`hum_notch_attenuates_60hz_by_more_than_40db`).  ⚠️ **f32 finding**: the RBJ
+    notch's zeros are exactly on the unit circle, but at the tiny normalised
+    mains frequency the f32 rounding of `cos(ω₀)` displaces the zero *angle*, so
+    the achievable null depth scales as ≈ `(2Q/ω₀)·Δω` — a **very high** Q (the
+    Q=30 default) is precision-limited to ≈ −34 dB, while a moderate Q clears
+    40 dB.  A preset needing both a narrow notch and a deep null would cascade
+    stages or compute coefficients in f64.
+  - Click repair detects and interpolates a single-sample impulse
+    (`click_repair_interpolates_single_sample_impulse`).
+- [x] **Integration tests**:
+  - Reference frame validated against the **closed-form** Hann-windowed-cosine
+    DFT (`|X[k]| = 0.5·Σw[n]`), which is exactly `np.fft.rfft(hann·cos)` — an
+    in-repo, dependency-free stand-in for a captured NumPy reference
+    (`stft_matches_analytic_windowed_cosine_reference`).
+  - Profile hot-swap under load: publishing a fresh profile mid-stream produces
+    no NaN/inf and no discontinuity spike
+    (`profile_hot_swap_under_load_is_glitch_free`).
+- [x] **RT-safety audit**:
+  - Zero allocations in `process()` — a counting global allocator confirms the
+    steady-state render **and** the Learn-capture path allocate nothing on the
+    audio thread (`process_is_allocation_free_on_the_audio_thread`).  A single
+    sequential test owns the measurement window (the counting allocator is
+    process-wide across threads).
+  - Latency matches the reported value exactly — an off-by-one shift is
+    demonstrably worse than the exact alignment across all three FFT sizes
+    (`reported_latency_matches_measured_group_delay`).
+- [ ] **Host validation**: `lv2lint`, `clap-validator`, `pluginval` — deferred
+  to CI / desktop: these need the built plugin bundles (`cargo xtask bundle`)
+  and the external validator binaries, none of which are available in the
+  headless dev shell.  The `nih` cdylib itself builds offline (`cargo build -p
+  rt-spectral --features nih`).
+
+## Phase 5: Packaging & release
+
+- [ ] **CI**: Linux (x86_64 + aarch64), macOS universal, Windows
+  x86_64.
+- [ ] **Bundling**: `.lv2`, `.clap`, `.vst3`.
+- [ ] **Installers**: Debian `.deb`, macOS signed `.pkg`, Windows
+  `.exe`.
+- [ ] **Presets**: dialogue cleanup, room-tone reduction, guitar
+  amp hiss, vinyl click removal starter preset.
+- [ ] **Documentation**: manual with a workflow guide for the
+  learn-then-process pattern.
+
+## Out of scope (future work)
+
+- ML-based source separation (Demucs, Spleeter) — orders of
+  magnitude more CPU, not a real-time target.
+- Spectral morphing / cross-synthesis — separate plugin.
+- Convolution-based deconvolution / de-reverb — see
+  [Ideas.md](Ideas.md) §1 for the convolution engine path.
+- Loudness / LUFS metering — separate plugin
+  (`rt-loudness-meter`, roadmap 10).

@@ -1,0 +1,12 @@
+# A transparent clean boost: gentle tanh, no tone shaping.
+name = "Clean Boost"
+input_gain_db = 0.0
+bias = 0.0
+output_gain_db = 0.0
+default_oversampling = 2
+
+[shaper]
+kind = "tanh"
+
+[tone]
+kind = "bypass"

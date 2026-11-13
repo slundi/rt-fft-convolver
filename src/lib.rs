@@ -32,3 +32,13 @@ pub use utils::resampler::{IrData, load_ir, resample};
 
 /// Anti-denormal protection helpers for the audio render thread.
 pub use utils::denormals::{DenormalGuard, flush_to_zero};
+
+/// Decibel ↔ linear-amplitude gain conversions.
+pub use utils::gain::{db_to_linear, linear_to_db};
+
+/// Real-time-safe fixed-capacity FIFO ring buffer (delay lines, STFT framing).
+pub use utils::ring::Ring;
+
+/// `realfft`-backed real→complex FFT wrapper, reused by spectral effects
+/// (e.g. the `rt-pitch` phase vocoder) as well as the convolution engines.
+pub use dsp::fft_handler::FftHandler;

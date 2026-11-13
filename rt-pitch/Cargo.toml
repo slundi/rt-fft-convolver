@@ -1,0 +1,33 @@
+[package]
+name = "rt-pitch"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time pitch-shift / harmoniser plugin (LV2 / CLAP / VST3) built on rt-pitch-core.  Selectable phase-vocoder / WSOLA / PSOLA shifters, 8-slot preset bank with click-free crossfade.  See docs/Roadmap-03-pitch-shift.md."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+publish = false
+
+[lib]
+# `cdylib` is what the CLAP/VST3 bundles load; `lib` keeps unit tests working.
+crate-type = ["lib", "cdylib"]
+
+[features]
+# The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
+# Build the actual plugin with `cargo build -p rt-pitch --features nih`.
+# `gui` adds the nih-plug-egui editor (Phase 3).
+default = []
+nih = ["dep:nih_plug"]
+gui = ["nih", "dep:nih_plug_egui"]
+
+[dependencies]
+# The pitch-shift DSP engine (selectable shifters + preset bank).
+rt-pitch-core = { path = "../rt-pitch-core" }
+# Shared plugin foundation: lock-free control→audio handoff + MIDI routing.
+rt-ir-plugin-core = { path = "../rt-ir-plugin-core" }
+# For DenormalGuard on the audio thread.
+rt-fft-convolver = { path = ".." }
+
+# nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

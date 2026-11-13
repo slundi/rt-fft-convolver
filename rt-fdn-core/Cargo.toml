@@ -1,0 +1,18 @@
+[package]
+name = "rt-fdn-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time algorithmic reverb engine: an 8×8 Feedback Delay Network with a fast Walsh–Hadamard mixing matrix, per-delay LFO modulation, Schroeder input diffusion, per-path damping / tone filtering and coprime delay lengths.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "reverb", "fdn", "hadamard", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Shared RT-safe primitives from the root crate.  We use `flush_to_zero` to
+# keep the long feedback tails free of subnormal floats even when no hardware
+# `DenormalGuard` wraps the callback, and re-export `DenormalGuard` for the
+# plugin layer (Phase 2).  Mirrors how `rt-spectral-core` consumes the root
+# crate.
+rt-fft-convolver = { path = ".." }

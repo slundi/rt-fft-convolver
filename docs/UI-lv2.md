@@ -39,6 +39,7 @@ during implementation with `nih-plug-egui`'s theming.
 | `border.strong`   | `#3f4655`        | Slot borders                      |
 | `accent.cab`      | `#e0a144`        | `rt-ir-cab` accent (amber)        |
 | `accent.reverb`   | `#3aa3b5`        | `rt-ir-reverb` accent (teal)      |
+| `accent.neural`   | `#7c5cff`        | `rt-neural-amp` accent (violet)   |
 | `signal.midi.ok`  | `#4ec36a`        | MIDI activity LED (recognised)    |
 | `signal.midi.err` | `#d94a4a`        | MIDI activity LED (unrecognised)  |
 | `signal.clip`     | `#d94a4a`        | Clip warning on gain/output       |

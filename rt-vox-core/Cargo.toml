@@ -1,0 +1,27 @@
+[package]
+name = "rt-vox-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time voice-processing DSP primitives: monophonic pitch tracking, LPC formant analysis, an FFT-based vocoder, a MIDI-driven harmoniser, and an independent formant shifter.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "vocoder", "harmoniser", "formant", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Real-to-complex FFT wrapper reused for the vocoder / formant STFT.
+realfft = "3.5"
+# Shared RT-safe primitives from the root crate: the fixed-capacity `Ring<T>`
+# FIFO backing STFT framing, `FftHandler`, and the `DenormalGuard`.
+rt-fft-convolver = { path = ".." }
+# The whole engine is built on `rt-pitch-core`'s tested, RT-safe pitch tracker,
+# formant estimator, STFT framing, and swappable `Shifter` back-ends
+# (Roadmap-08 Phase 0: reuse over a second parallel implementation).
+rt-pitch-core = { path = "../rt-pitch-core" }
+
+[dev-dependencies]
+# Micro-benchmarks would live here; kept for parity with the other core crates.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }

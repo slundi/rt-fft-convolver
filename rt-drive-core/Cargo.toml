@@ -1,0 +1,37 @@
+[package]
+name = "rt-drive-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time oversampled nonlinear-drive DSP primitives: Kaiser half-band polyphase resampler, waveshaper curve bank, biquad tone stacks and a DC blocker.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "distortion", "waveshaping", "oversampling", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Portable SIMD abstraction with automatic runtime dispatch across
+# SSE/AVX2/AVX-512/NEON on stable Rust.  Same choice as `rt-neural-core`
+# (see its Phase 0 decision) so the two cores share one SIMD strategy.
+pulp = "0.22"
+# Shared dB↔linear gain helpers (Roadmap-02 Prerequisites decision: the
+# helper lives in the root crate so every plugin core reuses one copy).
+rt-fft-convolver = { path = ".." }
+# Span-aware TOML parser for the pedal authoring format ([decision]): gives
+# byte-offset diagnostics on hand-edited pedal files.  Manual ValueInner
+# walking — no serde.
+toml-span = "0.7"
+# Structured, span-carrying pedal-load error type.
+thiserror = "2"
+
+[dev-dependencies]
+# FFT for the Phase-4 spectral tests (round-trip fidelity + aliasing floor).
+realfft = "3.5"
+# Micro-benchmarks: each shaper at each oversampling factor.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+[[bench]]
+name = "drive"
+harness = false

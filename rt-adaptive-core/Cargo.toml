@@ -1,0 +1,29 @@
+[package]
+name = "rt-adaptive-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time adaptive-filter DSP primitives: an NLMS/LMS tap vector for echo cancellation, an FFT feedback detector, a fixed-capacity biquad notch bank, and an adaptive mains-hum tracker.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "adaptive", "feedback", "nlms", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Real-to-complex FFT bins reused by the feedback detector's rolling analysis.
+realfft = "3.5"
+# Shared RT-safe primitives from the root crate: the fixed-capacity `Ring<T>`
+# FIFO backing the detector/tracker framing, `FftHandler`, and `DenormalGuard`.
+rt-fft-convolver = { path = ".." }
+# Roadmap-09 Phase 0 reuse: the autocorrelation `PitchTracker` is the adaptive
+# hum-fundamental drift tracker.
+rt-pitch-core = { path = "../rt-pitch-core" }
+# Roadmap-09 Phase 0 reuse: `Biquad` (RBJ notch) backs the feedback notch bank
+# and `HumNotchBank`/`HumParams` are the mains-hum comb.
+rt-spectral-core = { path = "../rt-spectral-core" }
+
+[dev-dependencies]
+# Micro-benchmarks would live here; kept for parity with the other core crates.
+criterion = { version = "0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+] }

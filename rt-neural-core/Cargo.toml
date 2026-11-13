@@ -1,0 +1,21 @@
+[package]
+name = "rt-neural-core"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time neural amp / pedal modelling inference engine.  Provides allocation-free LSTM and WaveNet layer primitives, a PreparedModel abstraction, and a slot bank for click-free model hot-swap.  Framework-agnostic (no plugin-format dependency)."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+keywords = ["dsp", "neural-network", "audio", "amp-modeling", "real-time"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Portable SIMD abstraction with automatic runtime dispatch across
+# SSE/AVX2/AVX-512/NEON on stable Rust.  See Phase 0 decision.
+pulp = "0.22"
+# Structured error enum for the model loader.
+thiserror = "2"
+# The convolution crate re-exports DenormalGuard, which we require on every
+# inference tick (ReLU / saturation activations can produce denormals when
+# the signal decays).
+rt-fft-convolver = { path = ".." }

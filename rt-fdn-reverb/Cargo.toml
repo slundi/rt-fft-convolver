@@ -1,0 +1,32 @@
+[package]
+name = "rt-fdn-reverb"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Algorithmic Feedback Delay Network reverb plugin (LV2 / CLAP / VST3) built on rt-fdn-core.  Eight modulated true-stereo spaces with per-preset crossfade, pre-delay, wet-bus EQ, stereo width, freeze and MIDI recall.  See docs/Roadmap-05-fdn-reverb.md."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+publish = false
+
+[lib]
+# `cdylib` is what the CLAP/VST3 bundles load; `lib` keeps unit tests working.
+crate-type = ["lib", "cdylib"]
+
+[features]
+# The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
+# Build the actual plugin with `cargo build -p rt-fdn-reverb --features nih`.
+# `gui` reserves the nih-plug-egui editor (Phase 3).
+default = []
+nih = ["dep:nih_plug"]
+gui = ["nih", "dep:nih_plug_egui"]
+
+[dependencies]
+# The FDN reverb engine (per-sample stereo wet generator + live setters).
+rt-fdn-core = { path = "../rt-fdn-core" }
+# Shared RT-safe plugin primitives: Biquad wet-bus EQ, ms→samples, dB→gain, and
+# the MIDI Program-Change / CC → preset router (same policy as the IR plugins).
+rt-ir-plugin-core = { path = "../rt-ir-plugin-core" }
+
+# nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }

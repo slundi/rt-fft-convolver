@@ -1,0 +1,36 @@
+[package]
+name = "rt-neural-amp"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+edition = "2024"
+license = "MIT"
+description = "Real-time neural amp / pedal modelling plugin (LV2 / CLAP / VST3) built on rt-neural-core.  See docs/Roadmap-01-neural-amp.md."
+repository = "https://codeberg.org/slundi/rt-fft-convolver"
+publish = false
+
+[lib]
+# `cdylib` is what the CLAP/VST3 bundles load; `rlib` keeps unit tests working.
+crate-type = ["lib", "cdylib"]
+
+[features]
+# The nih-plug wrapper is opt-in so `cargo test`/`clippy` stay fast and offline.
+# Build the actual plugin with `cargo build -p rt-neural-amp --features nih`.
+# `gui` adds the nih-plug-egui editor, which is Phase 3.
+default = []
+nih = ["dep:nih_plug", "dep:parking_lot"]
+gui = ["nih", "dep:nih_plug_egui"]
+
+[dependencies]
+# The inference engine.
+rt-neural-core = { path = "../rt-neural-core" }
+# Shared plugin foundation from the IR line: MidiRouter, IrPublisher / IrConsumer
+# lock-free handoff, SlotCrossfader with a MonoConvolver trait, gain / ms helpers.
+rt-ir-plugin-core = { path = "../rt-ir-plugin-core" }
+# For DenormalGuard on the audio thread.
+rt-fft-convolver = { path = ".." }
+
+# nih-plug is git-only (not on crates.io) and heavy; pulled in only for `nih`.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
+# For the `#[persist]` state field (matches nih-plug's own PersistentField impls).
+parking_lot = { version = "0.12", optional = true }
